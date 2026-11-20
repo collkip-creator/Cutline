@@ -30,6 +30,7 @@ New-Item -ItemType Directory -Force -Path "src-tauri\resources\bin" | Out-Null
     --distpath "src-tauri\binaries" `
     --workpath "build\pyinstaller-sidecar" `
     clippah_core\packaging\tauri_windows\sidecar.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
 Write-Host "==> 3. Fetching static Windows ffmpeg.exe, ffprobe.exe, and yt-dlp.exe if missing..."
 $BinDir = "src-tauri\resources\bin"
@@ -48,10 +49,13 @@ if (-not (Test-Path "$BinDir\ffmpeg.exe") -or -not (Test-Path "$BinDir\ffprobe.e
 
 Write-Host "==> 4. Installing frontend deps & building Tauri v2 NSIS installer (.exe)..."
 if (Test-Path "package-lock.json") {
-    npm ci
+    npm ci --legacy-peer-deps
 } else {
-    npm install
+    npm install --legacy-peer-deps
 }
+if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
+
 npx --yes @tauri-apps/cli@2 build --bundles nsis
+if ($LASTEXITCODE -ne 0) { throw "Tauri build failed with exit code $LASTEXITCODE" }
 
 Write-Host "==> Done! Installer created under src-tauri\target\release\bundle\nsis\"
