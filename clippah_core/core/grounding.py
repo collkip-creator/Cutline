@@ -99,6 +99,16 @@ def snap_clip_to_words(
             # Split the gap cleanly so we don't bleed the previous word
             snapped_start = prev_end + (gap * 0.5)
 
+    # Avoid stopping mid-sentence if a sentence-ending punctuation word follows shortly
+    if not words[last_idx].word.rstrip().endswith((".", "!", "?")):
+        max_lookahead = min(len(words) - 1, last_idx + 6)
+        for probe in range(last_idx + 1, max_lookahead + 1):
+            if words[probe].end_sec - words[last_idx].end_sec > 1.4:
+                break
+            if words[probe].word.rstrip().endswith((".", "!", "?")):
+                last_idx = probe
+                break
+
     snapped_end = words[last_idx].end_sec + post_roll_sec
     if last_idx + 1 < len(words):
         next_start = words[last_idx + 1].start_sec
@@ -119,14 +129,24 @@ def snap_clip_to_words(
 def ground_and_deduplicate_clips(
     clips: List[ClipCandidate],
     transcript: Transcript,
-    max_overlap_ratio: float = 0.65,
+    max_overlap_ratio: float = 0.50,
 ) -> List[ClipCandidate]:
     """
-    Snap every clip to word boundaries, sort by hook_score descending, and suppress
-    redundant overlapping candidates.
+    Clamp timestamps within transcript duration, snap every clip to complete-arc word
+    boundaries, rank by composite editorial score descending, and suppress overlaps.
     """
-    snapped = [snap_clip_to_words(c, transcript) for c in clips]
-    snapped.sort(key=lambda c: c.hook_score, reverse=True)
+    clamped: List[ClipCandidate] = []
+    max_dur = max(1.0, float(transcript.duration_sec or 1.0))
+    for c in clips:
+        if c.start_sec >= max_dur:
+            continue
+        data = c.model_dump()
+        data["start_sec"] = round(max(0.0, c.start_sec), 3)
+        data["end_sec"] = round(min(max_dur, max(data["start_sec"] + 1.0, c.end_sec)), 3)
+        clamped.append(ClipCandidate.model_validate(data))
+
+    snapped = [snap_clip_to_words(c, transcript) for c in clamped]
+    snapped.sort(key=lambda c: c.composite_score, reverse=True)
 
     kept: List[ClipCandidate] = []
     for candidate in snapped:

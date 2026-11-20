@@ -55,7 +55,7 @@ export default function App() {
   // Ingestion & prompt controls
   const [streamUrl, setStreamUrl] = useState('');
   const [prompt, setPrompt] = useState(
-    'High-retention hooks, strong architectural claims, and concise 10-30s takeaways'
+    'Strongest standalone moments across actionable lessons, entertaining banter/stories, and high-retention hooks'
   );
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
   const [ollamaModel, setOllamaModel] = useState('qwen2.5:14b');
@@ -438,9 +438,12 @@ export default function App() {
     const created: ClipCandidate = {
       id,
       title: `Manual Clip ${clips.length + 1}`,
+      category: 'insight',
       start_sec: start,
       end_sec: end,
-      hook_score: 75,
+      hook_score: 7.5,
+      lesson_score: 7.0,
+      entertainment_score: 6.5,
       reason: 'Manually defined range',
       caption_hook: 'KEY TAKEAWAY',
       tags: ['manual'],

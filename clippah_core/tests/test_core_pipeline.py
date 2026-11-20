@@ -149,6 +149,56 @@ class CorePipelineTests(unittest.TestCase):
             max_clip_sec=20.0,
         )
         self.assertGreaterEqual(len(batch.clips), 1)
+        for clip in batch.clips:
+            self.assertGreaterEqual(clip.hook_score, 1.0)
+            self.assertLessEqual(clip.hook_score, 10.0)
+            self.assertGreaterEqual(clip.lesson_score, 1.0)
+            self.assertLessEqual(clip.lesson_score, 10.0)
+            self.assertGreaterEqual(clip.entertainment_score, 1.0)
+            self.assertLessEqual(clip.entertainment_score, 10.0)
+
+    def test_editorial_filler_rejection_and_category_variety(self) -> None:
+        transcript = Transcript(
+            video_hash="edit999",
+            source_path="/tmp/podcast.mp4",
+            duration_sec=52.0,
+            segments=[
+                TranscriptSegment(
+                    id=0, start_sec=0.2, end_sec=5.0,
+                    text="Can you hear me? Testing one two mic check before we get started.",
+                ),
+                TranscriptSegment(
+                    id=1, start_sec=5.5, end_sec=14.0,
+                    text="Don't forget to like and subscribe and hit the bell, sponsored by AcmeVPN.",
+                ),
+                TranscriptSegment(
+                    id=2, start_sec=15.0, end_sec=25.0,
+                    text="Here is the 3 step rule to avoid silent render bugs in local media apps!",
+                ),
+                TranscriptSegment(
+                    id=3, start_sec=26.0, end_sec=36.0,
+                    text="Haha wait literally our test rig exploded in chaos and everyone laughed so hard!",
+                ),
+                TranscriptSegment(
+                    id=4, start_sec=37.0, end_sec=49.0,
+                    text="Why do 90% of cloud video pipelines stall right when bandwidth drops?",
+                ),
+            ],
+        )
+        engine = OllamaHighlightEngine(base_url="http://127.0.0.1:1", timeout_sec=0.2)
+        batch = engine.extract_highlights(
+            transcript,
+            user_prompt="actionable lessons, funny stories, and strong hooks",
+            min_clip_sec=7.0,
+            max_clip_sec=15.0,
+            max_clips=3,
+        )
+        self.assertEqual(len(batch.clips), 3)
+        joined_titles = " ".join(c.title.lower() for c in batch.clips)
+        self.assertNotIn("mic check", joined_titles)
+        self.assertNotIn("like and subscribe", joined_titles)
+        categories = {c.category.value for c in batch.clips}
+        self.assertGreaterEqual(len(categories), 2)
 
 
 if __name__ == "__main__":

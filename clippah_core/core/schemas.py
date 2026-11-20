@@ -152,6 +152,13 @@ class PublishStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ClipCategory(str, Enum):
+    LESSON = "lesson"
+    ENTERTAINMENT = "entertainment"
+    INSIGHT = "insight"
+    HOOK = "hook"
+
+
 class WordTimestamp(BaseModel):
     word: str
     start_sec: float
@@ -214,12 +221,45 @@ class MediaAsset(BaseModel):
     has_audio: bool = True
 
 
+def _normalize_ten_point_score(raw: Any, default: float = 5.0) -> float:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if val > 10.0:
+        val = val / 10.0
+    return round(max(1.0, min(10.0, val)), 1)
+
+
+def _normalize_category(raw: Any) -> ClipCategory:
+    if isinstance(raw, ClipCategory):
+        return raw
+    txt = str(raw or "").strip().lower()
+    mapping = {
+        "lesson": ClipCategory.LESSON,
+        "lessons": ClipCategory.LESSON,
+        "takeaway": ClipCategory.LESSON,
+        "entertainment": ClipCategory.ENTERTAINMENT,
+        "funny": ClipCategory.ENTERTAINMENT,
+        "comedy": ClipCategory.ENTERTAINMENT,
+        "story": ClipCategory.ENTERTAINMENT,
+        "hook": ClipCategory.HOOK,
+        "hooks": ClipCategory.HOOK,
+        "insight": ClipCategory.INSIGHT,
+        "insights": ClipCategory.INSIGHT,
+    }
+    return mapping.get(txt, ClipCategory.INSIGHT)
+
+
 class ClipCandidate(BaseModel):
     id: str
     title: str
+    category: ClipCategory = ClipCategory.INSIGHT
     start_sec: float
     end_sec: float
     hook_score: float
+    lesson_score: float = 5.0
+    entertainment_score: float = 5.0
     reason: str
     caption_hook: str
     tags: List[str] = Field(default_factory=list)
@@ -231,8 +271,17 @@ class ClipCandidate(BaseModel):
             self.start_sec = 0.0
         if self.end_sec <= self.start_sec:
             self.end_sec = round(self.start_sec + 1.0, 3)
-        self.hook_score = max(0.0, min(100.0, round(float(self.hook_score), 1)))
+        self.category = _normalize_category(self.category)
+        self.hook_score = _normalize_ten_point_score(self.hook_score, 5.0)
+        self.lesson_score = _normalize_ten_point_score(self.lesson_score, 5.0)
+        self.entertainment_score = _normalize_ten_point_score(self.entertainment_score, 5.0)
         return self
+
+    @property
+    def composite_score(self) -> float:
+        peak = max(self.hook_score, self.lesson_score, self.entertainment_score)
+        avg = (self.hook_score + self.lesson_score + self.entertainment_score) / 3.0
+        return round(0.55 * peak + 0.45 * avg, 2)
 
     @property
     def duration_sec(self) -> float:

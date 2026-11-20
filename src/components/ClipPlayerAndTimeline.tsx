@@ -169,6 +169,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                     {' · '}Clip {formatTimecode(activeClip.start_sec)}–{formatTimecode(activeClip.end_sec)}
                     {' · '}
                     {(activeClip.end_sec - activeClip.start_sec).toFixed(2)}s
+                    {activeClip.category ? ` · ${activeClip.category}` : ''}
                   </>
                 )}
               </p>

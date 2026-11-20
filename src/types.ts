@@ -28,12 +28,17 @@ export interface Transcript {
   segments: TranscriptSegment[];
 }
 
+export type ClipCategory = 'lesson' | 'entertainment' | 'insight' | 'hook';
+
 export interface ClipCandidate {
   id: string;
   title: string;
+  category?: ClipCategory;
   start_sec: number;
   end_sec: number;
   hook_score: number;
+  lesson_score?: number;
+  entertainment_score?: number;
   reason: string;
   caption_hook: string;
   tags: string[];

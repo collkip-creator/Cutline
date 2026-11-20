@@ -93,18 +93,26 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-800/80 text-[11px] font-medium text-slate-400 bg-[#0D121D]">
-                <th className="py-2.5 px-3">ID</th>
+                <th className="py-2.5 px-3">ID & Type</th>
                 <th className="py-2.5 px-3 min-w-[200px]">Title & Hook Caption</th>
                 <th className="py-2.5 px-3 text-right">Start (s)</th>
                 <th className="py-2.5 px-3 text-right">End (s)</th>
-                <th className="py-2.5 px-3 text-right">Score</th>
-                <th className="py-2.5 px-3 min-w-[220px]">Selection Reason & Tags</th>
+                <th className="py-2.5 px-3 text-right min-w-[140px]">Scores (1–10)</th>
+                <th className="py-2.5 px-3 min-w-[220px]">Editorial Reason & Tags</th>
                 <th className="py-2.5 px-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-xs">
               {clips.map((clip) => {
                 const isActive = activeClip?.id === clip.id;
+                const normScore = (v: number | undefined, fallback = 5.0) => {
+                  const n = Number(v ?? fallback);
+                  return n > 10 ? Math.round((n / 10) * 10) / 10 : n;
+                };
+                const hookVal = normScore(clip.hook_score, 5.0);
+                const lessonVal = normScore(clip.lesson_score, 5.0);
+                const funVal = normScore(clip.entertainment_score, 5.0);
+
                 return (
                   <tr
                     key={clip.id}
@@ -113,10 +121,25 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
                       isActive ? 'bg-blue-950/30' : 'hover:bg-slate-800/35'
                     }`}
                   >
-                    <td className="py-2.5 px-3 font-mono tabular-nums text-slate-300 align-top">
+                    <td className="py-2.5 px-3 font-mono tabular-nums text-slate-300 align-top space-y-1.5" onClick={(e) => e.stopPropagation()}>
                       <div>{clip.id}</div>
+                      <select
+                        value={clip.category || 'insight'}
+                        onChange={(e) =>
+                          onChangeClip({
+                            ...clip,
+                            category: e.target.value as ClipCandidate['category'],
+                          })
+                        }
+                        className="bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-1.5 py-0.5 text-[11px] font-sans text-slate-200 outline-none"
+                      >
+                        <option value="hook">hook</option>
+                        <option value="lesson">lesson</option>
+                        <option value="entertainment">entertainment</option>
+                        <option value="insight">insight</option>
+                      </select>
                       {clip.snapped_to_words && (
-                        <div className="text-[11px] text-emerald-400 mt-0.5">Snapped</div>
+                        <div className="text-[11px] font-sans text-emerald-400">Snapped</div>
                       )}
                     </td>
 
@@ -173,21 +196,58 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
                       </div>
                     </td>
 
-                    <td className="py-2.5 px-3 text-right align-top" onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="number"
-                        step="0.5"
-                        min="0"
-                        max="100"
-                        value={clip.hook_score}
-                        onChange={(e) =>
-                          onChangeClip({
-                            ...clip,
-                            hook_score: Math.min(100, Math.max(0, Number(e.target.value) || 0)),
-                          })
-                        }
-                        className="w-16 text-right font-mono tabular-nums bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-2 py-1 text-xs font-semibold text-amber-300 outline-none"
-                      />
+                    <td className="py-2.5 px-3 align-top space-y-1" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center justify-end gap-1.5 text-[11px]">
+                        <span className="text-slate-400">Hook</span>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="1"
+                          max="10"
+                          value={hookVal}
+                          onChange={(e) =>
+                            onChangeClip({
+                              ...clip,
+                              hook_score: Math.min(10, Math.max(1, Number(e.target.value) || 1)),
+                            })
+                          }
+                          className="w-12 text-right font-mono tabular-nums bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-1.5 py-0.5 text-[11px] font-semibold text-amber-300 outline-none"
+                        />
+                      </div>
+                      <div className="flex items-center justify-end gap-1.5 text-[11px]">
+                        <span className="text-slate-400">Lesson</span>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="1"
+                          max="10"
+                          value={lessonVal}
+                          onChange={(e) =>
+                            onChangeClip({
+                              ...clip,
+                              lesson_score: Math.min(10, Math.max(1, Number(e.target.value) || 1)),
+                            })
+                          }
+                          className="w-12 text-right font-mono tabular-nums bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-1.5 py-0.5 text-[11px] text-emerald-300 outline-none"
+                        />
+                      </div>
+                      <div className="flex items-center justify-end gap-1.5 text-[11px]">
+                        <span className="text-slate-400">Fun</span>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="1"
+                          max="10"
+                          value={funVal}
+                          onChange={(e) =>
+                            onChangeClip({
+                              ...clip,
+                              entertainment_score: Math.min(10, Math.max(1, Number(e.target.value) || 1)),
+                            })
+                          }
+                          className="w-12 text-right font-mono tabular-nums bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-1.5 py-0.5 text-[11px] text-blue-300 outline-none"
+                        />
+                      </div>
                     </td>
 
                     <td className="py-2.5 px-3 align-top space-y-1.5" onClick={(e) => e.stopPropagation()}>
