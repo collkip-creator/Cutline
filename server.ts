@@ -518,6 +518,22 @@ async function startServer() {
       }
     }
 
+    if (!project.has_audio) {
+      const silentTranscript = buildSegmentedTranscriptFromLines(
+        hash,
+        project.local_path,
+        project.duration_sec,
+        [
+          `Silent video track detected for ${project.title}.`,
+          'Import an .srt transcript or adjust clip timestamps manually to export.',
+        ],
+        'silent-track-draft'
+      );
+      writeCachedTranscript(silentTranscript);
+      res.json({ transcript: silentTranscript, cache_hit: false });
+      return;
+    }
+
     // Check if faster-whisper is installed in local Python environment
     try {
       await execFileAsync('python3', ['-c', 'import faster_whisper']);
@@ -860,9 +876,11 @@ print(res.model_dump_json())
   }
 
   const PORT = 3000;
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Cutline Studio listening on http://0.0.0.0:${PORT}`);
   });
+  server.timeout = 300000;
+  server.keepAliveTimeout = 65000;
 }
 
 startServer();

@@ -1,0 +1,342 @@
+{
+  "video_hash": "6e54fb3882ab3320f9f2f077df4168d9261556d8492ae50534cc2506f76c1d7e",
+  "source_path": "/app/applet/data/videos/1795164989140_test_upload.mp4",
+  "language": "en",
+  "duration_sec": 5,
+  "model_name": "local-timed-draft",
+  "created_at_iso": "2026-11-20T08:56:29.273Z",
+  "segments": [
+    {
+      "id": 0,
+      "start_sec": 0.15,
+      "end_sec": 1.13,
+      "text": "Analyzing test_upload locally with zero cloud rendering or remote ASR calls.",
+      "words": [
+        {
+          "word": "Analyzing",
+          "start_sec": 0.15,
+          "end_sec": 0.256,
+          "confidence": 0.96
+        },
+        {
+          "word": "test_upload",
+          "start_sec": 0.27,
+          "end_sec": 0.376,
+          "confidence": 0.96
+        },
+        {
+          "word": "locally",
+          "start_sec": 0.39,
+          "end_sec": 0.496,
+          "confidence": 0.96
+        },
+        {
+          "word": "with",
+          "start_sec": 0.51,
+          "end_sec": 0.616,
+          "confidence": 0.96
+        },
+        {
+          "word": "zero",
+          "start_sec": 0.63,
+          "end_sec": 0.736,
+          "confidence": 0.96
+        },
+        {
+          "word": "cloud",
+          "start_sec": 0.75,
+          "end_sec": 0.856,
+          "confidence": 0.96
+        },
+        {
+          "word": "rendering",
+          "start_sec": 0.87,
+          "end_sec": 0.976,
+          "confidence": 0.96
+        },
+        {
+          "word": "or",
+          "start_sec": 0.99,
+          "end_sec": 1.096,
+          "confidence": 0.96
+        },
+        {
+          "word": "remote",
+          "start_sec": 1.11,
+          "end_sec": 1.13,
+          "confidence": 0.96
+        },
+        {
+          "word": "ASR",
+          "start_sec": 1.23,
+          "end_sec": 1.13,
+          "confidence": 0.96
+        },
+        {
+          "word": "calls.",
+          "start_sec": 1.35,
+          "end_sec": 1.13,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "start_sec": 1.4,
+      "end_sec": 2.38,
+      "text": "Every spoken segment is indexed with word-level timestamps inside the SHA-256 transcript cache.",
+      "words": [
+        {
+          "word": "Every",
+          "start_sec": 1.4,
+          "end_sec": 1.506,
+          "confidence": 0.96
+        },
+        {
+          "word": "spoken",
+          "start_sec": 1.52,
+          "end_sec": 1.626,
+          "confidence": 0.96
+        },
+        {
+          "word": "segment",
+          "start_sec": 1.64,
+          "end_sec": 1.746,
+          "confidence": 0.96
+        },
+        {
+          "word": "is",
+          "start_sec": 1.76,
+          "end_sec": 1.866,
+          "confidence": 0.96
+        },
+        {
+          "word": "indexed",
+          "start_sec": 1.88,
+          "end_sec": 1.986,
+          "confidence": 0.96
+        },
+        {
+          "word": "with",
+          "start_sec": 2,
+          "end_sec": 2.106,
+          "confidence": 0.96
+        },
+        {
+          "word": "word-level",
+          "start_sec": 2.12,
+          "end_sec": 2.226,
+          "confidence": 0.96
+        },
+        {
+          "word": "timestamps",
+          "start_sec": 2.24,
+          "end_sec": 2.346,
+          "confidence": 0.96
+        },
+        {
+          "word": "inside",
+          "start_sec": 2.36,
+          "end_sec": 2.38,
+          "confidence": 0.96
+        },
+        {
+          "word": "the",
+          "start_sec": 2.48,
+          "end_sec": 2.38,
+          "confidence": 0.96
+        },
+        {
+          "word": "SHA-256",
+          "start_sec": 2.6,
+          "end_sec": 2.38,
+          "confidence": 0.96
+        },
+        {
+          "word": "transcript",
+          "start_sec": 2.72,
+          "end_sec": 2.38,
+          "confidence": 0.96
+        },
+        {
+          "word": "cache.",
+          "start_sec": 2.84,
+          "end_sec": 2.38,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "start_sec": 2.65,
+      "end_sec": 3.63,
+      "text": "Re-running highlight prompts pulls directly from disk cache without re-transcribing audio.",
+      "words": [
+        {
+          "word": "Re-running",
+          "start_sec": 2.65,
+          "end_sec": 2.756,
+          "confidence": 0.96
+        },
+        {
+          "word": "highlight",
+          "start_sec": 2.77,
+          "end_sec": 2.876,
+          "confidence": 0.96
+        },
+        {
+          "word": "prompts",
+          "start_sec": 2.89,
+          "end_sec": 2.996,
+          "confidence": 0.96
+        },
+        {
+          "word": "pulls",
+          "start_sec": 3.01,
+          "end_sec": 3.116,
+          "confidence": 0.96
+        },
+        {
+          "word": "directly",
+          "start_sec": 3.13,
+          "end_sec": 3.236,
+          "confidence": 0.96
+        },
+        {
+          "word": "from",
+          "start_sec": 3.25,
+          "end_sec": 3.356,
+          "confidence": 0.96
+        },
+        {
+          "word": "disk",
+          "start_sec": 3.37,
+          "end_sec": 3.476,
+          "confidence": 0.96
+        },
+        {
+          "word": "cache",
+          "start_sec": 3.49,
+          "end_sec": 3.596,
+          "confidence": 0.96
+        },
+        {
+          "word": "without",
+          "start_sec": 3.61,
+          "end_sec": 3.63,
+          "confidence": 0.96
+        },
+        {
+          "word": "re-transcribing",
+          "start_sec": 3.73,
+          "end_sec": 3.63,
+          "confidence": 0.96
+        },
+        {
+          "word": "audio.",
+          "start_sec": 3.85,
+          "end_sec": 3.63,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "start_sec": 3.9,
+      "end_sec": 4.88,
+      "text": "Selected moments snap to word boundaries and export via FFmpeg in 16:9 or 9:16 vertical.",
+      "words": [
+        {
+          "word": "Selected",
+          "start_sec": 3.9,
+          "end_sec": 4.006,
+          "confidence": 0.96
+        },
+        {
+          "word": "moments",
+          "start_sec": 4.02,
+          "end_sec": 4.126,
+          "confidence": 0.96
+        },
+        {
+          "word": "snap",
+          "start_sec": 4.14,
+          "end_sec": 4.246,
+          "confidence": 0.96
+        },
+        {
+          "word": "to",
+          "start_sec": 4.26,
+          "end_sec": 4.366,
+          "confidence": 0.96
+        },
+        {
+          "word": "word",
+          "start_sec": 4.38,
+          "end_sec": 4.486,
+          "confidence": 0.96
+        },
+        {
+          "word": "boundaries",
+          "start_sec": 4.5,
+          "end_sec": 4.606,
+          "confidence": 0.96
+        },
+        {
+          "word": "and",
+          "start_sec": 4.62,
+          "end_sec": 4.726,
+          "confidence": 0.96
+        },
+        {
+          "word": "export",
+          "start_sec": 4.74,
+          "end_sec": 4.846,
+          "confidence": 0.96
+        },
+        {
+          "word": "via",
+          "start_sec": 4.86,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "FFmpeg",
+          "start_sec": 4.98,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "in",
+          "start_sec": 5.1,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "16:9",
+          "start_sec": 5.22,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "or",
+          "start_sec": 5.34,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "9:16",
+          "start_sec": 5.46,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        },
+        {
+          "word": "vertical.",
+          "start_sec": 5.58,
+          "end_sec": 4.88,
+          "confidence": 0.96
+        }
+      ]
+    }
+  ]
+}

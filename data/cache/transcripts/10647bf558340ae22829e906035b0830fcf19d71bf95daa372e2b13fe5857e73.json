@@ -1,0 +1,128 @@
+{
+  "video_hash": "10647bf558340ae22829e906035b0830fcf19d71bf95daa372e2b13fe5857e73",
+  "source_path": "/app/applet/data/videos/1795165079678_silent_clip.mp4",
+  "language": "en",
+  "duration_sec": 12,
+  "model_name": "silent-track-draft",
+  "created_at_iso": "2026-11-20T08:57:59.794Z",
+  "segments": [
+    {
+      "id": 0,
+      "start_sec": 0.15,
+      "end_sec": 5.88,
+      "text": "Silent video track detected for silent_clip.",
+      "words": [
+        {
+          "word": "Silent",
+          "start_sec": 0.15,
+          "end_sec": 0.99,
+          "confidence": 0.96
+        },
+        {
+          "word": "video",
+          "start_sec": 1.105,
+          "end_sec": 1.945,
+          "confidence": 0.96
+        },
+        {
+          "word": "track",
+          "start_sec": 2.06,
+          "end_sec": 2.9,
+          "confidence": 0.96
+        },
+        {
+          "word": "detected",
+          "start_sec": 3.015,
+          "end_sec": 3.855,
+          "confidence": 0.96
+        },
+        {
+          "word": "for",
+          "start_sec": 3.97,
+          "end_sec": 4.81,
+          "confidence": 0.96
+        },
+        {
+          "word": "silent_clip.",
+          "start_sec": 4.925,
+          "end_sec": 5.765,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "start_sec": 6.15,
+      "end_sec": 11.88,
+      "text": "Import an .srt transcript or adjust clip timestamps manually to export.",
+      "words": [
+        {
+          "word": "Import",
+          "start_sec": 6.15,
+          "end_sec": 6.608,
+          "confidence": 0.96
+        },
+        {
+          "word": "an",
+          "start_sec": 6.671,
+          "end_sec": 7.129,
+          "confidence": 0.96
+        },
+        {
+          "word": ".srt",
+          "start_sec": 7.192,
+          "end_sec": 7.65,
+          "confidence": 0.96
+        },
+        {
+          "word": "transcript",
+          "start_sec": 7.713,
+          "end_sec": 8.171,
+          "confidence": 0.96
+        },
+        {
+          "word": "or",
+          "start_sec": 8.234,
+          "end_sec": 8.692,
+          "confidence": 0.96
+        },
+        {
+          "word": "adjust",
+          "start_sec": 8.755,
+          "end_sec": 9.213,
+          "confidence": 0.96
+        },
+        {
+          "word": "clip",
+          "start_sec": 9.275,
+          "end_sec": 9.733,
+          "confidence": 0.96
+        },
+        {
+          "word": "timestamps",
+          "start_sec": 9.796,
+          "end_sec": 10.254,
+          "confidence": 0.96
+        },
+        {
+          "word": "manually",
+          "start_sec": 10.317,
+          "end_sec": 10.775,
+          "confidence": 0.96
+        },
+        {
+          "word": "to",
+          "start_sec": 10.838,
+          "end_sec": 11.296,
+          "confidence": 0.96
+        },
+        {
+          "word": "export.",
+          "start_sec": 11.359,
+          "end_sec": 11.817,
+          "confidence": 0.96
+        }
+      ]
+    }
+  ]
+}

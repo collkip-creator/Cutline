@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional
@@ -27,7 +28,7 @@ from ..adapters.desktop_ytdlp import DesktopMediaDownloader
 from ..adapters.social_adapters import build_default_publishers
 from ..core.cache import TranscriptCache, compute_file_sha256
 from ..core.captions import generate_ass, generate_srt
-from ..core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
+from ..core.grounding import snap_clip_to_words
 from ..core.pipeline import ClippahPipeline
 from ..core.queue import PublishQueueStore
 from ..core.schemas import (
@@ -55,7 +56,7 @@ video_processor = FFmpegVideoProcessor()
 cache_store = TranscriptCache(CACHE_DIR)
 pipeline = ClippahPipeline(
     downloader=DesktopMediaDownloader(video_processor),
-    transcriber=FasterWhisperTranscriber(model_size="small", compute_type="int8"),
+    transcriber=FasterWhisperTranscriber(model_size="base", compute_type="int8"),
     highlight_engine=OllamaHighlightEngine(),
     video_processor=video_processor,
     cache=cache_store,
@@ -96,6 +97,81 @@ def _upsert_project(record: Dict[str, Any]) -> None:
     else:
         items.insert(0, record)
     _write_projects(items)
+
+
+def _build_timed_draft_transcript(
+    video_hash: str,
+    source_path: str,
+    duration_sec: float,
+    lines: List[str],
+    model_name: str = "local-timed-draft",
+) -> Transcript:
+    safe_dur = max(4.0, float(duration_sec or 10.0))
+    step = safe_dur / max(1, len(lines))
+    segs: List[TranscriptSegment] = []
+    for idx, line in enumerate(lines):
+        s0 = round(idx * step + 0.15, 3)
+        s1 = round(min(safe_dur, (idx + 1) * step - 0.12), 3)
+        toks = line.split()
+        wstep = max(0.08, (s1 - s0) / max(1, len(toks)))
+        words = [
+            WordTimestamp(
+                word=t,
+                start_sec=round(s0 + wi * wstep, 3),
+                end_sec=round(min(s1, s0 + (wi + 0.88) * wstep), 3),
+            )
+            for wi, t in enumerate(toks)
+        ]
+        segs.append(TranscriptSegment(id=idx, start_sec=s0, end_sec=s1, text=line, words=words))
+    return Transcript(
+        video_hash=video_hash,
+        source_path=source_path,
+        duration_sec=safe_dur,
+        model_name=model_name,
+        segments=segs,
+    )
+
+
+def _parse_srt_to_transcript(srt_text: str, video_hash: str, source_path: str, duration_sec: float) -> Transcript:
+    def _parse_ts(ts: str) -> float:
+        m = re.search(r"(\d+):(\d+):(\d+)[,.](\d+)", ts)
+        if not m:
+            return 0.0
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000.0
+
+    blocks = re.split(r"\r?\n\s*\r?\n", srt_text.strip())
+    segs: List[TranscriptSegment] = []
+    for idx, blk in enumerate(blocks):
+        lines = [l.strip() for l in blk.splitlines() if l.strip()]
+        ts_idx = next((i for i, l in enumerate(lines) if "-->" in l), -1)
+        if ts_idx < 0:
+            continue
+        s_str, e_str = lines[ts_idx].split("-->", 1)
+        s0 = round(_parse_ts(s_str), 3)
+        s1 = round(max(s0 + 0.5, _parse_ts(e_str)), 3)
+        text = " ".join(lines[ts_idx + 1 :]).strip()
+        if not text:
+            continue
+        toks = text.split()
+        wstep = (s1 - s0) / max(1, len(toks))
+        words = [
+            WordTimestamp(
+                word=t,
+                start_sec=round(s0 + wi * wstep, 3),
+                end_sec=round(s0 + (wi + 0.9) * wstep, 3),
+            )
+            for wi, t in enumerate(toks)
+        ]
+        segs.append(TranscriptSegment(id=idx, start_sec=s0, end_sec=s1, text=text, words=words))
+
+    final_dur = max(float(duration_sec or 1.0), segs[-1].end_sec if segs else 1.0)
+    return Transcript(
+        video_hash=video_hash,
+        source_path=source_path,
+        duration_sec=final_dur,
+        model_name="imported-srt",
+        segments=segs,
+    )
 
 
 class UrlRequest(BaseModel):
@@ -204,24 +280,7 @@ def create_sample():
             "Content-addressed transcript caching means re-running prompts takes zero milliseconds.",
             "Every LLM timestamp gets snapped to exact word boundaries before FFmpeg cuts the clip.",
         ]
-        dur = float(meta["duration_sec"] or 30.0)
-        step = dur / len(lines)
-        segs = []
-        for idx, line in enumerate(lines):
-            s0 = round(idx * step + 0.15, 3)
-            s1 = round((idx + 1) * step - 0.12, 3)
-            toks = line.split()
-            wstep = (s1 - s0) / max(1, len(toks))
-            words = [
-                WordTimestamp(
-                    word=t,
-                    start_sec=round(s0 + wi * wstep, 3),
-                    end_sec=round(s0 + (wi + 0.88) * wstep, 3),
-                )
-                for wi, t in enumerate(toks)
-            ]
-            segs.append(TranscriptSegment(id=idx, start_sec=s0, end_sec=s1, text=line, words=words))
-        tr = Transcript(video_hash=vhash, source_path=str(target), duration_sec=dur, segments=segs)
+        tr = _build_timed_draft_transcript(vhash, str(target), float(meta["duration_sec"] or 30.0), lines, "faster-whisper-base-int8")
         cache_store.put(tr)
 
     clips = pipeline.find_clips(tr, "High-retention hooks and local architecture", min_clip_sec=6.0)
@@ -298,11 +357,62 @@ def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
         cached = cache_store.get(video_hash)
         if cached:
             return {"transcript": cached.model_dump(), "cache_hit": True}
-    wav_path = CACHE_DIR / f"{video_hash[:12]}_16k.wav"
-    video_processor.extract_audio(Path(proj["local_path"]), wav_path)
-    tr = pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
-    cache_store.put(tr, pipeline.transcriber.model_identifier)
-    return {"transcript": tr.model_dump(), "cache_hit": False}
+
+    if not proj.get("has_audio", True):
+        tr = _build_timed_draft_transcript(
+            video_hash,
+            proj["local_path"],
+            float(proj.get("duration_sec") or 10.0),
+            [
+                f"Silent video track detected for {proj['title']}.",
+                "Import an .srt transcript or define manual clip start/end bounds to export.",
+            ],
+        )
+        cache_store.put(tr)
+        return {
+            "transcript": tr.model_dump(),
+            "cache_hit": False,
+            "warning": "No audio stream found; generated draft timeline segments.",
+        }
+
+    try:
+        wav_path = CACHE_DIR / f"{video_hash[:12]}_16k.wav"
+        video_processor.extract_audio(Path(proj["local_path"]), wav_path)
+        tr = pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
+        cache_store.put(tr, pipeline.transcriber.model_identifier)
+        return {"transcript": tr.model_dump(), "cache_hit": False}
+    except Exception as exc:  # noqa: BLE001
+        tr = _build_timed_draft_transcript(
+            video_hash,
+            proj["local_path"],
+            float(proj.get("duration_sec") or 10.0),
+            [
+                f"Draft timeline created for {proj['title']} while Whisper ASR was unavailable.",
+                "You can paste an .srt file in Transcript or edit clip intervals directly.",
+            ],
+        )
+        cache_store.put(tr)
+        return {
+            "transcript": tr.model_dump(),
+            "cache_hit": False,
+            "warning": f"Whisper ASR fallback active ({exc}). Draft timeline cached so clipping remains unlocked.",
+        }
+
+
+@app.put("/api/projects/{video_hash}/transcript")
+def update_transcript(video_hash: str, body: Dict[str, Any]):
+    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if isinstance(body.get("srt"), str):
+        tr = _parse_srt_to_transcript(body["srt"], video_hash, proj["local_path"], float(proj.get("duration_sec") or 10.0))
+        cache_store.put(tr)
+        return {"transcript": tr.model_dump()}
+    if isinstance(body.get("transcript"), dict):
+        tr = Transcript.model_validate(body["transcript"])
+        cache_store.put(tr)
+        return {"transcript": tr.model_dump()}
+    raise HTTPException(status_code=400, detail="Provide srt string or transcript object")
 
 
 @app.post("/api/projects/{video_hash}/highlights")

@@ -17,7 +17,7 @@ import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
-import { apiUrl } from './lib/api';
+import { apiFetch, apiUrl, readJsonResponse } from './lib/api';
 import type {
   AspectRatio,
   ClipCandidate,
@@ -84,34 +84,46 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadProjects = async (selectFirst = false) => {
-    const res = await fetch(apiUrl('/api/projects'));
-    if (!res.ok) return;
-    const list: ProjectRecord[] = await res.json();
-    setProjects(list);
-    if (selectFirst && list.length > 0) {
-      await selectProject(list[0].video_hash);
-    } else if (selectFirst && list.length === 0) {
-      await handleLoadSample();
+    try {
+      const res = await apiFetch('/api/projects');
+      const list = await readJsonResponse<ProjectRecord[]>(res);
+      setProjects(list);
+      if (selectFirst && list.length > 0) {
+        await selectProject(list[0].video_hash);
+      } else if (selectFirst && list.length === 0) {
+        await handleLoadSample();
+      }
+    } catch {
+      // Ignore transient cold-start poll errors
     }
   };
 
   const selectProject = async (hash: string) => {
-    const res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}`));
-    if (!res.ok) return;
-    const data = await res.json();
-    setActiveProject(data.project);
-    setTranscript(data.transcript);
-    setCacheHit(Boolean(data.cache_hit));
-    const projectClips: ClipCandidate[] = data.project.clips || [];
-    setClips(projectClips);
-    setActiveClipId(projectClips[0]?.id || null);
-    setLastExport(null);
+    try {
+      const res = await apiFetch(`/api/projects/${encodeURIComponent(hash)}`);
+      const data = await readJsonResponse<{
+        project: ProjectRecord;
+        transcript: Transcript | null;
+        cache_hit: boolean;
+      }>(res);
+      setActiveProject(data.project);
+      setTranscript(data.transcript);
+      setCacheHit(Boolean(data.cache_hit));
+      const projectClips: ClipCandidate[] = data.project.clips || [];
+      setClips(projectClips);
+      setActiveClipId(projectClips[0]?.id || null);
+      setLastExport(null);
+    } catch (err: any) {
+      setNotice({ kind: 'error', text: err.message });
+    }
   };
 
   const loadQueue = async () => {
-    const res = await fetch(apiUrl('/api/queue'));
-    if (res.ok) {
-      setQueueJobs(await res.json());
+    try {
+      const res = await apiFetch('/api/queue');
+      setQueueJobs(await readJsonResponse<PublishJob[]>(res));
+    } catch {
+      // Ignore transient cold-start poll errors
     }
   };
 
@@ -121,7 +133,7 @@ export default function App() {
   }, []);
 
   const persistClips = async (hash: string, updatedClips: ClipCandidate[]) => {
-    await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}/clips`), {
+    await apiFetch(`/api/projects/${encodeURIComponent(hash)}/clips`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clips: updatedClips }),
@@ -132,9 +144,8 @@ export default function App() {
     setIsIngesting(true);
     setNotice(null);
     try {
-      const res = await fetch(apiUrl('/api/projects/sample'), { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to synthesize sample');
+      const res = await apiFetch('/api/projects/sample', { method: 'POST' });
+      const data = await readJsonResponse<any>(res);
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
@@ -155,9 +166,8 @@ export default function App() {
     try {
       const form = new FormData();
       form.append('video', file);
-      const res = await fetch(apiUrl('/api/projects/upload'), { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Video upload failed');
+      const res = await apiFetch('/api/projects/upload', { method: 'POST', body: form });
+      const data = await readJsonResponse<any>(res);
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
@@ -181,13 +191,12 @@ export default function App() {
     setIsIngesting(true);
     setNotice(null);
     try {
-      const res = await fetch(apiUrl('/api/projects/url'), {
+      const res = await apiFetch('/api/projects/url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: streamUrl.trim() }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'URL ingestion failed');
+      const data = await readJsonResponse<any>(res);
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
@@ -202,22 +211,30 @@ export default function App() {
     }
   };
 
-  const handleTranscribe = async (hash: string, force = false) => {
+  const handleTranscribe = async (hash: string, force = false): Promise<Transcript | null> => {
     setIsTranscribing(true);
     setNotice(null);
     try {
-      const res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}/transcribe`), {
+      const res = await apiFetch(`/api/projects/${encodeURIComponent(hash)}/transcribe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Transcription failed');
+      const data = await readJsonResponse<{
+        transcript: Transcript;
+        cache_hit: boolean;
+        warning?: string;
+      }>(res);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
+      if (data.warning) {
+        setNotice({ kind: 'info', text: data.warning });
+      }
       await loadProjects(false);
+      return data.transcript;
     } catch (err: any) {
       setNotice({ kind: 'error', text: err.message });
+      return null;
     } finally {
       setIsTranscribing(false);
     }
@@ -225,22 +242,22 @@ export default function App() {
 
   const handleImportSrt = async () => {
     if (!activeProject || !srtImportText.trim()) return;
-    const res = await fetch(
-      apiUrl(`/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`),
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ srt: srtImportText }),
-      }
-    );
-    const data = await res.json();
-    if (res.ok) {
+    try {
+      const res = await apiFetch(
+        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ srt: srtImportText }),
+        }
+      );
+      const data = await readJsonResponse<any>(res);
       setTranscript(data.transcript);
       setCacheHit(true);
       setSrtImportText('');
       setNotice({ kind: 'info', text: 'Imported SRT into SHA-256 transcript cache.' });
-    } else {
-      setNotice({ kind: 'error', text: data.error || 'Failed to parse SRT' });
+    } catch (err: any) {
+      setNotice({ kind: 'error', text: err.message || 'Failed to parse SRT' });
     }
   };
 
@@ -249,8 +266,15 @@ export default function App() {
     setIsExtracting(true);
     setNotice(null);
     try {
-      const res = await fetch(
-        apiUrl(`/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`),
+      let currentTranscript = transcript;
+      if (!currentTranscript) {
+        currentTranscript = await handleTranscribe(activeProject.video_hash, false);
+        if (!currentTranscript) {
+          throw new Error('Could not obtain transcript before extracting clips.');
+        }
+      }
+      const res = await apiFetch(
+        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -264,8 +288,7 @@ export default function App() {
           }),
         }
       );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Highlight extraction failed');
+      const data = await readJsonResponse<{ clips: ClipCandidate[] }>(res);
       setClips(data.clips);
       setActiveClipId(data.clips[0]?.id || null);
       setNotice({
@@ -281,13 +304,12 @@ export default function App() {
 
   const handleSnapToWords = async (clip: ClipCandidate) => {
     if (!transcript || !activeProject) return;
-    const res = await fetch(apiUrl('/api/clips/snap'), {
+    const res = await apiFetch('/api/clips/snap', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clip, transcript }),
     });
-    if (!res.ok) return;
-    const snapped: ClipCandidate = await res.json();
+    const snapped = await readJsonResponse<ClipCandidate>(res);
     const next = clips.map((c) => (c.id === clip.id ? snapped : c));
     setClips(next);
     await persistClips(activeProject.video_hash, next);
@@ -666,6 +688,7 @@ export default function App() {
                       className="hidden"
                       onChange={(e) => {
                         const f = e.target.files?.[0];
+                        e.target.value = '';
                         if (f) handleFileUpload(f);
                       }}
                     />
@@ -723,10 +746,14 @@ export default function App() {
                     <button
                       type="button"
                       disabled={isTranscribing}
-                      onClick={() => handleTranscribe(activeProject.video_hash, true)}
+                      onClick={() => handleTranscribe(activeProject.video_hash, Boolean(transcript))}
                       className="px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
-                      {isTranscribing ? 'Transcribing...' : 'Re-Transcribe'}
+                      {isTranscribing
+                        ? 'Transcribing...'
+                        : transcript
+                          ? 'Re-Transcribe'
+                          : 'Transcribe Video'}
                     </button>
                     <button
                       type="button"
@@ -738,7 +765,7 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      disabled={isExtracting || !transcript}
+                      disabled={isExtracting || isTranscribing}
                       onClick={handleExtractHighlights}
                       className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded transition-colors whitespace-nowrap shrink-0"
                     >

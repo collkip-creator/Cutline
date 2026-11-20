@@ -1,5 +1,49 @@
 [
   {
+    "video_hash": "10647bf558340ae22829e906035b0830fcf19d71bf95daa372e2b13fe5857e73",
+    "title": "silent_clip",
+    "filename": "1795165079678_silent_clip.mp4",
+    "local_path": "/app/applet/data/videos/1795165079678_silent_clip.mp4",
+    "video_url": "/media/videos/1795165079678_silent_clip.mp4",
+    "source_url": null,
+    "duration_sec": 12,
+    "width": 640,
+    "height": 360,
+    "fps": 25,
+    "has_audio": false,
+    "created_at_iso": "2026-11-20T08:57:59.778Z",
+    "clips": [
+      {
+        "id": "clip_01",
+        "title": "Silent video track detected for silent_clip",
+        "start_sec": 0.03,
+        "end_sec": 12,
+        "hook_score": 65,
+        "reason": "Matched 1 brief terms and 0 retention cues.",
+        "caption_hook": "SILENT VIDEO TRACK DETECTED FOR SILENT_CLIP",
+        "tags": [
+          "silent"
+        ],
+        "snapped_to_words": true
+      }
+    ]
+  },
+  {
+    "video_hash": "6e54fb3882ab3320f9f2f077df4168d9261556d8492ae50534cc2506f76c1d7e",
+    "title": "test_upload",
+    "filename": "1795164989140_test_upload.mp4",
+    "local_path": "/app/applet/data/videos/1795164989140_test_upload.mp4",
+    "video_url": "/media/videos/1795164989140_test_upload.mp4",
+    "source_url": null,
+    "duration_sec": 5,
+    "width": 640,
+    "height": 360,
+    "fps": 25,
+    "has_audio": true,
+    "created_at_iso": "2026-11-20T08:56:29.234Z",
+    "clips": []
+  },
+  {
     "video_hash": "f5891dfc887461f285684a80a1063a4790a8f14995efa1dd448702442cbcd064",
     "title": "Cutline Local-First Architecture Briefing",
     "filename": "cutline_architecture_briefing.mp4",
