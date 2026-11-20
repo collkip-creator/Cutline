@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from ..core.cache import compute_file_sha256
 from ..core.interfaces import MediaDownloader, ProgressCallback, VideoProcessor
 from ..core.schemas import MediaAsset
-from .desktop_ffmpeg import resolve_media_binary
+from .desktop_ffmpeg import _subprocess_kwargs, resolve_media_binary
 
 
 class DesktopMediaDownloader(MediaDownloader):
@@ -55,6 +55,7 @@ class DesktopMediaDownloader(MediaDownloader):
             out_template = str(workspace_dir / "%(id)s.%(ext)s")
             cmd = [
                 self.ytdlp_bin,
+                "--no-playlist",
                 "-f",
                 "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
                 "--merge-output-format",
@@ -64,7 +65,13 @@ class DesktopMediaDownloader(MediaDownloader):
                 out_template,
                 source,
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                **_subprocess_kwargs(),
+            )
             if proc.returncode != 0:
                 raise RuntimeError(f"yt-dlp failed: {proc.stderr.strip() or proc.stdout.strip()}")
 

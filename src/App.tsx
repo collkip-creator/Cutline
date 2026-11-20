@@ -17,7 +17,16 @@ import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
-import { apiFetch, apiUrl, readJsonResponse } from './lib/api';
+import {
+  apiFetch,
+  apiUrl,
+  checkSidecarHealth,
+  getTauriSidecarDiagnostics,
+  isTauriRuntime,
+  readJsonResponse,
+  restartTauriSidecar,
+  type SidecarDiagnostics,
+} from './lib/api';
 import type {
   AspectRatio,
   ClipCandidate,
@@ -60,7 +69,13 @@ export default function App() {
   const [lastExport, setLastExport] = useState<ExportResult | null>(null);
 
   // Async states & notices
-  const [isIngesting, setIsIngesting] = useState(false);
+  const [sidecarStatus, setSidecarStatus] = useState<'checking' | 'ready' | 'starting' | 'error'>(
+    isTauriRuntime ? 'starting' : 'checking'
+  );
+  const [sidecarDiag, setSidecarDiag] = useState<SidecarDiagnostics | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isFetchingUrl, setIsFetchingUrl] = useState(false);
+  const [isLoadingSample, setIsLoadingSample] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -127,10 +142,58 @@ export default function App() {
     }
   };
 
+  const bootWorkspace = async () => {
+    let cancelled = false;
+    const maxPolls = isTauriRuntime ? 50 : 2;
+    if (isTauriRuntime) {
+      setSidecarStatus('starting');
+    }
+
+    for (let i = 0; i < maxPolls; i++) {
+      if (cancelled) return;
+      const healthy = await checkSidecarHealth(2000);
+      if (healthy) {
+        setSidecarStatus('ready');
+        setSidecarDiag(null);
+        await Promise.all([loadProjects(true), loadQueue()]);
+        return;
+      }
+      if (isTauriRuntime) {
+        const diag = await getTauriSidecarDiagnostics();
+        if (diag) {
+          setSidecarDiag(diag);
+          if (diag.spawn_error || diag.terminated) {
+            setSidecarStatus('error');
+            return;
+          }
+        }
+      }
+      await new Promise((r) => setTimeout(r, 750));
+    }
+
+    if (isTauriRuntime) {
+      setSidecarDiag(await getTauriSidecarDiagnostics());
+      setSidecarStatus('error');
+    } else {
+      setSidecarStatus('ready');
+      await Promise.all([loadProjects(true), loadQueue()]);
+    }
+    return () => {
+      cancelled = true;
+    };
+  };
+
   useEffect(() => {
-    loadProjects(true);
-    loadQueue();
+    bootWorkspace();
   }, []);
+
+  const handleRestartSidecar = async () => {
+    setSidecarStatus('starting');
+    setSidecarDiag(null);
+    setNotice(null);
+    await restartTauriSidecar();
+    await bootWorkspace();
+  };
 
   const persistClips = async (hash: string, updatedClips: ClipCandidate[]) => {
     await apiFetch(`/api/projects/${encodeURIComponent(hash)}/clips`, {
@@ -141,11 +204,12 @@ export default function App() {
   };
 
   const handleLoadSample = async () => {
-    setIsIngesting(true);
+    setIsLoadingSample(true);
     setNotice(null);
     try {
       const res = await apiFetch('/api/projects/sample', { method: 'POST' });
       const data = await readJsonResponse<any>(res);
+      setSidecarStatus('ready');
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
@@ -154,20 +218,26 @@ export default function App() {
       setLastExport(null);
       await loadProjects(false);
     } catch (err: any) {
+      if (isTauriRuntime) setSidecarDiag(await getTauriSidecarDiagnostics());
       setNotice({ kind: 'error', text: err.message });
     } finally {
-      setIsIngesting(false);
+      setIsLoadingSample(false);
     }
   };
 
   const handleFileUpload = async (file: File) => {
-    setIsIngesting(true);
-    setNotice(null);
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+    setIsUploading(true);
+    setNotice({
+      kind: 'info',
+      text: `Loading "${file.name}" (${sizeMb} MB) into local workspace...`,
+    });
     try {
       const form = new FormData();
       form.append('video', file);
       const res = await apiFetch('/api/projects/upload', { method: 'POST', body: form });
       const data = await readJsonResponse<any>(res);
+      setSidecarStatus('ready');
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
@@ -177,19 +247,25 @@ export default function App() {
       await loadProjects(false);
       if (!data.transcript) {
         await handleTranscribe(data.project.video_hash, false);
+      } else {
+        setNotice({ kind: 'info', text: `Loaded "${file.name}" with cached transcript.` });
       }
     } catch (err: any) {
+      if (isTauriRuntime) setSidecarDiag(await getTauriSidecarDiagnostics());
       setNotice({ kind: 'error', text: err.message });
     } finally {
-      setIsIngesting(false);
+      setIsUploading(false);
     }
   };
 
   const handleUrlIngest = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!streamUrl.trim()) return;
-    setIsIngesting(true);
-    setNotice(null);
+    setIsFetchingUrl(true);
+    setNotice({
+      kind: 'info',
+      text: 'Fetching stream via yt-dlp (this can take 10–60s depending on stream size)...',
+    });
     try {
       const res = await apiFetch('/api/projects/url', {
         method: 'POST',
@@ -197,17 +273,20 @@ export default function App() {
         body: JSON.stringify({ url: streamUrl.trim() }),
       });
       const data = await readJsonResponse<any>(res);
+      setSidecarStatus('ready');
       setActiveProject(data.project);
       setTranscript(data.transcript);
       setCacheHit(Boolean(data.cache_hit));
       setClips(data.project.clips || []);
       setActiveClipId(data.project.clips?.[0]?.id || null);
       setStreamUrl('');
+      setNotice({ kind: 'info', text: `Imported "${data.project.title}" from URL.` });
       await loadProjects(false);
     } catch (err: any) {
+      if (isTauriRuntime) setSidecarDiag(await getTauriSidecarDiagnostics());
       setNotice({ kind: 'error', text: err.message });
     } finally {
-      setIsIngesting(false);
+      setIsFetchingUrl(false);
     }
   };
 
@@ -656,6 +735,36 @@ export default function App() {
         </header>
 
         <main className="p-4 lg:p-6 max-w-[1440px] w-full mx-auto space-y-5 flex-1">
+          {isTauriRuntime && sidecarStatus !== 'ready' && (
+            <div
+              className={`px-4 py-3 rounded-md border text-xs space-y-2 ${
+                sidecarStatus === 'error'
+                  ? 'bg-rose-950/40 border-rose-500/40 text-rose-100'
+                  : 'bg-amber-950/35 border-amber-500/40 text-amber-100'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <span className="font-medium">
+                  {sidecarStatus === 'starting'
+                    ? 'Starting local Python sidecar on 127.0.0.1:43111 (first launch unpacks Whisper & FFmpeg runtime)...'
+                    : `Local Python sidecar failed to start (${sidecarDiag?.terminated || sidecarDiag?.spawn_error || '127.0.0.1:43111 unreachable'}).`}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleRestartSidecar}
+                  className="px-3 py-1 text-xs font-semibold bg-slate-900 hover:bg-slate-800 border border-slate-700 text-white rounded shrink-0"
+                >
+                  Restart Sidecar
+                </button>
+              </div>
+              {sidecarStatus === 'error' && (sidecarDiag?.log_file_tail || sidecarDiag?.logs.length) ? (
+                <pre className="bg-[#0B0F17] border border-slate-800 rounded p-2.5 text-[11px] font-mono text-slate-300 overflow-x-auto max-h-36">
+                  {sidecarDiag.log_file_tail || sidecarDiag.logs.join('\n')}
+                </pre>
+              ) : null}
+            </div>
+          )}
+
           {notice && (
             <div
               className={`px-4 py-2.5 rounded-md border text-xs flex items-center justify-between gap-4 ${
@@ -684,31 +793,33 @@ export default function App() {
                     <input
                       ref={fileInputRef}
                       type="file"
-                      accept="video/*"
-                      className="hidden"
+                      accept="video/*,.mp4,.mov,.mkv,.webm,.avi,.m4v"
+                      className="sr-only"
+                      onClick={(e) => {
+                        e.currentTarget.value = '';
+                      }}
                       onChange={(e) => {
                         const f = e.target.files?.[0];
-                        e.target.value = '';
                         if (f) handleFileUpload(f);
                       }}
                     />
                     <button
                       type="button"
-                      disabled={isIngesting}
+                      disabled={isUploading}
                       onClick={() => fileInputRef.current?.click()}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
                       <Upload className="w-3.5 h-3.5" />
-                      Pick Local Video
+                      {isUploading ? 'Uploading...' : 'Pick Local Video'}
                     </button>
                     <button
                       type="button"
-                      disabled={isIngesting}
+                      disabled={isLoadingSample}
                       onClick={handleLoadSample}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 disabled:opacity-50 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
                       <Video className="w-3.5 h-3.5" />
-                      {isIngesting ? 'Preparing...' : 'Load Sample Footage'}
+                      {isLoadingSample ? 'Preparing...' : 'Load Sample Footage'}
                     </button>
                   </div>
 
@@ -725,10 +836,10 @@ export default function App() {
                     </div>
                     <button
                       type="submit"
-                      disabled={isIngesting || !streamUrl.trim()}
+                      disabled={isFetchingUrl || !streamUrl.trim()}
                       className="px-3.5 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
-                      Fetch URL
+                      {isFetchingUrl ? 'Fetching...' : 'Fetch URL'}
                     </button>
                   </form>
                 </div>
