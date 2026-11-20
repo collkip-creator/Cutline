@@ -106,11 +106,13 @@ except ImportError:  # pragma: no cover - stdlib fallback for minimal environmen
         def model_validate(cls: Type[T], obj: Any) -> T:
             if isinstance(obj, cls):
                 return obj
-            if isinstance(obj, str):
-                obj = json.loads(obj)
             if not isinstance(obj, dict):
-                raise TypeError(f"Expected dict or JSON string, got {type(obj)}")
+                raise TypeError(f"Expected dict or {cls.__name__}, got {type(obj).__name__}")
             return cls(**obj)
+
+        @classmethod
+        def model_validate_json(cls: Type[T], raw: str | bytes) -> T:
+            return cls(**json.loads(raw))
 
         @classmethod
         def model_json_schema(cls) -> dict[str, Any]:

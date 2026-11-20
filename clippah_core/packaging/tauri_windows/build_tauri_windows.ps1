@@ -44,8 +44,9 @@ try {
         try {
             $Health = Invoke-RestMethod -Uri "http://127.0.0.1:43111/api/health" -TimeoutSec 2
             if ($Health.status -eq "ok") {
+                $Projects = Invoke-RestMethod -Uri "http://127.0.0.1:43111/api/projects" -TimeoutSec 5
                 $SidecarHealthy = $true
-                Write-Host "Sidecar smoke test passed: $($Health | ConvertTo-Json -Compress)"
+                Write-Host "Sidecar smoke test passed: $($Health | ConvertTo-Json -Compress) (projects=$($Projects.Count))"
                 break
             }
         } catch {
