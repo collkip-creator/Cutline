@@ -5,24 +5,26 @@ Windows sidecar executable (`cutline-sidecar-x86_64-pc-windows-msvc.exe`).
 """
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parents[2]
 
+fw_datas, fw_bins, fw_hidden = collect_all("faster_whisper")
+ct_datas, ct_bins, ct_hidden = collect_all("ctranslate2")
+
 a = Analysis(
-    [str(ROOT / "clippah_core" / "ui" / "tauri_sidecar.py")],
+    [str(ROOT / "clippah_core" / "packaging" / "tauri_windows" / "sidecar_entry.py")],
     pathex=[str(ROOT)],
-    binaries=[],
-    datas=[],
+    binaries=fw_bins + ct_bins,
+    datas=fw_datas + ct_datas,
     hiddenimports=[
         "uvicorn.logging",
         "uvicorn.loops.auto",
         "uvicorn.protocols.http.auto",
         "uvicorn.lifespan.on",
-        "faster_whisper",
-        "ctranslate2",
         "pydantic",
         "multipart",
-    ],
+    ] + fw_hidden + ct_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

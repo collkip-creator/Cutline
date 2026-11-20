@@ -11,7 +11,15 @@ if (-not (Test-Path ".venv-win")) {
     python -m venv .venv-win
 }
 & .\.venv-win\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv-win\Scripts\pip.exe install -r clippah_core\requirements.txt python-multipart pyinstaller
+& .\.venv-win\Scripts\pip.exe install `
+    "pydantic>=2.7.0" `
+    "httpx>=0.27.0" `
+    "faster-whisper>=1.0.3" `
+    "yt-dlp>=2024.10.0" `
+    "fastapi>=0.115.0" `
+    "uvicorn>=0.30.0" `
+    "python-multipart>=0.0.9" `
+    "pyinstaller>=6.10.0"
 
 Write-Host "==> 2. Compiling cutline-sidecar-x86_64-pc-windows-msvc.exe..."
 New-Item -ItemType Directory -Force -Path "src-tauri\binaries" | Out-Null
@@ -39,7 +47,11 @@ if (-not (Test-Path "$BinDir\ffmpeg.exe") -or -not (Test-Path "$BinDir\ffprobe.e
 }
 
 Write-Host "==> 4. Installing frontend deps & building Tauri v2 NSIS installer (.exe)..."
-npm ci
+if (Test-Path "package-lock.json") {
+    npm ci
+} else {
+    npm install
+}
 npx --yes @tauri-apps/cli@2 build --bundles nsis
 
 Write-Host "==> Done! Installer created under src-tauri\target\release\bundle\nsis\"
