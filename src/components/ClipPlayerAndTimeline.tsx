@@ -35,6 +35,7 @@ interface ClipPlayerAndTimelineProps {
   onBurnCaptionsChange: (val: boolean) => void;
   onSelectClip: (clip: ClipCandidate) => void;
   onUpdateClipBounds: (clipId: string, startSec: number, endSec: number) => void;
+  onAddClipRange: (startSec: number, endSec: number) => void;
   onExportClip: () => Promise<void>;
   isExporting: boolean;
   lastExport: ExportResult | null;
@@ -63,6 +64,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   onBurnCaptionsChange,
   onSelectClip,
   onUpdateClipBounds,
+  onAddClipRange,
   onExportClip,
   isExporting,
   lastExport,
@@ -73,28 +75,78 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   const [isMuted, setIsMuted] = useState(false);
   const [loopClip, setLoopClip] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
+  const [markInSec, setMarkInSec] = useState<number | null>(null);
+
+  // Reset active mark if switching projects
+  useEffect(() => {
+    setMarkInSec(null);
+    setCurrentTime(0);
+    setIsPlaying(false);
+  }, [project.video_hash]);
 
   // Seek player to active clip start when selection changes
   useEffect(() => {
     const vid = videoRef.current;
-    if (!vid || !activeClip) return;
+    if (!vid || !activeClip || markInSec !== null) return;
     vid.currentTime = activeClip.start_sec;
     setCurrentTime(activeClip.start_sec);
   }, [activeClip?.id]);
 
-  // Sync playhead and clip looping
+  // Sync playhead and clip looping (paused while actively marking a new clip)
   const handleTimeUpdate = () => {
     const vid = videoRef.current;
     if (!vid) return;
     const t = vid.currentTime;
     setCurrentTime(t);
-    if (loopClip && activeClip && t >= activeClip.end_sec) {
+    if (loopClip && activeClip && markInSec === null && t >= activeClip.end_sec) {
       vid.currentTime = activeClip.start_sec;
       if (isPlaying) {
         vid.play().catch(() => {});
       }
     }
   };
+
+  const handleStartMark = () => {
+    const t = videoRef.current ? videoRef.current.currentTime : currentTime;
+    setMarkInSec(Math.round(t * 100) / 100);
+  };
+
+  const handleEndMark = () => {
+    if (markInSec === null) return;
+    const t = videoRef.current ? videoRef.current.currentTime : currentTime;
+    const s = Math.min(markInSec, t);
+    const e = Math.max(markInSec, t);
+    const safeEnd = Math.min(project.duration_sec, Math.max(s + Math.min(1.0, project.duration_sec - s), e));
+    onAddClipRange(Math.round(s * 100) / 100, Math.round(safeEnd * 100) / 100);
+    setMarkInSec(null);
+  };
+
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (ev.key === 'i' || ev.key === 'I') {
+        ev.preventDefault();
+        handleStartMark();
+      } else if ((ev.key === 'o' || ev.key === 'O') && markInSec !== null) {
+        ev.preventDefault();
+        handleEndMark();
+      } else if (ev.key === 'Escape' && markInSec !== null) {
+        ev.preventDefault();
+        setMarkInSec(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [markInSec, currentTime, project.duration_sec]);
 
   const togglePlay = () => {
     const vid = videoRef.current;
@@ -243,16 +295,16 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
             </div>
           </div>
 
-          {/* Transport Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
-            <div className="flex items-center gap-2">
+          {/* Transport & Live Clip Marking Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2 border-t border-slate-800/80">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={togglePlay}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded border border-slate-700 transition-colors whitespace-nowrap shrink-0"
               >
                 {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-                {isPlaying ? 'Pause' : 'Play Clip'}
+                {isPlaying ? 'Pause' : 'Play'}
               </button>
               <button
                 type="button"
@@ -271,6 +323,42 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
               >
                 {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
               </button>
+
+              <span className="h-4 w-px bg-slate-800 mx-0.5 hidden sm:inline-block" aria-hidden="true" />
+
+              {markInSec === null ? (
+                <button
+                  type="button"
+                  onClick={handleStartMark}
+                  title="Mark clip start at current playhead (Shortcut: I)"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-200 border border-emerald-500/45 rounded transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Scissors className="w-3.5 h-3.5" />
+                  Start New Clip (I)
+                </button>
+              ) : (
+                <div className="inline-flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleEndMark}
+                    title="Finish and save clip at current playhead (Shortcut: O)"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded transition-colors whitespace-nowrap shrink-0"
+                  >
+                    End &amp; Save Clip (O)
+                  </button>
+                  <span className="text-[11px] font-mono tabular-nums text-emerald-300 px-1.5">
+                    {formatTimecode(markInSec)} → {formatTimecode(currentTime)} (
+                    {Math.abs(currentTime - markInSec).toFixed(2)}s)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setMarkInSec(null)}
+                    className="px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200 border border-slate-800 rounded"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
             </div>
 
             <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
@@ -280,7 +368,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                 onChange={(e) => setLoopClip(e.target.checked)}
                 className="rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500"
               />
-              Loop active clip range
+              Loop active clip
             </label>
           </div>
         </div>
@@ -380,7 +468,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="flex items-center justify-between bg-[#0B0F17] border border-slate-800 rounded px-2.5 py-1.5">
+                  <div className="flex items-center justify-between bg-[#0B0F17] border border-slate-800 rounded px-2 py-1.5">
                     <span className="text-slate-400">In</span>
                     <div className="flex items-center gap-1 font-mono tabular-nums">
                       <button
@@ -402,7 +490,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                         onClick={() =>
                           onUpdateClipBounds(
                             activeClip.id,
-                            Math.min(activeClip.end_sec - 1, activeClip.start_sec + 0.25),
+                            Math.min(activeClip.end_sec - 0.5, activeClip.start_sec + 0.25),
                             activeClip.end_sec
                           )
                         }
@@ -410,9 +498,20 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                       >
                         +0.25
                       </button>
+                      <button
+                        type="button"
+                        title="Set clip start to current playhead"
+                        onClick={() => {
+                          const nextIn = Math.min(activeClip.end_sec - 0.5, currentTime);
+                          onUpdateClipBounds(activeClip.id, Math.max(0, nextIn), activeClip.end_sec);
+                        }}
+                        className="px-1.5 py-0.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-sans text-[10px]"
+                      >
+                        Set
+                      </button>
                     </div>
                   </div>
-                  <div className="flex items-center justify-between bg-[#0B0F17] border border-slate-800 rounded px-2.5 py-1.5">
+                  <div className="flex items-center justify-between bg-[#0B0F17] border border-slate-800 rounded px-2 py-1.5">
                     <span className="text-slate-400">Out</span>
                     <div className="flex items-center gap-1 font-mono tabular-nums">
                       <button
@@ -421,7 +520,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                           onUpdateClipBounds(
                             activeClip.id,
                             activeClip.start_sec,
-                            Math.max(activeClip.start_sec + 1, activeClip.end_sec - 0.25)
+                            Math.max(activeClip.start_sec + 0.5, activeClip.end_sec - 0.25)
                           )
                         }
                         className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
@@ -441,6 +540,21 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                         className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
                       >
                         +0.25
+                      </button>
+                      <button
+                        type="button"
+                        title="Set clip end to current playhead"
+                        onClick={() => {
+                          const nextOut = Math.max(activeClip.start_sec + 0.5, currentTime);
+                          onUpdateClipBounds(
+                            activeClip.id,
+                            activeClip.start_sec,
+                            Math.min(project.duration_sec, nextOut)
+                          );
+                        }}
+                        className="px-1.5 py-0.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-sans text-[10px]"
+                      >
+                        Set
                       </button>
                     </div>
                   </div>
@@ -562,6 +676,21 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
               </button>
             );
           })}
+
+          {/* Live Marked Range Band */}
+          {markInSec !== null && (() => {
+            const total = Math.max(1, project.duration_sec);
+            const lo = Math.min(markInSec, currentTime);
+            const hi = Math.max(markInSec, currentTime);
+            const leftPct = (lo / total) * 100;
+            const widthPct = Math.max(0.8, ((hi - lo) / total) * 100);
+            return (
+              <div
+                style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                className="pointer-events-none absolute top-0.5 bottom-0.5 bg-emerald-500/25 border border-emerald-400/80 rounded-sm"
+              />
+            );
+          })()}
 
           {/* Playhead */}
           <div

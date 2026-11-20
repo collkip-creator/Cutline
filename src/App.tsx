@@ -430,27 +430,64 @@ export default function App() {
     }
   };
 
-  const handleAddManualClip = () => {
+  const handleAddManualClip = (startSec?: number, endSec?: number) => {
     if (!activeProject) return;
-    const start = 0;
-    const end = Math.min(activeProject.duration_sec, 12);
-    const id = `clip_${String(clips.length + 1).padStart(2, '0')}`;
+    const maxDur = Math.max(1, activeProject.duration_sec || 10);
+    const defaultStart =
+      clips.length > 0
+        ? Math.min(Math.max(0, maxDur - 2), Math.max(...clips.map((c) => c.end_sec)))
+        : 0;
+    const rawStart = startSec ?? defaultStart;
+    const rawEnd = endSec ?? Math.min(maxDur, rawStart + 12);
+    const start = Math.round(Math.max(0, Math.min(rawStart, rawEnd)) * 100) / 100;
+    const end =
+      Math.round(
+        Math.min(maxDur, Math.max(start + Math.min(1.0, maxDur - start), Math.max(rawStart, rawEnd))) *
+          100
+      ) / 100;
+
+    let maxIdx = 0;
+    for (const c of clips) {
+      const m = c.id.match(/(\d+)$/);
+      if (m) maxIdx = Math.max(maxIdx, Number(m[1]));
+    }
+    const nextNum = Math.max(clips.length + 1, maxIdx + 1);
+    const id = `clip_${String(nextNum).padStart(2, '0')}`;
+
+    const spokenText = transcript
+      ? transcript.segments
+          .filter((s) => s.end_sec >= start && s.start_sec <= end)
+          .map((s) => s.text.trim())
+          .join(' ')
+          .trim()
+      : '';
+    const autoTitle = spokenText
+      ? spokenText.slice(0, 56) + (spokenText.length > 56 ? '…' : '')
+      : `Manual Clip ${nextNum}`;
+    const autoHook = spokenText
+      ? spokenText.split(/[.!?]/)[0].trim().slice(0, 44).toUpperCase() || 'HIGHLIGHT'
+      : 'KEY TAKEAWAY';
+
     const created: ClipCandidate = {
       id,
-      title: `Manual Clip ${clips.length + 1}`,
+      title: autoTitle,
       category: 'insight',
       start_sec: start,
       end_sec: end,
       hook_score: 7.5,
       lesson_score: 7.0,
       entertainment_score: 6.5,
-      reason: 'Manually defined range',
-      caption_hook: 'KEY TAKEAWAY',
+      reason: 'Manually marked start/end range',
+      caption_hook: autoHook,
       tags: ['manual'],
     };
-    const next = [...clips, created];
+    const next = [...clips, created].sort((a, b) => a.start_sec - b.start_sec);
     setClips(next);
     setActiveClipId(id);
+    setNotice({
+      kind: 'info',
+      text: `Added ${id} (${start.toFixed(2)}s – ${end.toFixed(2)}s · ${(end - start).toFixed(2)}s).`,
+    });
     persistClips(activeProject.video_hash, next);
   };
 
@@ -953,6 +990,7 @@ export default function App() {
                     onBurnCaptionsChange={setBurnCaptions}
                     onSelectClip={(c) => setActiveClipId(c.id)}
                     onUpdateClipBounds={handleUpdateClipBounds}
+                    onAddClipRange={(s, e) => handleAddManualClip(s, e)}
                     onExportClip={handleExportActiveClip}
                     isExporting={isExporting}
                     lastExport={lastExport}
@@ -967,7 +1005,7 @@ export default function App() {
                     onSelectClip={(c) => setActiveClipId(c.id)}
                     onChangeClip={handleChangeClip}
                     onDeleteClip={handleDeleteClip}
-                    onAddManualClip={handleAddManualClip}
+                    onAddManualClip={() => handleAddManualClip()}
                     onSnapToWords={handleSnapToWords}
                     onQueueClip={openQueueModal}
                   />
