@@ -21,11 +21,19 @@ struct SidecarState(Arc<Mutex<SidecarInner>>);
 #[derive(serde::Serialize)]
 struct SidecarDiagnosticsSnapshot {
     running: bool,
+    port_listening: bool,
     spawn_error: Option<String>,
     terminated: Option<String>,
     logs: Vec<String>,
     log_file_path: String,
     log_file_tail: String,
+}
+
+fn is_sidecar_port_open() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr = SocketAddr::from(([127, 0, 0, 1], 43111));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
 }
 
 fn sidecar_log_path() -> Option<PathBuf> {
@@ -172,10 +180,12 @@ fn get_sidecar_diagnostics(state: State<'_, SidecarState>) -> SidecarDiagnostics
         })
         .unwrap_or_default();
 
+    let port_listening = is_sidecar_port_open();
     let guard = state.0.lock().ok();
     match guard {
         Some(g) => SidecarDiagnosticsSnapshot {
             running: g.running,
+            port_listening,
             spawn_error: g.spawn_error.clone(),
             terminated: g.terminated.clone(),
             logs: g.logs.clone(),
@@ -184,6 +194,7 @@ fn get_sidecar_diagnostics(state: State<'_, SidecarState>) -> SidecarDiagnostics
         },
         None => SidecarDiagnosticsSnapshot {
             running: false,
+            port_listening,
             spawn_error: Some("Sidecar state lock poisoned".to_string()),
             terminated: None,
             logs: Vec::new(),

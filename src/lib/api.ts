@@ -12,6 +12,7 @@ export const API_BASE_URL: string =
 
 export interface SidecarDiagnostics {
   running: boolean;
+  port_listening?: boolean;
   spawn_error: string | null;
   terminated: string | null;
   logs: string[];
@@ -78,10 +79,18 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   if (isTauriRuntime) {
     const diag = await getTauriSidecarDiagnostics();
     const detail = diag?.spawn_error || diag?.terminated;
+    if (detail) {
+      throw new Error(
+        `Local sidecar stopped (${detail}). Log: ${diag?.log_file_path || '%USERPROFILE%\\.cutline_studio\\sidecar.log'}`
+      );
+    }
+    if (diag && diag.running && !diag.port_listening) {
+      throw new Error(
+        `Local sidecar is still starting (port 43111 not open yet). Wait a few seconds or check ${diag.log_file_path}.`
+      );
+    }
     throw new Error(
-      detail
-        ? `Local sidecar stopped (${detail}). Log: ${diag?.log_file_path || '%USERPROFILE%\\.cutline_studio\\sidecar.log'}`
-        : `Local sidecar unreachable (${msg}). Check %USERPROFILE%\\.cutline_studio\\sidecar.log if cutline-sidecar failed to start on 127.0.0.1:43111.`
+      `Local sidecar unreachable (${msg}). Check %USERPROFILE%\\.cutline_studio\\sidecar.log if cutline-sidecar failed to start on 127.0.0.1:43111.`
     );
   }
   throw new Error(

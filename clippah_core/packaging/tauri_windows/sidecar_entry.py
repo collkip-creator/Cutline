@@ -1,5 +1,6 @@
 """Top-level PyInstaller entrypoint using absolute package imports for Tauri sidecar."""
 
+from datetime import datetime, timezone
 import multiprocessing
 from pathlib import Path
 import sys
@@ -20,6 +21,11 @@ def _setup_stdio_log() -> Path:
     return log_path
 
 
+def _log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[sidecar {ts}] {msg}", flush=True)
+
+
 def _run_transcribe_worker(wav_path: str, video_hash: str, out_json: str) -> int:
     from clippah_core.adapters.desktop_whisper import FasterWhisperTranscriber
 
@@ -35,19 +41,25 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 5 and sys.argv[1] == "--transcribe-worker":
         try:
+            _log(f"Starting transcribe worker for {sys.argv[3]}")
             sys.exit(_run_transcribe_worker(sys.argv[2], sys.argv[3], sys.argv[4]))
         except Exception:
             traceback.print_exc()
             sys.exit(1)
 
     try:
+        _log("Booting FastAPI sidecar...")
         import uvicorn
         from clippah_core.ui.tauri_sidecar import app
 
+        _log("Binding Uvicorn on http://127.0.0.1:43111")
         uvicorn.run(
             app,
             host="127.0.0.1",
             port=43111,
+            loop="asyncio",
+            http="h11",
+            ws="none",
             log_config=None,
             access_log=False,
         )

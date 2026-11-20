@@ -53,9 +53,12 @@ class DesktopMediaDownloader(MediaDownloader):
                 on_progress(0.10, "Downloading stream via yt-dlp...")
 
             out_template = str(workspace_dir / "%(id)s.%(ext)s")
+            ffmpeg_bin = getattr(self.video_processor, "ffmpeg_bin", None) or resolve_media_binary("ffmpeg")
             cmd = [
                 self.ytdlp_bin,
                 "--no-playlist",
+                "--no-warnings",
+                "--no-progress",
                 "-f",
                 "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
                 "--merge-output-format",
@@ -63,8 +66,11 @@ class DesktopMediaDownloader(MediaDownloader):
                 "--print-json",
                 "-o",
                 out_template,
-                source,
             ]
+            if Path(ffmpeg_bin).is_file():
+                cmd.extend(["--ffmpeg-location", str(Path(ffmpeg_bin).parent)])
+            cmd.append(source)
+
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -75,8 +81,16 @@ class DesktopMediaDownloader(MediaDownloader):
             if proc.returncode != 0:
                 raise RuntimeError(f"yt-dlp failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
-            info = json.loads(proc.stdout.strip().splitlines()[-1])
-            local_path = Path(info.get("_filename") or info.get("requested_downloads", [{}])[0].get("filepath"))
+            json_lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip().startswith("{")]
+            if not json_lines:
+                raise RuntimeError("yt-dlp did not emit metadata JSON for the requested URL.")
+            info = json.loads(json_lines[-1])
+            dl_path = (info.get("requested_downloads") or [{}])[0].get("filepath") or info.get("_filename")
+            if not dl_path:
+                raise RuntimeError("yt-dlp completed without an output file path.")
+            local_path = Path(dl_path)
+            if not local_path.exists() and local_path.with_suffix(".mp4").exists():
+                local_path = local_path.with_suffix(".mp4")
             title = info.get("title") or local_path.stem
             source_url = source
 

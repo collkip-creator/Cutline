@@ -32,6 +32,43 @@ New-Item -ItemType Directory -Force -Path "src-tauri\resources\bin" | Out-Null
     clippah_core\packaging\tauri_windows\sidecar.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
+Write-Host "==> 2b. Smoke-testing compiled sidecar on 127.0.0.1:43111..."
+$SidecarExe = "src-tauri\binaries\cutline-sidecar-x86_64-pc-windows-msvc.exe"
+$SidecarProc = Start-Process -FilePath $SidecarExe -PassThru
+$SidecarHealthy = $false
+try {
+    for ($i = 0; $i -lt 40; $i++) {
+        if ($SidecarProc.HasExited) {
+            throw "Sidecar exited prematurely with code $($SidecarProc.ExitCode)"
+        }
+        try {
+            $Health = Invoke-RestMethod -Uri "http://127.0.0.1:43111/api/health" -TimeoutSec 2
+            if ($Health.status -eq "ok") {
+                $SidecarHealthy = $true
+                Write-Host "Sidecar smoke test passed: $($Health | ConvertTo-Json -Compress)"
+                break
+            }
+        } catch {
+            Start-Sleep -Milliseconds 750
+        }
+    }
+    if (-not $SidecarHealthy) {
+        throw "Sidecar did not respond on 127.0.0.1:43111/api/health within 30s"
+    }
+} catch {
+    $LogFile = Join-Path $env:USERPROFILE ".cutline_studio\sidecar.log"
+    if (Test-Path $LogFile) {
+        Write-Host "--- sidecar.log ---"
+        Get-Content $LogFile -Tail 50
+    }
+    throw
+} finally {
+    if ($SidecarProc -and -not $SidecarProc.HasExited) {
+        Stop-Process -Id $SidecarProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    taskkill /F /IM cutline-sidecar-x86_64-pc-windows-msvc.exe /T 2>$null | Out-Null
+}
+
 Write-Host "==> 3. Fetching static Windows ffmpeg.exe, ffprobe.exe, and yt-dlp.exe if missing..."
 $BinDir = "src-tauri\resources\bin"
 if (-not (Test-Path "$BinDir\yt-dlp.exe")) {
