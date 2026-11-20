@@ -1,0 +1,134 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.displayName is string && data.displayName.size() <= 160
+        && data.email is string && data.email.size() <= 254
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSocialPlatform(platform) {
+      return platform is string && platform in ['tiktok', 'instagram', 'youtube'];
+    }
+
+    function isValidSocialConnection(data, platform) {
+      return data.keys().hasAll([
+          'platform',
+          'accountName',
+          'handle',
+          'externalAccountId',
+          'accessToken',
+          'refreshToken',
+          'expiresAt',
+          'scopes',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'platform',
+          'accountName',
+          'handle',
+          'externalAccountId',
+          'accessToken',
+          'refreshToken',
+          'expiresAt',
+          'scopes',
+          'updatedAt'
+        ])
+        && isValidSocialPlatform(data.platform)
+        && data.platform == platform
+        && data.accountName is string && data.accountName.size() >= 1 && data.accountName.size() <= 160
+        && data.handle is string && data.handle.size() <= 120
+        && data.externalAccountId is string && data.externalAccountId.size() >= 1 && data.externalAccountId.size() <= 200
+        && data.accessToken is string && data.accessToken.size() >= 1 && data.accessToken.size() <= 4096
+        && data.refreshToken is string && data.refreshToken.size() <= 4096
+        && (data.expiresAt is int || data.expiresAt is float) && data.expiresAt >= 0
+        && data.scopes is list && data.scopes.size() <= 25 && (data.scopes.size() == 0 || data.scopes[0] is string)
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    // Owner-only user root profile
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'updatedAt']);
+      allow delete: if false;
+
+      // Owner-only connected social providers: users/{userId}/socialConnections/{platform}
+      match /socialConnections/{platform} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidSocialPlatform(platform);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidSocialPlatform(platform)
+          && isValidSocialConnection(incoming(), platform)
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidSocialPlatform(platform)
+          && isValidSocialConnection(incoming(), platform)
+          && incoming().platform == existing().platform
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['accessToken', 'refreshToken', 'expiresAt', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly([
+              'accountName',
+              'handle',
+              'externalAccountId',
+              'accessToken',
+              'refreshToken',
+              'expiresAt',
+              'scopes',
+              'updatedAt'
+            ])
+          );
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidSocialPlatform(platform);
+      }
+    }
+  }
+}

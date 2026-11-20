@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import type { User } from 'firebase/auth';
 import {
   CalendarClock,
   Check,
@@ -31,10 +32,18 @@ import {
   shareViaSystemSheet,
   supportsNavigatorShare,
 } from '../lib/socialShare';
+import {
+  type SocialConnectionRecord,
+  type SocialPlatformId,
+} from '../lib/firebase';
+import { SocialAccountsCard } from './SocialAccountsCard';
 
 interface PublishQueueViewProps {
   jobs: PublishJob[];
   channels: PublishChannelConfig[];
+  authUser: User | null;
+  authReady: boolean;
+  socialConnections: Record<SocialPlatformId, SocialConnectionRecord | null>;
   onRefresh: () => Promise<void>;
   onProcessDue: (includeFuture: boolean) => Promise<void>;
   onDispatchJob: (jobId: string) => Promise<void>;
@@ -78,6 +87,9 @@ const STATUS_DISPLAY: Record<PublishStatus, { label: string; colorClass: string 
 export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
   jobs,
   channels,
+  authUser,
+  authReady,
+  socialConnections,
   onRefresh,
   onProcessDue,
   onDispatchJob,
@@ -302,6 +314,14 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Unified Connected Social Accounts Card (TikTok, Instagram Reels, YouTube Shorts) */}
+      <SocialAccountsCard
+        authUser={authUser}
+        authReady={authReady}
+        connections={socialConnections}
+        onStatusBanner={setActionBanner}
+      />
+
       {/* Header & Controls */}
       <div className="bg-[#111724] border border-slate-800/90 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div>

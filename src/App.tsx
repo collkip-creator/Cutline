@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import type { User } from 'firebase/auth';
 import {
   CalendarClock,
   Cpu,
@@ -15,9 +16,17 @@ import {
 import { ArchitectureView } from './components/ArchitectureView';
 import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
 import { SharePublishModal } from './components/SharePublishModal';
+import {
+  ensureUserProfileDoc,
+  subscribeAuthUser,
+  subscribeSocialConnections,
+  type SocialConnectionRecord,
+  type SocialPlatformId,
+} from './lib/firebase';
 import {
   apiFetch,
   apiUrl,
@@ -93,6 +102,17 @@ export default function App() {
   const [queueJobs, setQueueJobs] = useState<PublishJob[]>([]);
   const [queueChannels, setQueueChannels] = useState<PublishChannelConfig[]>([]);
   const [queueModalClip, setQueueModalClip] = useState<ClipCandidate | null>(null);
+
+  // Firebase Auth & Firestore Social Connections
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [socialConnections, setSocialConnections] = useState<
+    Record<SocialPlatformId, SocialConnectionRecord | null>
+  >({
+    tiktok: null,
+    instagram: null,
+    youtube: null,
+  });
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -188,6 +208,30 @@ export default function App() {
   useEffect(() => {
     bootWorkspace();
   }, []);
+
+  useEffect(() => {
+    const unsub = subscribeAuthUser((user) => {
+      setAuthUser(user);
+      setAuthReady(true);
+    });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) {
+      setSocialConnections({ tiktok: null, instagram: null, youtube: null });
+      return;
+    }
+    void ensureUserProfileDoc(authUser).catch(() => {
+      // Non-fatal; social connection save will ensure profile exists too
+    });
+    const unsub = subscribeSocialConnections(
+      authUser.uid,
+      (conns) => setSocialConnections(conns),
+      (err) => setNotice({ kind: 'error', text: err.message })
+    );
+    return unsub;
+  }, [authUser]);
 
   const handleRestartSidecar = async () => {
     setSidecarStatus('starting');
@@ -529,22 +573,27 @@ export default function App() {
     setQueueModalClip(clip);
   };
 
+  const connectedSocialCount = (
+    ['tiktok', 'instagram', 'youtube'] as SocialPlatformId[]
+  ).filter((p) => Boolean(socialConnections[p])).length;
+
   const navItems: Array<{ id: WorkspaceTab; label: string; icon: React.ReactNode }> = [
     { id: 'studio', label: 'Clip Studio', icon: <Scissors className="w-4 h-4" /> },
-    { id: 'queue', label: 'Publish Queue', icon: <CalendarClock className="w-4 h-4" /> },
+    { id: 'queue', label: 'Social & Queue', icon: <CalendarClock className="w-4 h-4" /> },
     { id: 'architecture', label: 'Architecture & Code', icon: <FolderGit2 className="w-4 h-4" /> },
     { id: 'hardware', label: 'Mobile & Hardware', icon: <Cpu className="w-4 h-4" /> },
   ];
 
   const breadcrumbTitle: Record<WorkspaceTab, string> = {
     studio: 'Clip Studio',
-    queue: 'Publish Queue',
+    queue: 'Social Accounts & Publish Queue',
     architecture: 'Architecture & Code',
     hardware: 'Mobile & Hardware Trade-offs',
   };
 
   return (
-    <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex">
+    <ErrorBoundary>
+      <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex">
       {/* Sidebar */}
       <aside
         className={`fixed inset-y-0 left-0 z-40 w-[264px] bg-[#0F1522] border-r border-slate-800/90 flex flex-col transition-transform duration-150 lg:static lg:translate-x-0 ${
@@ -586,9 +635,11 @@ export default function App() {
                   {item.icon}
                   {item.label}
                 </span>
-                {item.id === 'queue' && queueJobs.length > 0 && (
+                {item.id === 'queue' && (queueJobs.length > 0 || connectedSocialCount > 0) && (
                   <span className="font-mono tabular-nums text-[11px] text-slate-400">
-                    {queueJobs.length}
+                    {connectedSocialCount > 0 ? `${connectedSocialCount}/3` : ''}
+                    {connectedSocialCount > 0 && queueJobs.length > 0 ? ' · ' : ''}
+                    {queueJobs.length > 0 ? queueJobs.length : ''}
                   </span>
                 )}
               </button>
@@ -990,6 +1041,9 @@ export default function App() {
             <PublishQueueView
               jobs={queueJobs}
               channels={queueChannels}
+              authUser={authUser}
+              authReady={authReady}
+              socialConnections={socialConnections}
               onRefresh={loadQueue}
               onProcessDue={async (includeFuture) => {
                 await apiFetch('/api/queue/process', {
@@ -1057,6 +1111,12 @@ export default function App() {
           burnCaptions={burnCaptions}
           lastExport={lastExport}
           channels={queueChannels}
+          authUser={authUser}
+          socialConnections={socialConnections}
+          onGoToAccounts={() => {
+            setQueueModalClip(null);
+            setActiveTab('queue');
+          }}
           onExportCompleted={(expData) => setLastExport(expData)}
           onQueueCompleted={async (count, dispatchedNow) => {
             await loadQueue();
@@ -1071,6 +1131,7 @@ export default function App() {
           onClose={() => setQueueModalClip(null)}
         />
       )}
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }

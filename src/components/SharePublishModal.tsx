@@ -1,14 +1,19 @@
 import React, { useMemo, useState } from 'react';
+import type { User } from 'firebase/auth';
 import {
   AlertTriangle,
   Check,
+  CheckCircle2,
   Copy,
   Download,
   ExternalLink,
+  Link2,
+  LogIn,
   Send,
   Share2,
   Sparkles,
   X,
+  XCircle,
 } from 'lucide-react';
 import type {
   AspectRatio,
@@ -20,6 +25,12 @@ import type {
   PublishPlatform,
 } from '../types';
 import { apiFetch, apiUrl, readJsonResponse } from '../lib/api';
+import {
+  saveSocialConnection,
+  signInWithGoogleForSocial,
+  type SocialConnectionRecord,
+  type SocialPlatformId,
+} from '../lib/firebase';
 import {
   buildExportFilename,
   cacheExportInLocalStorage,
@@ -40,6 +51,30 @@ import {
   trimCopyForLimit,
 } from '../lib/socialShare';
 
+type SocialPrivacy = 'public' | 'unlisted' | 'private';
+
+interface DirectPublishResult {
+  platform: SocialPlatformId;
+  ok: boolean;
+  postId?: string;
+  publishedUrl?: string;
+  status: string;
+  error?: string;
+  tokenRefreshed?: boolean;
+  refreshedConnection?: Omit<SocialConnectionRecord, 'updatedAtIso'>;
+}
+
+const DIRECT_PROVIDERS: Array<{
+  id: SocialPlatformId;
+  label: string;
+  accent: string;
+  maxCaptionChars: number;
+}> = [
+  { id: 'tiktok', label: 'TikTok', accent: 'text-cyan-300', maxCaptionChars: 2200 },
+  { id: 'instagram', label: 'Instagram Reels', accent: 'text-pink-300', maxCaptionChars: 2200 },
+  { id: 'youtube', label: 'YouTube Shorts', accent: 'text-rose-300', maxCaptionChars: 100 },
+];
+
 interface SharePublishModalProps {
   clip: ClipCandidate;
   project: ProjectRecord;
@@ -48,6 +83,9 @@ interface SharePublishModalProps {
   burnCaptions: boolean;
   lastExport: ExportResult | null;
   channels: PublishChannelConfig[];
+  authUser: User | null;
+  socialConnections: Record<SocialPlatformId, SocialConnectionRecord | null>;
+  onGoToAccounts?: () => void;
   onExportCompleted: (result: ExportResult) => void;
   onQueueCompleted: (queuedCount: number, dispatchedNow: boolean) => Promise<void>;
   onClose: () => void;
@@ -61,10 +99,33 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   burnCaptions,
   lastExport,
   channels,
+  authUser,
+  socialConnections,
+  onGoToAccounts,
   onExportCompleted,
   onQueueCompleted,
   onClose,
 }) => {
+  const connectedProviderIds = useMemo(
+    () =>
+      DIRECT_PROVIDERS.filter((p) => Boolean(socialConnections[p.id])).map((p) => p.id),
+    [socialConnections]
+  );
+
+  const [shareTab, setShareTab] = useState<'direct' | 'queue'>(() =>
+    connectedProviderIds.length > 0 ? 'direct' : 'queue'
+  );
+
+  // Direct OAuth publish state
+  const [directPlatforms, setDirectPlatforms] = useState<SocialPlatformId[]>(() =>
+    connectedProviderIds.length > 0 ? connectedProviderIds : []
+  );
+  const [privacy, setPrivacy] = useState<SocialPrivacy>('public');
+  const [isPublishingDirect, setIsPublishingDirect] = useState(false);
+  const [directResults, setDirectResults] = useState<DirectPublishResult[] | null>(null);
+  const [isSigningIn, setIsSigningIn] = useState(false);
+
+  // Queue / Share Kit state
   const [selectedPlatforms, setSelectedPlatforms] = useState<PublishPlatform[]>(['youtube_shorts']);
   const [previewPlatform, setPreviewPlatform] = useState<PublishPlatform>('youtube_shorts');
   const [caption, setCaption] = useState<string>(() =>
@@ -110,6 +171,13 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
     [caption, previewTags]
   );
 
+  const toggleDirectPlatform = (pid: SocialPlatformId) => {
+    if (!socialConnections[pid]) return;
+    setDirectPlatforms((prev) =>
+      prev.includes(pid) ? prev.filter((p) => p !== pid) : [...prev, pid]
+    );
+  };
+
   const togglePlatform = (platform: PublishPlatform) => {
     setSelectedPlatforms((prev) => {
       if (prev.includes(platform)) {
@@ -152,6 +220,84 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       // Non-fatal if IndexedDB quota is tight
     }
     return expData;
+  };
+
+  const handleDirectPublish = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authUser) {
+      setStatusMessage({
+        kind: 'error',
+        text: 'Sign in with Google first to publish using your connected social accounts.',
+      });
+      return;
+    }
+    if (directPlatforms.length === 0) {
+      setStatusMessage({
+        kind: 'error',
+        text: 'Select at least one connected social account above.',
+      });
+      return;
+    }
+
+    setIsPublishingDirect(true);
+    setDirectResults(null);
+    setStatusMessage(null);
+    try {
+      const exp = await ensureExportedAsset();
+      const idToken = await authUser.getIdToken();
+      const fullCaption = buildFormattedPostText(caption, parsedUserTags);
+
+      const connectionPayload: Partial<Record<SocialPlatformId, SocialConnectionRecord>> = {};
+      for (const pid of directPlatforms) {
+        const conn = socialConnections[pid];
+        if (conn) connectionPayload[pid] = conn;
+      }
+
+      const res = await apiFetch('/api/social/publish', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          userId: authUser.uid,
+          platforms: directPlatforms,
+          videoUrl: exp.video_url,
+          localVideoPath: exp.video_path,
+          caption: fullCaption,
+          privacy,
+          connections: connectionPayload,
+        }),
+      });
+      const data = await readJsonResponse<{ results: DirectPublishResult[] }>(res);
+      const results = data.results || [];
+      setDirectResults(results);
+
+      // Persist any refreshed OAuth tokens back to Firestore
+      for (const r of results) {
+        if (r.refreshedConnection) {
+          try {
+            await saveSocialConnection(authUser.uid, r.refreshedConnection);
+          } catch {
+            // Token persistence error is non-fatal for display
+          }
+        }
+      }
+
+      const succeeded = results.filter((r) => r.ok).length;
+      const failed = results.length - succeeded;
+      setStatusMessage({
+        kind: failed > 0 && succeeded === 0 ? 'error' : 'info',
+        text:
+          failed === 0
+            ? `Published clip to ${succeeded} platform${succeeded === 1 ? '' : 's'}.`
+            : `Completed: ${succeeded} succeeded, ${failed} failed. Inspect per-platform results below.`,
+      });
+    } catch (err: any) {
+      setStatusMessage({ kind: 'error', text: err?.message || 'Direct social publish failed.' });
+    } finally {
+      setIsPublishingDirect(false);
+    }
   };
 
   const handleCopyPostText = async () => {
@@ -290,7 +436,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       aria-label={`Share & Publish ${clip.id}`}
     >
       <form
-        onSubmit={handleSubmitQueue}
+        onSubmit={shareTab === 'direct' ? handleDirectPublish : handleSubmitQueue}
         className="w-full max-w-2xl bg-[#111724] border border-slate-700 rounded-lg overflow-hidden shadow-2xl flex flex-col max-h-[92vh]"
       >
         <div className="px-5 py-3.5 border-b border-slate-800 bg-[#0B0F17] flex items-center justify-between gap-3">
@@ -312,260 +458,523 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
           </button>
         </div>
 
+        {/* Workflow Switcher */}
+        <div className="px-5 pt-3 pb-2 border-b border-slate-800/80 bg-[#0D131F] flex flex-wrap items-center justify-between gap-2">
+          <div className="inline-flex items-center gap-1 p-0.5 bg-[#0B0F17] border border-slate-800 rounded">
+            <button
+              type="button"
+              onClick={() => {
+                setShareTab('direct');
+                setStatusMessage(null);
+              }}
+              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                shareTab === 'direct'
+                  ? 'bg-blue-600/25 text-blue-200 border border-blue-500/40'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              Connected Accounts ({connectedProviderIds.length}/3)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShareTab('queue');
+                setStatusMessage(null);
+              }}
+              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                shareTab === 'queue'
+                  ? 'bg-slate-800 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Queue / Schedule / Share Kit
+            </button>
+          </div>
+
+          {onGoToAccounts && (
+            <button
+              type="button"
+              onClick={onGoToAccounts}
+              className="inline-flex items-center gap-1 text-[11px] text-blue-400 hover:text-blue-300"
+            >
+              <Link2 className="w-3 h-3" />
+              Manage Social Accounts
+            </button>
+          )}
+        </div>
+
         <div className="p-5 overflow-y-auto space-y-4 text-xs">
-          {/* Multi-Platform Target Picker */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-slate-300 font-medium">
-                Target Channels ({selectedPlatforms.length} selected)
-              </label>
-              <button
-                type="button"
-                onClick={() => setSelectedPlatforms(ALL_PLATFORMS)}
-                className="text-[11px] text-blue-400 hover:text-blue-300"
-              >
-                Select all 4
-              </button>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {ALL_PLATFORMS.map((pid) => {
-                const spec = PLATFORM_SPECS[pid];
-                const checked = selectedPlatforms.includes(pid);
-                const ch = channelMap.get(pid);
-                const hasWebhook = Boolean(ch?.endpoint_url && ch.enabled);
-                return (
+          {shareTab === 'direct' ? (
+            <>
+              {!authUser && (
+                <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="font-semibold text-slate-200">
+                      Sign in with Google to unlock Direct OAuth Publishing
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-0.5">
+                      Your connected TikTok, Instagram Reels, and YouTube Shorts tokens are loaded
+                      from Firestore.
+                    </div>
+                  </div>
                   <button
-                    key={pid}
                     type="button"
-                    onClick={() => togglePlatform(pid)}
-                    className={`p-2.5 rounded border text-left transition-colors ${
-                      checked
-                        ? 'bg-blue-600/20 border-blue-500 text-white'
-                        : 'bg-[#0B0F17] border-slate-800 text-slate-400 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="font-semibold text-xs">{spec.label}</span>
-                      <span
-                        className={`w-3.5 h-3.5 rounded-sm border flex items-center justify-center ${
-                          checked
-                            ? 'bg-blue-500 border-blue-400 text-white'
-                            : 'border-slate-600'
-                        }`}
-                      >
-                        {checked && <Check className="w-2.5 h-2.5" />}
-                      </span>
-                    </div>
-                    <div className="text-[10px] mt-1 font-mono text-slate-400">
-                      {hasWebhook ? 'Webhook connected' : 'Share Kit / Staged'}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Caption + Hashtags Editor */}
-          <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-            <div className="sm:col-span-8 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-slate-300 font-medium">Post Caption / Title</label>
-                {selectedPlatforms.includes('x_video') &&
-                  previewPostText.length > PLATFORM_SPECS.x_video.maxChars && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setCaption((prev) =>
-                          trimCopyForLimit(prev, parsedUserTags, PLATFORM_SPECS.x_video.maxChars)
-                        )
+                    disabled={isSigningIn}
+                    onClick={async () => {
+                      setIsSigningIn(true);
+                      try {
+                        await signInWithGoogleForSocial();
+                      } catch (err: any) {
+                        setStatusMessage({
+                          kind: 'error',
+                          text: err?.message || 'Google sign-in failed.',
+                        });
+                      } finally {
+                        setIsSigningIn(false);
                       }
-                      className="inline-flex items-center gap-1 text-[10px] text-amber-300 hover:text-amber-200"
-                    >
-                      <Sparkles className="w-3 h-3" />
-                      Fit 280c for X
-                    </button>
-                  )}
-              </div>
-              <textarea
-                rows={3}
-                value={caption}
-                onChange={(e) => setCaption(e.target.value)}
-                className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-slate-100 outline-none resize-none"
-              />
-            </div>
-
-            <div className="sm:col-span-4 space-y-1.5">
-              <label className="text-slate-300 font-medium">Hashtags</label>
-              <textarea
-                rows={3}
-                value={hashtagInput}
-                onChange={(e) => setHashtagInput(e.target.value)}
-                placeholder="#coding #productivity"
-                className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 font-mono text-[11px] text-slate-200 outline-none resize-none"
-              />
-              <label className="flex items-center gap-1.5 text-[11px] text-slate-400 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={appendPlatformDefaults}
-                  onChange={(e) => setAppendPlatformDefaults(e.target.checked)}
-                  className="accent-blue-500"
-                />
-                Auto-add channel tags (#Shorts, #fyp)
-              </label>
-            </div>
-          </div>
-
-          {/* Per-Platform Preview & Readiness Check */}
-          <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 space-y-2.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="inline-flex items-center gap-1 bg-[#111724] border border-slate-800 rounded p-0.5">
-                {ALL_PLATFORMS.map((pid) => (
-                  <button
-                    key={pid}
-                    type="button"
-                    onClick={() => setPreviewPlatform(pid)}
-                    className={`px-2 py-1 rounded text-[11px] font-medium transition-colors ${
-                      previewPlatform === pid
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded"
                   >
-                    {PLATFORM_SPECS[pid].shortLabel}
+                    <LogIn className="w-3.5 h-3.5" />
+                    {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
                   </button>
-                ))}
-              </div>
-              <span
-                className={`font-mono tabular-nums text-[11px] ${
-                  previewPostText.length > activePreviewSpec.maxChars
-                    ? 'text-amber-400'
-                    : 'text-slate-400'
-                }`}
-              >
-                {previewPostText.length} / {activePreviewSpec.maxChars} chars
-              </span>
-            </div>
-
-            <pre className="text-[11px] text-slate-200 whitespace-pre-wrap font-sans bg-[#111724] border border-slate-800/80 rounded p-2.5 max-h-24 overflow-y-auto">
-              {previewPostText || '(Empty caption)'}
-            </pre>
-
-            {(() => {
-              const warnings = getPlatformWarnings(
-                previewPlatform,
-                previewPostText,
-                clipDurationSec,
-                aspectRatio
-              );
-              if (warnings.length === 0) return null;
-              return (
-                <div className="flex flex-wrap items-center gap-2 text-[11px] text-amber-300">
-                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                  <span>{warnings.join(' · ')}</span>
                 </div>
-              );
-            })()}
-
-            {/* Instant Share Now Row (Zero-Config Local & Web Actions) */}
-            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-800/80">
-              <button
-                type="button"
-                onClick={handleCopyPostText}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-slate-200"
-              >
-                {copiedCopy ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedCopy ? 'Copied Copy' : `Copy ${activePreviewSpec.shortLabel} Copy`}
-              </button>
-
-              <button
-                type="button"
-                disabled={instantBusy === 'kit'}
-                onClick={handleDownloadShareKit}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-medium"
-              >
-                <Download className="w-3.5 h-3.5" />
-                {instantBusy === 'kit' ? 'Preparing MP4...' : 'Copy + Download MP4'}
-              </button>
-
-              {anyShareSupported && (
-                <button
-                  type="button"
-                  disabled={instantBusy === 'native'}
-                  onClick={handleNativeShare}
-                  title={
-                    fileShareSupported
-                      ? 'Share MP4 file directly through OS Share Sheet'
-                      : 'Share post copy through OS Share Sheet'
-                  }
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 rounded text-emerald-300 font-medium"
-                >
-                  <Share2 className="w-3.5 h-3.5" />
-                  {instantBusy === 'native'
-                    ? 'Opening Share...'
-                    : fileShareSupported
-                      ? 'Share File (OS Sheet)'
-                      : 'Share Text (OS Sheet)'}
-                </button>
               )}
 
-              <a
-                href={activePreviewSpec.buildStudioUrl(previewPostText)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-200 ml-auto"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                {activePreviewSpec.uploadLabel}
-              </a>
-            </div>
-          </div>
+              {/* Connected Accounts Multi-Select */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-slate-300 font-medium">
+                    Select Connected Platforms ({directPlatforms.length} selected)
+                  </label>
+                  {connectedProviderIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setDirectPlatforms(connectedProviderIds)}
+                      className="text-[11px] text-blue-400 hover:text-blue-300"
+                    >
+                      Select all connected ({connectedProviderIds.length})
+                    </button>
+                  )}
+                </div>
 
-          {/* Queue Dispatch Timing */}
-          <div className="space-y-2">
-            <label className="block text-slate-300 font-medium">Queue & Dispatch Mode</label>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => setScheduleMode('now')}
-                className={`py-2 px-3 rounded border font-medium text-center ${
-                  scheduleMode === 'now'
-                    ? 'bg-blue-600/20 border-blue-500 text-white'
-                    : 'bg-[#0B0F17] border-slate-800 text-slate-400'
-                }`}
-              >
-                Save to Queue
-              </button>
-              <button
-                type="button"
-                onClick={() => setScheduleMode('dispatch')}
-                className={`py-2 px-3 rounded border font-medium text-center ${
-                  scheduleMode === 'dispatch'
-                    ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
-                    : 'bg-[#0B0F17] border-slate-800 text-slate-400'
-                }`}
-              >
-                Queue & Publish Now
-              </button>
-              <button
-                type="button"
-                onClick={() => setScheduleMode('later')}
-                className={`py-2 px-3 rounded border font-medium text-center ${
-                  scheduleMode === 'later'
-                    ? 'bg-blue-600/20 border-blue-500 text-white'
-                    : 'bg-[#0B0F17] border-slate-800 text-slate-400'
-                }`}
-              >
-                Schedule Date/Time
-              </button>
-            </div>
-            {scheduleMode === 'later' && (
-              <input
-                type="datetime-local"
-                value={scheduleIso}
-                onChange={(e) => setScheduleIso(e.target.value)}
-                className="w-full bg-[#0B0F17] border border-slate-800 rounded px-3 py-2 font-mono text-slate-100 outline-none focus:border-blue-500"
-              />
-            )}
-          </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {DIRECT_PROVIDERS.map((prov) => {
+                    const conn = socialConnections[prov.id];
+                    const checked = directPlatforms.includes(prov.id);
+                    return (
+                      <button
+                        key={prov.id}
+                        type="button"
+                        disabled={!conn}
+                        onClick={() => toggleDirectPlatform(prov.id)}
+                        className={`p-3 rounded border text-left transition-colors ${
+                          !conn
+                            ? 'bg-[#0B0F17]/60 border-slate-800/80 opacity-60 cursor-not-allowed'
+                            : checked
+                              ? 'bg-blue-600/20 border-blue-500 text-white'
+                              : 'bg-[#0B0F17] border-slate-800 text-slate-300 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-semibold text-xs ${prov.accent}`}>
+                            {prov.label}
+                          </span>
+                          <span
+                            className={`w-3.5 h-3.5 rounded-sm border flex items-center justify-center ${
+                              checked
+                                ? 'bg-blue-500 border-blue-400 text-white'
+                                : 'border-slate-600'
+                            }`}
+                          >
+                            {checked && <Check className="w-2.5 h-2.5" />}
+                          </span>
+                        </div>
+                        <div className="text-[11px] mt-1 truncate text-slate-300">
+                          {conn ? conn.handle || conn.accountName : 'Not connected'}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {connectedProviderIds.length === 0 && authUser && (
+                  <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 flex items-center justify-between gap-3 text-[11px] text-slate-300">
+                    <span>No social accounts are connected yet. Connect TikTok, Instagram, or YouTube in Social Accounts.</span>
+                    {onGoToAccounts && (
+                      <button
+                        type="button"
+                        onClick={onGoToAccounts}
+                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded shrink-0"
+                      >
+                        Connect Accounts
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Caption / Title + Hashtags + Privacy */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                <div className="sm:col-span-8 space-y-1.5">
+                  <label className="block text-slate-300 font-medium">
+                    Caption / YouTube Title
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={caption}
+                    onChange={(e) => setCaption(e.target.value)}
+                    placeholder="Enter your hook caption or Shorts title..."
+                    className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-slate-100 outline-none resize-none"
+                  />
+                </div>
+
+                <div className="sm:col-span-4 space-y-2">
+                  <div>
+                    <label className="block text-slate-300 font-medium mb-1">Hashtags</label>
+                    <input
+                      type="text"
+                      value={hashtagInput}
+                      onChange={(e) => setHashtagInput(e.target.value)}
+                      placeholder="#Shorts #creator"
+                      className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 font-mono text-[11px] text-slate-200 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-300 font-medium mb-1">Visibility</label>
+                    <select
+                      value={privacy}
+                      onChange={(e) => setPrivacy(e.target.value as SocialPrivacy)}
+                      className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 text-slate-100 outline-none"
+                    >
+                      <option value="public">Public</option>
+                      <option value="unlisted">Unlisted (YouTube / Mutual on TikTok)</option>
+                      <option value="private">Private / Self Only</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Per-Platform Dispatch Results */}
+              {directResults && directResults.length > 0 && (
+                <div className="space-y-2 bg-[#0B0F17] border border-slate-800 rounded p-3">
+                  <div className="text-[11px] font-semibold text-slate-300">
+                    Per-Platform Publish Results
+                  </div>
+                  <div className="space-y-2">
+                    {directResults.map((res) => {
+                      const meta = DIRECT_PROVIDERS.find((p) => p.id === res.platform);
+                      return (
+                        <div
+                          key={res.platform}
+                          className={`p-2.5 rounded border flex items-start justify-between gap-3 ${
+                            res.ok
+                              ? 'bg-emerald-950/30 border-emerald-500/35 text-emerald-200'
+                              : 'bg-rose-950/35 border-rose-500/40 text-rose-200'
+                          }`}
+                        >
+                          <div className="flex items-start gap-2 min-w-0">
+                            {res.ok ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                            )}
+                            <div className="min-w-0">
+                              <div className="font-semibold text-xs flex flex-wrap items-center gap-2">
+                                <span>{meta?.label || res.platform}</span>
+                                <span className="font-mono text-[10px] opacity-80">
+                                  {res.status}
+                                  {res.tokenRefreshed ? ' · token refreshed' : ''}
+                                </span>
+                              </div>
+                              {res.error && (
+                                <div className="text-[11px] text-rose-300 mt-0.5 break-words">
+                                  {res.error}
+                                </div>
+                              )}
+                              {res.postId && (
+                                <div className="font-mono text-[10px] text-emerald-300/90 mt-0.5">
+                                  ID: {res.postId}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {res.publishedUrl && (
+                            <a
+                              href={res.publishedUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 text-[11px] text-emerald-200 shrink-0"
+                            >
+                              <ExternalLink className="w-3 h-3" />
+                              View
+                            </a>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {/* Multi-Platform Target Picker */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-slate-300 font-medium">
+                    Target Channels ({selectedPlatforms.length} selected)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedPlatforms(ALL_PLATFORMS)}
+                    className="text-[11px] text-blue-400 hover:text-blue-300"
+                  >
+                    Select all 4
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {ALL_PLATFORMS.map((pid) => {
+                    const spec = PLATFORM_SPECS[pid];
+                    const checked = selectedPlatforms.includes(pid);
+                    const ch = channelMap.get(pid);
+                    const hasWebhook = Boolean(ch?.endpoint_url && ch.enabled);
+                    return (
+                      <button
+                        key={pid}
+                        type="button"
+                        onClick={() => togglePlatform(pid)}
+                        className={`p-2.5 rounded border text-left transition-colors ${
+                          checked
+                            ? 'bg-blue-600/20 border-blue-500 text-white'
+                            : 'bg-[#0B0F17] border-slate-800 text-slate-400 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="font-semibold text-xs">{spec.label}</span>
+                          <span
+                            className={`w-3.5 h-3.5 rounded-sm border flex items-center justify-center ${
+                              checked
+                                ? 'bg-blue-500 border-blue-400 text-white'
+                                : 'border-slate-600'
+                            }`}
+                          >
+                            {checked && <Check className="w-2.5 h-2.5" />}
+                          </span>
+                        </div>
+                        <div className="text-[10px] mt-1 font-mono text-slate-400">
+                          {hasWebhook ? 'Webhook connected' : 'Share Kit / Staged'}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Caption + Hashtags Editor */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                <div className="sm:col-span-8 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-slate-300 font-medium">Post Caption / Title</label>
+                    {selectedPlatforms.includes('x_video') &&
+                      previewPostText.length > PLATFORM_SPECS.x_video.maxChars && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCaption((prev) =>
+                              trimCopyForLimit(prev, parsedUserTags, PLATFORM_SPECS.x_video.maxChars)
+                            )
+                          }
+                          className="inline-flex items-center gap-1 text-[10px] text-amber-300 hover:text-amber-200"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          Fit 280c for X
+                        </button>
+                      )}
+                  </div>
+                  <textarea
+                    rows={3}
+                    value={caption}
+                    onChange={(e) => setCaption(e.target.value)}
+                    className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-slate-100 outline-none resize-none"
+                  />
+                </div>
+
+                <div className="sm:col-span-4 space-y-1.5">
+                  <label className="text-slate-300 font-medium">Hashtags</label>
+                  <textarea
+                    rows={3}
+                    value={hashtagInput}
+                    onChange={(e) => setHashtagInput(e.target.value)}
+                    placeholder="#coding #productivity"
+                    className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 font-mono text-[11px] text-slate-200 outline-none resize-none"
+                  />
+                  <label className="flex items-center gap-1.5 text-[11px] text-slate-400 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={appendPlatformDefaults}
+                      onChange={(e) => setAppendPlatformDefaults(e.target.checked)}
+                      className="accent-blue-500"
+                    />
+                    Auto-add channel tags (#Shorts, #fyp)
+                  </label>
+                </div>
+              </div>
+
+              {/* Per-Platform Preview & Readiness Check */}
+              <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="inline-flex items-center gap-1 bg-[#111724] border border-slate-800 rounded p-0.5">
+                    {ALL_PLATFORMS.map((pid) => (
+                      <button
+                        key={pid}
+                        type="button"
+                        onClick={() => setPreviewPlatform(pid)}
+                        className={`px-2 py-1 rounded text-[11px] font-medium transition-colors ${
+                          previewPlatform === pid
+                            ? 'bg-slate-800 text-white'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {PLATFORM_SPECS[pid].shortLabel}
+                      </button>
+                    ))}
+                  </div>
+                  <span
+                    className={`font-mono tabular-nums text-[11px] ${
+                      previewPostText.length > activePreviewSpec.maxChars
+                        ? 'text-amber-400'
+                        : 'text-slate-400'
+                    }`}
+                  >
+                    {previewPostText.length} / {activePreviewSpec.maxChars} chars
+                  </span>
+                </div>
+
+                <pre className="text-[11px] text-slate-200 whitespace-pre-wrap font-sans bg-[#111724] border border-slate-800/80 rounded p-2.5 max-h-24 overflow-y-auto">
+                  {previewPostText || '(Empty caption)'}
+                </pre>
+
+                {(() => {
+                  const warnings = getPlatformWarnings(
+                    previewPlatform,
+                    previewPostText,
+                    clipDurationSec,
+                    aspectRatio
+                  );
+                  if (warnings.length === 0) return null;
+                  return (
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] text-amber-300">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                      <span>{warnings.join(' · ')}</span>
+                    </div>
+                  );
+                })()}
+
+                {/* Instant Share Now Row (Zero-Config Local & Web Actions) */}
+                <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-800/80">
+                  <button
+                    type="button"
+                    onClick={handleCopyPostText}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-slate-200"
+                  >
+                    {copiedCopy ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedCopy ? 'Copied Copy' : `Copy ${activePreviewSpec.shortLabel} Copy`}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={instantBusy === 'kit'}
+                    onClick={handleDownloadShareKit}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-medium"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    {instantBusy === 'kit' ? 'Preparing MP4...' : 'Copy + Download MP4'}
+                  </button>
+
+                  {anyShareSupported && (
+                    <button
+                      type="button"
+                      disabled={instantBusy === 'native'}
+                      onClick={handleNativeShare}
+                      title={
+                        fileShareSupported
+                          ? 'Share MP4 file directly through OS Share Sheet'
+                          : 'Share post copy through OS Share Sheet'
+                      }
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 rounded text-emerald-300 font-medium"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                      {instantBusy === 'native'
+                        ? 'Opening Share...'
+                        : fileShareSupported
+                          ? 'Share File (OS Sheet)'
+                          : 'Share Text (OS Sheet)'}
+                    </button>
+                  )}
+
+                  <a
+                    href={activePreviewSpec.buildStudioUrl(previewPostText)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-200 ml-auto"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    {activePreviewSpec.uploadLabel}
+                  </a>
+                </div>
+              </div>
+
+              {/* Queue Dispatch Timing */}
+              <div className="space-y-2">
+                <label className="block text-slate-300 font-medium">Queue & Dispatch Mode</label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setScheduleMode('now')}
+                    className={`py-2 px-3 rounded border font-medium text-center ${
+                      scheduleMode === 'now'
+                        ? 'bg-blue-600/20 border-blue-500 text-white'
+                        : 'bg-[#0B0F17] border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    Save to Queue
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setScheduleMode('dispatch')}
+                    className={`py-2 px-3 rounded border font-medium text-center ${
+                      scheduleMode === 'dispatch'
+                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                        : 'bg-[#0B0F17] border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    Queue & Publish Now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setScheduleMode('later')}
+                    className={`py-2 px-3 rounded border font-medium text-center ${
+                      scheduleMode === 'later'
+                        ? 'bg-blue-600/20 border-blue-500 text-white'
+                        : 'bg-[#0B0F17] border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    Schedule Date/Time
+                  </button>
+                </div>
+                {scheduleMode === 'later' && (
+                  <input
+                    type="datetime-local"
+                    value={scheduleIso}
+                    onChange={(e) => setScheduleIso(e.target.value)}
+                    className="w-full bg-[#0B0F17] border border-slate-800 rounded px-3 py-2 font-mono text-slate-100 outline-none focus:border-blue-500"
+                  />
+                )}
+              </div>
+            </>
+          )}
 
           {statusMessage && (
             <div
@@ -592,20 +1001,33 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
               onClick={onClose}
               className="px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
             >
-              Cancel
+              {directResults ? 'Done' : 'Cancel'}
             </button>
-            <button
-              type="submit"
-              disabled={isSubmitting || selectedPlatforms.length === 0}
-              className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
-            >
-              <Send className="w-3.5 h-3.5" />
-              {isSubmitting
-                ? 'Rendering & Queuing...'
-                : scheduleMode === 'dispatch'
-                  ? `Publish to ${selectedPlatforms.length} Channel${selectedPlatforms.length > 1 ? 's' : ''}`
-                  : `Add ${selectedPlatforms.length} Job${selectedPlatforms.length > 1 ? 's' : ''} to Queue`}
-            </button>
+            {shareTab === 'direct' ? (
+              <button
+                type="submit"
+                disabled={isPublishingDirect || !authUser || directPlatforms.length === 0}
+                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {isPublishingDirect
+                  ? 'Rendering & Publishing...'
+                  : `Publish to ${directPlatforms.length} Platform${directPlatforms.length === 1 ? '' : 's'}`}
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={isSubmitting || selectedPlatforms.length === 0}
+                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {isSubmitting
+                  ? 'Rendering & Queuing...'
+                  : scheduleMode === 'dispatch'
+                    ? `Publish to ${selectedPlatforms.length} Channel${selectedPlatforms.length > 1 ? 's' : ''}`
+                    : `Add ${selectedPlatforms.length} Job${selectedPlatforms.length > 1 ? 's' : ''} to Queue`}
+              </button>
+            )}
           </div>
         </div>
       </form>

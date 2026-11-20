@@ -1,6 +1,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
+import cookieParser from 'cookie-parser';
 import multer from 'multer';
 import JSZip from 'jszip';
 import crypto from 'crypto';
@@ -8,6 +9,21 @@ import fs from 'fs';
 import path from 'path';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
+import {
+  SOCIAL_PROVIDERS,
+  buildProviderRedirectUri,
+  consumeOAuthStateSession,
+  createOAuthStateSession,
+  getSocialProvider,
+  publishClipToPlatform,
+  resolvePublicMediaUrl,
+  type SocialPrivacy,
+} from './server/socialProviders.ts';
+import {
+  getSocialConnectionFromFirestore,
+  persistRefreshedTokensToFirestore,
+  type SupportedSocialPlatform,
+} from './server/firestoreRest.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -369,6 +385,8 @@ const upload = multer({
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
+  app.use(cookieParser());
   app.use(express.json({ limit: '10mb' }));
 
   // Serve media files with HTTP Range support for smooth <video> scrubbing
@@ -809,6 +827,309 @@ print(res.model_dump_json())
       res.json(JSON.parse(stdout));
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Delete failed' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Multi-Platform OAuth Routes & Social Publishing Dispatcher
+  // -------------------------------------------------------------------------
+  app.get('/api/auth/providers/status', (req: Request, res: Response) => {
+    const providers = (Object.keys(SOCIAL_PROVIDERS) as SupportedSocialPlatform[]).map((pid) => {
+      const adapter = SOCIAL_PROVIDERS[pid];
+      return {
+        platform: adapter.platform,
+        displayName: adapter.displayName,
+        configured: adapter.isConfigured(),
+        missingSecrets: adapter.getMissingSecrets(),
+        redirectUri: buildProviderRedirectUri(adapter.platform, req),
+        scopes: adapter.requiredScopes,
+      };
+    });
+    res.json({ providers });
+  });
+
+  app.get(
+    ['/api/auth/:platform/start', '/api/auth/:platform/start/'],
+    (req: Request, res: Response) => {
+      const platform = String(req.params.platform || '').toLowerCase();
+      const provider = getSocialProvider(platform);
+      if (!provider) {
+        res.status(404).json({ error: `Unsupported OAuth platform: ${platform}` });
+        return;
+      }
+      const missing = provider.getMissingSecrets();
+      if (missing.length > 0) {
+        res.status(400).json({
+          error: `${provider.displayName} OAuth requires server environment secret(s): ${missing.join(', ')}`,
+          missingSecrets: missing,
+          redirectUri: buildProviderRedirectUri(provider.platform, req),
+        });
+        return;
+      }
+
+      const redirectUri = buildProviderRedirectUri(provider.platform, req);
+      const { state, codeChallenge } = createOAuthStateSession(provider.platform, redirectUri);
+      res.cookie(`cutline_oauth_state_${provider.platform}`, state, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        maxAge: 10 * 60 * 1000,
+      });
+      const authUrl = provider.buildAuthorizeUrl({ redirectUri, state, codeChallenge });
+      if (req.query.mode === 'redirect') {
+        res.redirect(authUrl);
+        return;
+      }
+      res.json({ url: authUrl, redirectUri, state });
+    }
+  );
+
+  const renderPopupCallbackHtml = (payload: Record<string, unknown>, title: string, detail: string) => {
+    const serialized = JSON.stringify(payload).replace(/</g, '\\u003c');
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${title}</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; background: #0b0f17; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+      .card { background: #111724; border: 1px solid #334155; border-radius: 10px; padding: 24px; max-width: 420px; text-align: center; }
+      h2 { margin: 0 0 8px; font-size: 16px; }
+      p { margin: 0 0 16px; font-size: 13px; color: #94a3b8; }
+      button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>${title}</h2>
+      <p>${detail}</p>
+      <button onclick="window.close()">Close Window</button>
+    </div>
+    <script>
+      (function () {
+        var payload = ${serialized};
+        try {
+          if (window.opener) {
+            window.opener.postMessage(payload, '*');
+            setTimeout(function () { window.close(); }, 350);
+          } else {
+            window.location.href = '/';
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </body>
+</html>`;
+  };
+
+  app.get(
+    ['/api/auth/:platform/callback', '/api/auth/:platform/callback/'],
+    async (req: Request, res: Response) => {
+      const platform = String(req.params.platform || '').toLowerCase();
+      const provider = getSocialProvider(platform);
+      if (!provider) {
+        res
+          .status(404)
+          .send(
+            renderPopupCallbackHtml(
+              { type: 'OAUTH_AUTH_ERROR', platform, error: `Unsupported platform: ${platform}` },
+              'Unsupported Provider',
+              `Platform "${platform}" is not supported.`
+            )
+          );
+        return;
+      }
+
+      const oauthError = String(req.query.error || '').trim();
+      if (oauthError) {
+        const desc = String(req.query.error_description || oauthError);
+        res
+          .status(400)
+          .send(
+            renderPopupCallbackHtml(
+              { type: 'OAUTH_AUTH_ERROR', platform, error: desc },
+              `${provider.displayName} Authorization Declined`,
+              desc
+            )
+          );
+        return;
+      }
+
+      const code = String(req.query.code || '').trim();
+      const state = String(req.query.state || '').trim();
+      const session = state ? consumeOAuthStateSession(state) : null;
+      const cookieState = req.cookies?.[`cutline_oauth_state_${provider.platform}`];
+      res.clearCookie(`cutline_oauth_state_${provider.platform}`, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+      });
+
+      if (!code || (!session && (!cookieState || cookieState !== state))) {
+        res
+          .status(400)
+          .send(
+            renderPopupCallbackHtml(
+              {
+                type: 'OAUTH_AUTH_ERROR',
+                platform,
+                error: 'Invalid or expired OAuth state parameter. Please try connecting again.',
+              },
+              'OAuth State Expired',
+              'The authorization session expired or failed CSRF verification. Close this window and retry.'
+            )
+          );
+        return;
+      }
+
+      try {
+        const redirectUri = session?.redirectUri || buildProviderRedirectUri(provider.platform, req);
+        const tokenData = await provider.exchangeCode({
+          code,
+          redirectUri,
+          codeVerifier: session?.codeVerifier || '',
+        });
+        const profile = await provider.fetchProfile({
+          accessToken: tokenData.accessToken,
+          rawTokenData: tokenData.raw,
+        });
+
+        const connection = {
+          platform: provider.platform,
+          accountName: profile.accountName,
+          handle: profile.handle,
+          externalAccountId: profile.externalAccountId,
+          accessToken: tokenData.accessToken,
+          refreshToken: tokenData.refreshToken,
+          expiresAt: tokenData.expiresAt,
+          scopes: tokenData.scopes,
+        };
+
+        res.send(
+          renderPopupCallbackHtml(
+            { type: 'OAUTH_AUTH_SUCCESS', platform: provider.platform, connection },
+            `${provider.displayName} Connected`,
+            `Connected ${connection.accountName} (${connection.handle}). Returning to Cutline Studio...`
+          )
+        );
+      } catch (err: any) {
+        const msg = err?.message || `Failed to complete ${provider.displayName} OAuth callback.`;
+        res
+          .status(500)
+          .send(
+            renderPopupCallbackHtml(
+              { type: 'OAUTH_AUTH_ERROR', platform: provider.platform, error: msg },
+              `${provider.displayName} Connection Failed`,
+              msg
+            )
+          );
+      }
+    }
+  );
+
+  app.post('/api/social/publish', async (req: Request, res: Response) => {
+    try {
+      const authHeader = String(req.headers.authorization || '');
+      const firebaseIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+
+      const userId = String(req.body?.userId || '').trim();
+      const rawPlatforms: unknown[] = Array.isArray(req.body?.platforms)
+        ? req.body.platforms
+        : req.body?.platform
+          ? [req.body.platform]
+          : [];
+      const platforms: SupportedSocialPlatform[] = rawPlatforms
+        .map((p: unknown) => String(p).toLowerCase())
+        .filter((p: string): p is SupportedSocialPlatform =>
+          p === 'tiktok' || p === 'instagram' || p === 'youtube'
+        );
+
+      if (platforms.length === 0) {
+        res.status(400).json({ error: 'Select at least one social platform (tiktok, instagram, youtube).' });
+        return;
+      }
+
+      const rawVideoUrl = String(req.body?.videoUrl || '').trim();
+      const rawLocalPath = String(req.body?.localVideoPath || req.body?.videoPath || '').trim();
+      let resolvedLocalPath = rawLocalPath && fs.existsSync(rawLocalPath) ? rawLocalPath : undefined;
+      if (!resolvedLocalPath && rawVideoUrl.includes('/media/exports/')) {
+        const fname = decodeURIComponent(rawVideoUrl.split('/media/exports/').pop() || '');
+        const candidate = path.join(EXPORTS_DIR, path.basename(fname));
+        if (fs.existsSync(candidate)) resolvedLocalPath = candidate;
+      }
+
+      const publicVideoUrl = resolvePublicMediaUrl(rawVideoUrl, req);
+      const caption = String(req.body?.caption || '').trim();
+      const rawPrivacy = String(req.body?.privacy || 'public').toLowerCase();
+      const privacy: SocialPrivacy =
+        rawPrivacy === 'private' || rawPrivacy === 'unlisted' ? rawPrivacy : 'public';
+      const connections = (req.body?.connections || {}) as Record<string, any>;
+
+      // Execute per-platform independently so one failure never blocks or hides others
+      const results = await Promise.all(
+        platforms.map((platform: SupportedSocialPlatform) =>
+          publishClipToPlatform({
+            userId,
+            platform,
+            videoUrl: publicVideoUrl,
+            localVideoPath: resolvedLocalPath,
+            caption,
+            privacy,
+            firebaseIdToken,
+            connectionOverride: connections?.[platform] || null,
+          })
+        )
+      );
+
+      res.json({ results });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Multi-platform social publish failed.' });
+    }
+  });
+
+  app.post('/api/social/refresh', async (req: Request, res: Response) => {
+    try {
+      const authHeader = String(req.headers.authorization || '');
+      const firebaseIdToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+      const userId = String(req.body?.userId || '').trim();
+      const platform = String(req.body?.platform || '').toLowerCase() as SupportedSocialPlatform;
+      const provider = getSocialProvider(platform);
+      if (!provider) {
+        res.status(400).json({ error: `Unsupported platform: ${platform}` });
+        return;
+      }
+
+      const missing = provider.getMissingSecrets();
+      if (missing.length > 0) {
+        res.status(400).json({ error: `Missing server secret(s): ${missing.join(', ')}` });
+        return;
+      }
+
+      let conn = req.body?.connection || null;
+      if (!conn && firebaseIdToken && userId) {
+        conn = await getSocialConnectionFromFirestore(userId, platform, firebaseIdToken);
+      }
+      if (!conn) {
+        res.status(404).json({ error: `No connected ${provider.displayName} account found.` });
+        return;
+      }
+
+      const refreshed = await provider.refreshToken({
+        accessToken: String(conn.accessToken || ''),
+        refreshToken: String(conn.refreshToken || ''),
+      });
+      if (firebaseIdToken && userId) {
+        await persistRefreshedTokensToFirestore(userId, platform, firebaseIdToken, refreshed);
+      }
+
+      res.json({
+        connection: {
+          ...conn,
+          ...refreshed,
+        },
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Token refresh failed.' });
     }
   });
 

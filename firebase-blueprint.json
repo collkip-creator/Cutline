@@ -1,0 +1,114 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated Cutline Studio user record stored cleanly under users/{userId}.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name.",
+          "maxLength": 160
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified account email.",
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of user profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": ["uid", "displayName", "email", "createdAt", "updatedAt"]
+    },
+    "SocialConnection": {
+      "title": "SocialConnection",
+      "description": "Per-user connected social media OAuth provider credentials and profile metadata.",
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string",
+          "enum": ["tiktok", "instagram", "youtube"],
+          "description": "Normalized provider identifier matching the document ID."
+        },
+        "accountName": {
+          "type": "string",
+          "description": "Connected creator display name.",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "handle": {
+          "type": "string",
+          "description": "Platform handle or username (e.g., @creator).",
+          "maxLength": 120
+        },
+        "externalAccountId": {
+          "type": "string",
+          "description": "Provider account ID (open_id, ig_user_id, or YouTube channel ID).",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "accessToken": {
+          "type": "string",
+          "description": "OAuth bearer access token for publishing.",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "refreshToken": {
+          "type": "string",
+          "description": "OAuth refresh token or empty string if provider issues long-lived tokens.",
+          "maxLength": 4096
+        },
+        "expiresAt": {
+          "type": "number",
+          "description": "Access token expiration timestamp in Unix milliseconds (0 if non-expiring)."
+        },
+        "scopes": {
+          "type": "array",
+          "description": "Granted OAuth permission scopes (bounded list of strings)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of connection write or token refresh."
+        }
+      },
+      "required": [
+        "platform",
+        "accountName",
+        "handle",
+        "externalAccountId",
+        "accessToken",
+        "refreshToken",
+        "expiresAt",
+        "scopes",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Owner-only user root profile document containing verified identity metadata."
+    },
+    "/users/{userId}/socialConnections/{platform}": {
+      "schema": { "$ref": "#/entities/SocialConnection" },
+      "description": "Owner-only connected social accounts and OAuth tokens keyed by platform (tiktok, instagram, youtube)."
+    }
+  }
+}
