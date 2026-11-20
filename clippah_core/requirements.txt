@@ -1,0 +1,15 @@
+# Core Runtime (Desktop & Sidecar)
+pydantic>=2.7.0
+httpx>=0.27.0
+
+# Desktop Media & Local AI Adapters
+faster-whisper>=1.0.3
+yt-dlp>=2024.10.0
+
+# Desktop UI Options (pick PyQt6 native OR FastAPI + Tauri v2 frontend)
+PyQt6>=6.7.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# Packaging
+pyinstaller>=6.10.0

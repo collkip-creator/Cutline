@@ -1,0 +1,82 @@
+[
+  {
+    "video_hash": "f5891dfc887461f285684a80a1063a4790a8f14995efa1dd448702442cbcd064",
+    "title": "Cutline Local-First Architecture Briefing",
+    "filename": "cutline_architecture_briefing.mp4",
+    "local_path": "/app/applet/data/videos/cutline_architecture_briefing.mp4",
+    "video_url": "/media/videos/cutline_architecture_briefing.mp4",
+    "source_url": null,
+    "duration_sec": 30,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "has_audio": true,
+    "created_at_iso": "2026-11-20T07:13:32.079Z",
+    "clips": [
+      {
+        "id": "clip_02",
+        "title": "Sending gigabytes of raw 4K footage to remote servers wa",
+        "start_sec": 5.03,
+        "end_sec": 14.993,
+        "hook_score": 98,
+        "reason": "Matched 3 brief terms and 3 retention cues.",
+        "caption_hook": "SENDING GIGABYTES OF RAW 4K FOOTAGE TO REMOTE SE",
+        "tags": [
+          "and",
+          "instead",
+          "latency",
+          "local"
+        ],
+        "snapped_to_words": true
+      },
+      {
+        "id": "clip_03",
+        "title": "Instead, keeping transcription local with faster-whisper",
+        "start_sec": 10.03,
+        "end_sec": 19.991,
+        "hook_score": 98,
+        "reason": "Matched 4 brief terms and 4 retention cues.",
+        "caption_hook": "INSTEAD, KEEPING TRANSCRIPTION LOCAL WITH FASTER",
+        "tags": [
+          "and",
+          "caching",
+          "instead",
+          "latency"
+        ],
+        "snapped_to_words": true
+      },
+      {
+        "id": "clip_04",
+        "title": "Even better, content-addressed transcript caching means ",
+        "start_sec": 15.03,
+        "end_sec": 24.998,
+        "hook_score": 83,
+        "reason": "Matched 2 brief terms and 2 retention cues.",
+        "caption_hook": "EVEN BETTER, CONTENT-ADDRESSED TRANSCRIPT CACHIN",
+        "tags": [
+          "caching",
+          "hooks",
+          "never",
+          "zero"
+        ],
+        "snapped_to_words": true
+      },
+      {
+        "id": "clip_05",
+        "title": "Every LLM timestamp gets snapped to exact word boundarie",
+        "start_sec": 20.03,
+        "end_sec": 30,
+        "hook_score": 84.5,
+        "reason": "Matched 3 brief terms and 1 retention cues.",
+        "caption_hook": "EVERY LLM TIMESTAMP GETS SNAPPED TO EXACT WORD B",
+        "tags": [
+          "and",
+          "android",
+          "hooks",
+          "never"
+        ],
+        "snapped_to_words": true
+      }
+    ]
+  }
+]

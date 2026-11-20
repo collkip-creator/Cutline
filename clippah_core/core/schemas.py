@@ -1,0 +1,286 @@
+"""
+Pure domain schemas for Cutline / Clippah.
+
+Uses Pydantic v2 when installed; includes a zero-dependency stdlib fallback shim
+so pure domain logic & unit tests execute cleanly even in minimal Python runtimes
+(such as restricted build sandboxes or lightweight mobile Python embeds).
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, List, Literal, Optional, Type, TypeVar
+import json
+
+try:
+    from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+    PYDANTIC_AVAILABLE = True
+except ImportError:  # pragma: no cover - stdlib fallback for minimal environments
+    PYDANTIC_AVAILABLE = False
+
+    T = TypeVar("T", bound="BaseModel")
+
+    def Field(default: Any = ..., *, default_factory: Any = None, **_: Any) -> Any:
+        if default_factory is not None:
+            return field(default_factory=default_factory)
+        if default is ...:
+            return field()
+        return field(default=default)
+
+    def model_validator(*, mode: str = "after"):
+        def decorator(fn):
+            fn._is_model_validator = mode
+            return fn
+        return decorator
+
+    class ConfigDict(dict):
+        pass
+
+    class BaseModel:
+        def __init__(self, **data: Any) -> None:
+            import typing
+
+            try:
+                hints = typing.get_type_hints(type(self))
+            except Exception:
+                hints = {}
+                for cls in reversed(type(self).__mro__):
+                    hints.update(getattr(cls, "__annotations__", {}))
+
+            def _coerce(value: Any, hint: Any) -> Any:
+                if value is None or hint is None:
+                    return value
+                origin = typing.get_origin(hint)
+                args = typing.get_args(hint)
+                if origin is typing.Union:
+                    non_none = [a for a in args if a is not type(None)]
+                    if len(non_none) == 1:
+                        return _coerce(value, non_none[0])
+                if origin in (list, List) and args and isinstance(value, list):
+                    return [_coerce(item, args[0]) for item in value]
+                if isinstance(hint, type) and issubclass(hint, BaseModel) and isinstance(value, dict):
+                    return hint(**value)
+                if isinstance(hint, type) and issubclass(hint, Enum) and not isinstance(value, hint):
+                    return hint(value)
+                return value
+
+            for name, hint in hints.items():
+                if name in data:
+                    val = _coerce(data[name], hint)
+                elif hasattr(type(self), name):
+                    attr = getattr(type(self), name)
+                    if hasattr(attr, "default_factory") and attr.default_factory is not None:  # type: ignore
+                        val = attr.default_factory()  # type: ignore
+                    else:
+                        val = attr
+                else:
+                    raise ValueError(f"Missing required field: {name}")
+                setattr(self, name, val)
+            for name in dir(type(self)):
+                fn = getattr(type(self), name)
+                if getattr(fn, "_is_model_validator", None) == "after":
+                    fn(self)
+
+        def model_dump(self) -> dict[str, Any]:
+            def _convert(obj: Any) -> Any:
+                if isinstance(obj, BaseModel):
+                    return obj.model_dump()
+                if isinstance(obj, list):
+                    return [_convert(x) for x in obj]
+                if isinstance(obj, Enum):
+                    return obj.value
+                return obj
+
+            annotations = {}
+            for cls in reversed(type(self).__mro__):
+                annotations.update(getattr(cls, "__annotations__", {}))
+            return {k: _convert(getattr(self, k)) for k in annotations}
+
+        def model_dump_json(self, indent: Optional[int] = None) -> str:
+            return json.dumps(self.model_dump(), indent=indent)
+
+        @classmethod
+        def model_validate(cls: Type[T], obj: Any) -> T:
+            if isinstance(obj, cls):
+                return obj
+            if isinstance(obj, str):
+                obj = json.loads(obj)
+            if not isinstance(obj, dict):
+                raise TypeError(f"Expected dict or JSON string, got {type(obj)}")
+            return cls(**obj)
+
+        @classmethod
+        def model_json_schema(cls) -> dict[str, Any]:
+            annotations = {}
+            for base in reversed(cls.__mro__):
+                annotations.update(getattr(base, "__annotations__", {}))
+            return {
+                "title": cls.__name__,
+                "type": "object",
+                "properties": {k: {"type": "string"} for k in annotations},
+            }
+
+
+class AspectRatio(str, Enum):
+    LANDSCAPE_16_9 = "16:9"
+    VERTICAL_9_16 = "9:16"
+
+
+class EncodeMode(str, Enum):
+    STREAM_COPY = "stream_copy"
+    REENCODE = "reencode"
+
+
+class PublishPlatform(str, Enum):
+    YOUTUBE_SHORTS = "youtube_shorts"
+    TIKTOK = "tiktok"
+    INSTAGRAM_REELS = "instagram_reels"
+    X_VIDEO = "x_video"
+
+
+class PublishStatus(str, Enum):
+    QUEUED = "queued"
+    SCHEDULED = "scheduled"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WordTimestamp(BaseModel):
+    word: str
+    start_sec: float
+    end_sec: float
+    confidence: float = 0.95
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "WordTimestamp":
+        if self.start_sec < 0:
+            self.start_sec = 0.0
+        if self.end_sec < self.start_sec:
+            self.end_sec = self.start_sec
+        return self
+
+
+class TranscriptSegment(BaseModel):
+    id: int
+    start_sec: float
+    end_sec: float
+    text: str
+    words: List[WordTimestamp] = Field(default_factory=list)
+
+
+class Transcript(BaseModel):
+    video_hash: str
+    source_path: str
+    language: str = "en"
+    duration_sec: float
+    model_name: str = "faster-whisper-small"
+    created_at_iso: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    segments: List[TranscriptSegment] = Field(default_factory=list)
+
+    def all_words(self) -> List[WordTimestamp]:
+        out: List[WordTimestamp] = []
+        for seg in self.segments:
+            if seg.words:
+                out.extend(seg.words)
+            else:
+                tokens = seg.text.split()
+                if tokens:
+                    step = max(0.05, (seg.end_sec - seg.start_sec) / len(tokens))
+                    for idx, tok in enumerate(tokens):
+                        w_start = round(seg.start_sec + idx * step, 3)
+                        w_end = round(min(seg.end_sec, w_start + step), 3)
+                        out.append(WordTimestamp(word=tok, start_sec=w_start, end_sec=w_end))
+        return out
+
+
+class MediaAsset(BaseModel):
+    video_hash: str
+    title: str
+    local_path: str
+    source_url: Optional[str] = None
+    duration_sec: float
+    width: int = 1280
+    height: int = 720
+    fps: float = 30.0
+    has_audio: bool = True
+
+
+class ClipCandidate(BaseModel):
+    id: str
+    title: str
+    start_sec: float
+    end_sec: float
+    hook_score: float
+    reason: str
+    caption_hook: str
+    tags: List[str] = Field(default_factory=list)
+    snapped_to_words: bool = False
+
+    @model_validator(mode="after")
+    def _validate_clip(self) -> "ClipCandidate":
+        if self.start_sec < 0:
+            self.start_sec = 0.0
+        if self.end_sec <= self.start_sec:
+            self.end_sec = round(self.start_sec + 1.0, 3)
+        self.hook_score = max(0.0, min(100.0, round(float(self.hook_score), 1)))
+        return self
+
+    @property
+    def duration_sec(self) -> float:
+        return round(self.end_sec - self.start_sec, 3)
+
+
+class HighlightBatch(BaseModel):
+    """Strict structured output contract expected from local Ollama / HighlightEngine."""
+
+    clips: List[ClipCandidate] = Field(default_factory=list)
+
+
+class ExportSpec(BaseModel):
+    clip: ClipCandidate
+    aspect_ratio: AspectRatio = AspectRatio.VERTICAL_9_16
+    encode_mode: EncodeMode = EncodeMode.REENCODE
+    include_srt: bool = True
+    burn_captions: bool = True
+    caption_font_size: int = 44
+    output_dir: str = "exports"
+
+
+class ExportResult(BaseModel):
+    clip_id: str
+    video_path: str
+    srt_path: Optional[str] = None
+    ass_path: Optional[str] = None
+    aspect_ratio: AspectRatio
+    encode_mode: EncodeMode
+    duration_sec: float
+    file_size_bytes: int
+
+
+class PublishJob(BaseModel):
+    job_id: str
+    clip_id: str
+    clip_title: str
+    video_path: str
+    srt_path: Optional[str] = None
+    platform: PublishPlatform
+    caption_text: str
+    tags: List[str] = Field(default_factory=list)
+    status: PublishStatus = PublishStatus.QUEUED
+    scheduled_at_iso: Optional[str] = None
+    created_at_iso: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    updated_at_iso: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    published_url: Optional[str] = None
+    error_message: Optional[str] = None
+    attempts: int = 0
