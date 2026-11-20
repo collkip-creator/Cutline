@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Crosshair, FileText, Plus, Send, Trash2 } from 'lucide-react';
 import type { AspectRatio, ClipCandidate, Transcript } from '../types';
+import { apiUrl } from '../lib/api';
 
 interface ClipInspectorTableProps {
   clips: ClipCandidate[];
@@ -38,7 +39,7 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
 
   const handleLoadCaptions = async (clip: ClipCandidate) => {
     if (!transcript) return;
-    const res = await fetch('/api/clips/captions', {
+    const res = await fetch(apiUrl('/api/clips/captions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clip, transcript, aspect_ratio: aspectRatio }),

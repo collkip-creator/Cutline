@@ -744,8 +744,9 @@ print(res.model_dump_json())
   app.get('/api/architecture/tree', (_req: Request, res: Response) => {
     const entries: Array<{ path: string; layer: string; bytes: number }> = [];
     const walk = (dir: string) => {
+      if (!fs.existsSync(dir)) return;
       for (const name of fs.readdirSync(dir).sort()) {
-        if (name === '__pycache__' || name.endsWith('.pyc')) continue;
+        if (name === '__pycache__' || name === 'target' || name.endsWith('.pyc') || name.endsWith('.png') || name.endsWith('.ico')) continue;
         const full = path.join(dir, name);
         const stat = fs.statSync(full);
         if (stat.isDirectory()) {
@@ -766,13 +767,20 @@ print(res.model_dump_json())
       }
     };
     walk(PYTHON_CORE_DIR);
+    walk(path.join(ROOT_DIR, 'src-tauri'));
+    walk(path.join(ROOT_DIR, '.github'));
     res.json(entries);
   });
 
   app.get('/api/architecture/file', (req: Request, res: Response) => {
     const relPath = String(req.query.path || '');
     const resolved = path.resolve(ROOT_DIR, relPath);
-    if (!resolved.startsWith(PYTHON_CORE_DIR) || !fs.existsSync(resolved)) {
+    const allowedRoots = [
+      PYTHON_CORE_DIR,
+      path.join(ROOT_DIR, 'src-tauri'),
+      path.join(ROOT_DIR, '.github'),
+    ];
+    if (!allowedRoots.some((r) => resolved.startsWith(r)) || !fs.existsSync(resolved)) {
       res.status(404).json({ error: 'Architecture file not found' });
       return;
     }
@@ -801,8 +809,9 @@ print(res.model_dump_json())
     try {
       const zip = new JSZip();
       const addDir = (dir: string) => {
+        if (!fs.existsSync(dir)) return;
         for (const name of fs.readdirSync(dir)) {
-          if (name === '__pycache__' || name.endsWith('.pyc')) continue;
+          if (name === '__pycache__' || name === 'target' || name === 'node_modules' || name.endsWith('.pyc')) continue;
           const full = path.join(dir, name);
           if (fs.statSync(full).isDirectory()) {
             addDir(full);
@@ -812,9 +821,18 @@ print(res.model_dump_json())
         }
       };
       addDir(PYTHON_CORE_DIR);
+      addDir(path.join(ROOT_DIR, 'src-tauri'));
+      addDir(path.join(ROOT_DIR, '.github'));
+      addDir(path.join(ROOT_DIR, 'src'));
+      for (const rootFile of ['package.json', 'package-lock.json', 'index.html', 'tsconfig.json', 'vite.config.ts']) {
+        const p = path.join(ROOT_DIR, rootFile);
+        if (fs.existsSync(p)) {
+          zip.file(rootFile, fs.readFileSync(p));
+        }
+      }
       const buf = await zip.generateAsync({ type: 'nodebuffer' });
       res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="clippah_core_starter.zip"');
+      res.setHeader('Content-Disposition', 'attachment; filename="cutline_studio_tauri_starter.zip"');
       res.send(buf);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Failed to package bundle' });

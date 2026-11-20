@@ -12,17 +12,19 @@ from pathlib import Path
 import json
 import shutil
 import subprocess
+from typing import Optional
 from urllib.parse import urlparse
 
 from ..core.cache import compute_file_sha256
 from ..core.interfaces import MediaDownloader, ProgressCallback, VideoProcessor
 from ..core.schemas import MediaAsset
+from .desktop_ffmpeg import resolve_media_binary
 
 
 class DesktopMediaDownloader(MediaDownloader):
-    def __init__(self, video_processor: VideoProcessor, ytdlp_bin: str = "yt-dlp") -> None:
+    def __init__(self, video_processor: VideoProcessor, ytdlp_bin: Optional[str] = None) -> None:
         self.video_processor = video_processor
-        self.ytdlp_bin = ytdlp_bin
+        self.ytdlp_bin = ytdlp_bin or resolve_media_binary("yt-dlp")
 
     def ingest(
         self,
@@ -43,9 +45,9 @@ class DesktopMediaDownloader(MediaDownloader):
             title = local_path.stem
             source_url = None
         else:
-            if shutil.which(self.ytdlp_bin) is None:
+            if not Path(self.ytdlp_bin).is_file() and shutil.which(self.ytdlp_bin) is None:
                 raise RuntimeError(
-                    f"'{self.ytdlp_bin}' binary not found on PATH. Install yt-dlp or import a local MP4."
+                    f"'{self.ytdlp_bin}' binary not found on PATH or bundled bin/. Install yt-dlp or import a local MP4."
                 )
             if on_progress:
                 on_progress(0.10, "Downloading stream via yt-dlp...")

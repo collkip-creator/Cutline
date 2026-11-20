@@ -1,6 +1,11 @@
 """
 Desktop VideoProcessor adapter backed by local FFmpeg & FFprobe.
 
+Binary resolution order:
+1. Explicit path passed to constructor
+2. Bundled binaries next to frozen executable / Tauri resources (`bin/` or `resources/bin/`)
+3. System PATH (`shutil.which`)
+
 Android adaptation note: Replace subprocess ffmpeg/ffprobe calls with AndroidX
 Media3 Transformer (hardware-accelerated MediaCodec H.264/HEVC encoding,
 Presentation/Crop effects for 9:16, and OverlayEffect for burned-in captions)
@@ -11,22 +16,53 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
+import sys
 from typing import Dict, List, Optional
 
 from ..core.interfaces import ProgressCallback, VideoProcessor
 from ..core.schemas import AspectRatio, EncodeMode, ExportResult, ExportSpec
 
 
+def resolve_media_binary(name: str) -> str:
+    """Locate bundled Windows/macOS/Linux binary when packaged with PyInstaller or Tauri."""
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    filename = name if name.endswith(exe_suffix) else f"{name}{exe_suffix}"
+
+    search_roots: List[Path] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        search_roots.extend([
+            exe_dir,
+            exe_dir / "bin",
+            exe_dir / "resources" / "bin",
+            exe_dir.parent / "resources" / "bin",
+        ])
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            search_roots.extend([Path(meipass), Path(meipass) / "bin"])
+
+    for root in search_roots:
+        candidate = root / filename
+        if candidate.is_file():
+            return str(candidate)
+
+    found = shutil.which(name) or shutil.which(filename)
+    return found or name
+
+
 class FFmpegVideoProcessor(VideoProcessor):
-    def __init__(self, ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe") -> None:
-        self.ffmpeg_bin = ffmpeg_bin
-        self.ffprobe_bin = ffprobe_bin
+    def __init__(self, ffmpeg_bin: Optional[str] = None, ffprobe_bin: Optional[str] = None) -> None:
+        self.ffmpeg_bin = ffmpeg_bin or resolve_media_binary("ffmpeg")
+        self.ffprobe_bin = ffprobe_bin or resolve_media_binary("ffprobe")
 
     def _check_bin(self, binary: str) -> None:
+        if Path(binary).is_file():
+            return
         if shutil.which(binary) is None:
-            raise RuntimeError(f"Required binary '{binary}' not found on PATH.")
+            raise RuntimeError(f"Required binary '{binary}' not found on PATH or bundled bin/.")
 
     def probe_media(self, media_path: Path) -> Dict[str, float | int | bool]:
         self._check_bin(self.ffprobe_bin)

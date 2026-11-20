@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Download, FileCode, Play, XCircle } from 'lucide-react';
 import type { ArchTreeNode } from '../types';
+import { apiUrl } from '../lib/api';
 
 export const ArchitectureView: React.FC = () => {
   const [tree, setTree] = useState<ArchTreeNode[]>([]);
@@ -15,7 +16,7 @@ export const ArchitectureView: React.FC = () => {
   const [runningTests, setRunningTests] = useState<boolean>(false);
 
   useEffect(() => {
-    fetch('/api/architecture/tree')
+    fetch(apiUrl('/api/architecture/tree'))
       .then((r) => r.json())
       .then((data: ArchTreeNode[]) => {
         setTree(data);
@@ -29,7 +30,7 @@ export const ArchitectureView: React.FC = () => {
   useEffect(() => {
     if (!selectedPath) return;
     setLoadingFile(true);
-    fetch(`/api/architecture/file?path=${encodeURIComponent(selectedPath)}`)
+    fetch(apiUrl(`/api/architecture/file?path=${encodeURIComponent(selectedPath)}`))
       .then((r) => r.json())
       .then((data) => {
         setFileContent(data.content || '');
@@ -41,7 +42,7 @@ export const ArchitectureView: React.FC = () => {
   const runUnitTests = async () => {
     setRunningTests(true);
     try {
-      const res = await fetch('/api/architecture/test', { method: 'POST' });
+      const res = await fetch(apiUrl('/api/architecture/test'), { method: 'POST' });
       const data = await res.json();
       setTestResult(data);
     } finally {
@@ -82,12 +83,12 @@ export const ArchitectureView: React.FC = () => {
             {runningTests ? 'Running Python Tests...' : 'Run Core Python Tests'}
           </button>
           <a
-            href="/api/architecture/bundle"
-            download="clippah_core_starter.zip"
+            href={apiUrl('/api/architecture/bundle')}
+            download="cutline_studio_tauri_starter.zip"
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
           >
             <Download className="w-3.5 h-3.5" />
-            Download Starter Bundle (.zip)
+            Download Tauri + Windows Bundle (.zip)
           </a>
         </div>
       </div>

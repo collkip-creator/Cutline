@@ -17,6 +17,7 @@ import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
+import { apiUrl } from './lib/api';
 import type {
   AspectRatio,
   ClipCandidate,
@@ -83,7 +84,7 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadProjects = async (selectFirst = false) => {
-    const res = await fetch('/api/projects');
+    const res = await fetch(apiUrl('/api/projects'));
     if (!res.ok) return;
     const list: ProjectRecord[] = await res.json();
     setProjects(list);
@@ -95,7 +96,7 @@ export default function App() {
   };
 
   const selectProject = async (hash: string) => {
-    const res = await fetch(`/api/projects/${encodeURIComponent(hash)}`);
+    const res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}`));
     if (!res.ok) return;
     const data = await res.json();
     setActiveProject(data.project);
@@ -108,7 +109,7 @@ export default function App() {
   };
 
   const loadQueue = async () => {
-    const res = await fetch('/api/queue');
+    const res = await fetch(apiUrl('/api/queue'));
     if (res.ok) {
       setQueueJobs(await res.json());
     }
@@ -120,7 +121,7 @@ export default function App() {
   }, []);
 
   const persistClips = async (hash: string, updatedClips: ClipCandidate[]) => {
-    await fetch(`/api/projects/${encodeURIComponent(hash)}/clips`, {
+    await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}/clips`), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clips: updatedClips }),
@@ -131,7 +132,7 @@ export default function App() {
     setIsIngesting(true);
     setNotice(null);
     try {
-      const res = await fetch('/api/projects/sample', { method: 'POST' });
+      const res = await fetch(apiUrl('/api/projects/sample'), { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to synthesize sample');
       setActiveProject(data.project);
@@ -154,7 +155,7 @@ export default function App() {
     try {
       const form = new FormData();
       form.append('video', file);
-      const res = await fetch('/api/projects/upload', { method: 'POST', body: form });
+      const res = await fetch(apiUrl('/api/projects/upload'), { method: 'POST', body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Video upload failed');
       setActiveProject(data.project);
@@ -180,7 +181,7 @@ export default function App() {
     setIsIngesting(true);
     setNotice(null);
     try {
-      const res = await fetch('/api/projects/url', {
+      const res = await fetch(apiUrl('/api/projects/url'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: streamUrl.trim() }),
@@ -205,7 +206,7 @@ export default function App() {
     setIsTranscribing(true);
     setNotice(null);
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(hash)}/transcribe`, {
+      const res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(hash)}/transcribe`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ force }),
@@ -225,7 +226,7 @@ export default function App() {
   const handleImportSrt = async () => {
     if (!activeProject || !srtImportText.trim()) return;
     const res = await fetch(
-      `/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`,
+      apiUrl(`/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`),
       {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -249,7 +250,7 @@ export default function App() {
     setNotice(null);
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`,
+        apiUrl(`/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -280,7 +281,7 @@ export default function App() {
 
   const handleSnapToWords = async (clip: ClipCandidate) => {
     if (!transcript || !activeProject) return;
-    const res = await fetch('/api/clips/snap', {
+    const res = await fetch(apiUrl('/api/clips/snap'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clip, transcript }),
@@ -356,7 +357,7 @@ export default function App() {
     setIsExporting(true);
     setNotice(null);
     try {
-      const res = await fetch('/api/clips/export', {
+      const res = await fetch(apiUrl('/api/clips/export'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -397,7 +398,7 @@ export default function App() {
     // Ensure the actual MP4 exists on disk before queuing so SocialPublisher verification passes
     if (!exportPath) {
       setIsExporting(true);
-      const expRes = await fetch('/api/clips/export', {
+      const expRes = await fetch(apiUrl('/api/clips/export'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -418,7 +419,7 @@ export default function App() {
       }
     }
 
-    const res = await fetch('/api/queue', {
+    const res = await fetch(apiUrl('/api/queue'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -622,11 +623,11 @@ export default function App() {
               </button>
             ) : (
               <a
-                href="/api/architecture/bundle"
-                download="clippah_core_starter.zip"
+                href={apiUrl('/api/architecture/bundle')}
+                download="cutline_studio_tauri_starter.zip"
                 className="inline-block px-4 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
               >
-                Download Python Core
+                Download Tauri + Python Bundle
               </a>
             )}
           </div>
@@ -852,7 +853,7 @@ export default function App() {
               jobs={queueJobs}
               onRefresh={loadQueue}
               onProcessDue={async (includeFuture) => {
-                await fetch('/api/queue/process', {
+                await fetch(apiUrl('/api/queue/process'), {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ include_future: includeFuture }),
@@ -860,11 +861,11 @@ export default function App() {
                 await loadQueue();
               }}
               onRetryJob={async (jobId) => {
-                await fetch(`/api/queue/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
+                await fetch(apiUrl(`/api/queue/${encodeURIComponent(jobId)}/retry`), { method: 'POST' });
                 await loadQueue();
               }}
               onDeleteJob={async (jobId) => {
-                await fetch(`/api/queue/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+                await fetch(apiUrl(`/api/queue/${encodeURIComponent(jobId)}`), { method: 'DELETE' });
                 await loadQueue();
               }}
             />

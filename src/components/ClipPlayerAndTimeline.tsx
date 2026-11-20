@@ -18,6 +18,7 @@ import type {
   ProjectRecord,
   Transcript,
 } from '../types';
+import { apiUrl } from '../lib/api';
 
 interface ClipPlayerAndTimelineProps {
   project: ProjectRecord;
@@ -211,7 +212,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
             >
               <video
                 ref={videoRef}
-                src={project.video_url}
+                src={apiUrl(project.video_url)}
                 onTimeUpdate={handleTimeUpdate}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
@@ -482,7 +483,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                 </div>
                 <div className="flex flex-wrap items-center gap-3 text-xs">
                   <a
-                    href={lastExport.video_url}
+                    href={apiUrl(lastExport.video_url)}
                     download
                     className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 underline underline-offset-2"
                   >
@@ -491,7 +492,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                   </a>
                   {lastExport.srt_url && (
                     <a
-                      href={lastExport.srt_url}
+                      href={apiUrl(lastExport.srt_url)}
                       download
                       className="inline-flex items-center gap-1 text-slate-300 hover:text-white underline underline-offset-2"
                     >
@@ -501,7 +502,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                   )}
                   {lastExport.ass_url && (
                     <a
-                      href={lastExport.ass_url}
+                      href={apiUrl(lastExport.ass_url)}
                       download
                       className="inline-flex items-center gap-1 text-slate-300 hover:text-white underline underline-offset-2"
                     >
