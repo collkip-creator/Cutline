@@ -1,14 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
+  Check,
+  Copy,
   Download,
+  Eye,
   Film,
+  HardDrive,
   Pause,
   Play,
   RotateCcw,
   Scissors,
   Send,
+  Trash2,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import type {
   AspectRatio,
@@ -19,6 +26,16 @@ import type {
   Transcript,
 } from '../types';
 import { apiUrl } from '../lib/api';
+import {
+  buildExportFilename,
+  cacheExportInLocalStorage,
+  deleteLocalExport,
+  downloadUrlViaBlob,
+  listLocalExports,
+  makeLocalExportKey,
+  triggerBlobDownload,
+  type LocalExportEntry,
+} from '../lib/localExports';
 
 interface ClipPlayerAndTimelineProps {
   project: ProjectRecord;
@@ -76,13 +93,80 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   const [loopClip, setLoopClip] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [markInSec, setMarkInSec] = useState<number | null>(null);
+  const [savedExports, setSavedExports] = useState<LocalExportEntry[]>([]);
+  const [isCachingExport, setIsCachingExport] = useState(false);
+  const [downloadingAction, setDownloadingAction] = useState<string | null>(null);
+  const [exportActionError, setExportActionError] = useState<string | null>(null);
+  const [copiedPath, setCopiedPath] = useState(false);
+  const [previewTarget, setPreviewTarget] = useState<{
+    title: string;
+    clipId: string;
+    aspectRatio: AspectRatio;
+    fileSizeBytes: number;
+    videoPath: string;
+    sourceLabel: string;
+    objectUrl: string;
+    isObjectUrl: boolean;
+    srtUrl: string | null;
+    assUrl: string | null;
+    entry?: LocalExportEntry;
+    exportResult?: ExportResult;
+  } | null>(null);
+  const previewObjectUrlRef = useRef<string | null>(null);
 
-  // Reset active mark if switching projects
+  const closePreview = () => {
+    if (previewObjectUrlRef.current) {
+      URL.revokeObjectURL(previewObjectUrlRef.current);
+      previewObjectUrlRef.current = null;
+    }
+    setPreviewTarget(null);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (previewObjectUrlRef.current) {
+        URL.revokeObjectURL(previewObjectUrlRef.current);
+        previewObjectUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  // Reset active mark and refresh local storage export history when switching projects
   useEffect(() => {
     setMarkInSec(null);
     setCurrentTime(0);
     setIsPlaying(false);
+    setExportActionError(null);
+    closePreview();
+    listLocalExports(project.video_hash)
+      .then((items) => setSavedExports(items))
+      .catch(() => setSavedExports([]));
   }, [project.video_hash]);
+
+  // Cache every newly rendered clip into browser local storage (IndexedDB) for offline preview & direct download
+  useEffect(() => {
+    if (!lastExport) return;
+    let cancelled = false;
+    setIsCachingExport(true);
+    setExportActionError(null);
+    const clipTitle =
+      clips.find((c) => c.id === lastExport.clip_id)?.title || lastExport.clip_id;
+    cacheExportInLocalStorage(project.video_hash, clipTitle, lastExport)
+      .then(async () => {
+        if (cancelled) return;
+        const items = await listLocalExports(project.video_hash);
+        if (!cancelled) setSavedExports(items);
+      })
+      .catch(() => {
+        // Non-fatal: preview and blob download still work directly from sidecar URL
+      })
+      .finally(() => {
+        if (!cancelled) setIsCachingExport(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [lastExport, project.video_hash]);
 
   // Seek player to active clip start when selection changes
   useEffect(() => {
@@ -123,6 +207,11 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
 
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape' && previewTarget !== null) {
+        ev.preventDefault();
+        closePreview();
+        return;
+      }
       const target = ev.target as HTMLElement | null;
       if (
         target &&
@@ -146,7 +235,143 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [markInSec, currentTime, project.duration_sec]);
+  }, [markInSec, previewTarget, currentTime, project.duration_sec]);
+
+  const pauseMainPlayer = () => {
+    const vid = videoRef.current;
+    if (vid && !vid.paused) {
+      vid.pause();
+      setIsPlaying(false);
+    }
+  };
+
+  const openEntryPreview = (entry: LocalExportEntry) => {
+    pauseMainPlayer();
+    closePreview();
+    const url = URL.createObjectURL(entry.video_blob);
+    previewObjectUrlRef.current = url;
+    setPreviewTarget({
+      title: entry.clip_title || entry.clip_id,
+      clipId: entry.clip_id,
+      aspectRatio: entry.aspect_ratio,
+      fileSizeBytes: entry.file_size_bytes,
+      videoPath: entry.video_path,
+      sourceLabel: 'Browser Local Storage',
+      objectUrl: url,
+      isObjectUrl: true,
+      srtUrl: entry.srt_url,
+      assUrl: entry.ass_url,
+      entry,
+    });
+  };
+
+  const openLastExportPreview = async (exp: ExportResult) => {
+    const cached = savedExports.find(
+      (item) => item.key === makeLocalExportKey(project.video_hash, exp)
+    );
+    if (cached) {
+      openEntryPreview(cached);
+      return;
+    }
+    pauseMainPlayer();
+    closePreview();
+    const clipTitle = clips.find((c) => c.id === exp.clip_id)?.title || exp.clip_id;
+    try {
+      setDownloadingAction('preview');
+      const entry = await cacheExportInLocalStorage(project.video_hash, clipTitle, exp);
+      const items = await listLocalExports(project.video_hash);
+      setSavedExports(items);
+      openEntryPreview(entry);
+    } catch {
+      // Fallback to direct sidecar stream inside the modal if IndexedDB cache fails
+      setPreviewTarget({
+        title: clipTitle,
+        clipId: exp.clip_id,
+        aspectRatio: exp.aspect_ratio,
+        fileSizeBytes: exp.file_size_bytes,
+        videoPath: exp.video_path,
+        sourceLabel: 'Local Sidecar Stream',
+        objectUrl: apiUrl(exp.video_url),
+        isObjectUrl: false,
+        srtUrl: exp.srt_url,
+        assUrl: exp.ass_url,
+        exportResult: exp,
+      });
+    } finally {
+      setDownloadingAction(null);
+    }
+  };
+
+  const handleDownloadAsset = async (
+    format: 'mp4' | 'srt' | 'ass',
+    options: { entry?: LocalExportEntry; exportResult?: ExportResult; actionId: string }
+  ) => {
+    const { entry, exportResult, actionId } = options;
+    setExportActionError(null);
+    setDownloadingAction(actionId);
+    try {
+      const clipId = entry?.clip_id || exportResult?.clip_id || 'clip';
+      const ratio = entry?.aspect_ratio || exportResult?.aspect_ratio || aspectRatio;
+      const filename = buildExportFilename(clipId, ratio, format);
+
+      if (format === 'mp4') {
+        if (entry?.video_blob) {
+          triggerBlobDownload(entry.video_blob, filename);
+          return;
+        }
+        if (exportResult) {
+          await downloadUrlViaBlob(apiUrl(exportResult.video_url), filename);
+        }
+        return;
+      }
+
+      if (format === 'srt') {
+        if (entry?.srt_blob) {
+          triggerBlobDownload(entry.srt_blob, filename);
+          return;
+        }
+        const url = entry?.srt_url || exportResult?.srt_url;
+        if (url) await downloadUrlViaBlob(apiUrl(url), filename);
+        return;
+      }
+
+      if (format === 'ass') {
+        if (entry?.ass_blob) {
+          triggerBlobDownload(entry.ass_blob, filename);
+          return;
+        }
+        const url = entry?.ass_url || exportResult?.ass_url;
+        if (url) await downloadUrlViaBlob(apiUrl(url), filename);
+      }
+    } catch (err: any) {
+      setExportActionError(err?.message || `Failed to save ${format.toUpperCase()} file.`);
+    } finally {
+      setDownloadingAction(null);
+    }
+  };
+
+  const handleDeleteSavedExport = async (key: string) => {
+    try {
+      await deleteLocalExport(key);
+      const items = await listLocalExports(project.video_hash);
+      setSavedExports(items);
+      if (previewTarget?.entry?.key === key) {
+        closePreview();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleCopyPath = async (pathText: string) => {
+    try {
+      await navigator.clipboard?.writeText(pathText);
+      setCopiedPath(true);
+      window.setTimeout(() => setCopiedPath(false), 1800);
+    } catch {
+      // ignore
+    }
+  };
 
   const togglePlay = () => {
     const vid = videoRef.current;
@@ -582,49 +807,186 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 rounded border border-slate-700 transition-colors whitespace-nowrap shrink-0"
               >
                 <Send className="w-3.5 h-3.5" />
-                Queue Post
+                Share / Queue
               </button>
             </div>
 
-            {lastExport && (
-              <div className="bg-[#0B0F17] border border-emerald-500/35 rounded p-3 space-y-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-medium text-emerald-400">
-                    Rendered {lastExport.clip_id}
-                  </span>
-                  <span className="font-mono tabular-nums text-slate-400">
-                    {lastExport.aspect_ratio} · {(lastExport.file_size_bytes / 1024).toFixed(0)} KB
-                  </span>
+            {lastExport && (() => {
+              const cachedLast = savedExports.find(
+                (item) => item.key === makeLocalExportKey(project.video_hash, lastExport)
+              );
+              return (
+                <div className="bg-[#0B0F17] border border-emerald-500/35 rounded p-3 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-medium text-emerald-400">
+                        Rendered {lastExport.clip_id}
+                      </span>
+                      <span className="text-[11px] text-slate-400 truncate">
+                        {isCachingExport
+                          ? 'Saving to local storage...'
+                          : cachedLast
+                            ? 'Cached in local storage'
+                            : 'Saved on disk'}
+                      </span>
+                    </div>
+                    <span className="font-mono tabular-nums text-slate-400 shrink-0">
+                      {lastExport.aspect_ratio} · {(lastExport.file_size_bytes / 1024).toFixed(0)} KB
+                    </span>
+                  </div>
+
+                  {lastExport.video_path && (
+                    <div className="flex items-center justify-between gap-2 bg-[#111724] border border-slate-800 rounded px-2 py-1">
+                      <span
+                        className="text-[10px] font-mono text-slate-400 truncate"
+                        title={lastExport.video_path}
+                      >
+                        {lastExport.video_path}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyPath(lastExport.video_path)}
+                        className="inline-flex items-center gap-1 text-[10px] text-slate-300 hover:text-white shrink-0"
+                      >
+                        {copiedPath ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            Copy Path
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <button
+                      type="button"
+                      disabled={downloadingAction === 'preview'}
+                      onClick={() => openLastExportPreview(lastExport)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-slate-100 font-medium transition-colors"
+                    >
+                      <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                      {downloadingAction === 'preview' ? 'Opening...' : 'Preview in App'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={downloadingAction === 'last-mp4'}
+                      onClick={() =>
+                        handleDownloadAsset('mp4', {
+                          entry: cachedLast,
+                          exportResult: lastExport,
+                          actionId: 'last-mp4',
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-medium transition-colors"
+                    >
+                      <Film className="w-3.5 h-3.5" />
+                      {downloadingAction === 'last-mp4' ? 'Saving...' : 'Download MP4'}
+                    </button>
+                    {lastExport.srt_url && (
+                      <button
+                        type="button"
+                        disabled={downloadingAction === 'last-srt'}
+                        onClick={() =>
+                          handleDownloadAsset('srt', {
+                            entry: cachedLast,
+                            exportResult: lastExport,
+                            actionId: 'last-srt',
+                          })
+                        }
+                        className="inline-flex items-center gap-1 px-2 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-300 hover:text-white transition-colors"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        {downloadingAction === 'last-srt' ? 'Saving...' : 'SRT'}
+                      </button>
+                    )}
+                    {lastExport.ass_url && (
+                      <button
+                        type="button"
+                        disabled={downloadingAction === 'last-ass'}
+                        onClick={() =>
+                          handleDownloadAsset('ass', {
+                            entry: cachedLast,
+                            exportResult: lastExport,
+                            actionId: 'last-ass',
+                          })
+                        }
+                        className="inline-flex items-center gap-1 px-2 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-300 hover:text-white transition-colors"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        {downloadingAction === 'last-ass' ? 'Saving...' : 'ASS'}
+                      </button>
+                    )}
+                  </div>
+
+                  {exportActionError && (
+                    <p className="text-[11px] text-rose-400">{exportActionError}</p>
+                  )}
                 </div>
-                <div className="flex flex-wrap items-center gap-3 text-xs">
-                  <a
-                    href={apiUrl(lastExport.video_url)}
-                    download
-                    className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 underline underline-offset-2"
-                  >
-                    <Film className="w-3.5 h-3.5" />
-                    Download MP4
-                  </a>
-                  {lastExport.srt_url && (
-                    <a
-                      href={apiUrl(lastExport.srt_url)}
-                      download
-                      className="inline-flex items-center gap-1 text-slate-300 hover:text-white underline underline-offset-2"
+              );
+            })()}
+
+            {savedExports.length > 0 && (
+              <div className="bg-[#0B0F17] border border-slate-800 rounded p-2.5 space-y-2">
+                <div className="flex items-center justify-between text-[11px] text-slate-400">
+                  <span className="inline-flex items-center gap-1.5 font-medium text-slate-300">
+                    <HardDrive className="w-3.5 h-3.5 text-slate-400" />
+                    Local Storage Previews ({savedExports.length})
+                  </span>
+                  <span className="font-mono text-[10px] text-slate-500">IndexedDB cache</span>
+                </div>
+                <div className="space-y-1.5 max-h-32 overflow-y-auto pr-0.5">
+                  {savedExports.map((entry) => (
+                    <div
+                      key={entry.key}
+                      className="flex items-center justify-between gap-2 px-2 py-1.5 bg-[#111724] border border-slate-800/80 rounded text-[11px]"
                     >
-                      <Download className="w-3.5 h-3.5" />
-                      Download SRT
-                    </a>
-                  )}
-                  {lastExport.ass_url && (
-                    <a
-                      href={apiUrl(lastExport.ass_url)}
-                      download
-                      className="inline-flex items-center gap-1 text-slate-300 hover:text-white underline underline-offset-2"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      Download ASS
-                    </a>
-                  )}
+                      <div className="min-w-0">
+                        <span className="font-medium text-slate-200">{entry.clip_id}</span>
+                        <span className="text-slate-500 mx-1.5">·</span>
+                        <span className="font-mono tabular-nums text-slate-400">
+                          {entry.aspect_ratio} · {(entry.file_size_bytes / 1024).toFixed(0)} KB
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => openEntryPreview(entry)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-slate-200"
+                        >
+                          <Eye className="w-3 h-3 text-emerald-400" />
+                          Preview
+                        </button>
+                        <button
+                          type="button"
+                          disabled={downloadingAction === `saved-${entry.key}`}
+                          onClick={() =>
+                            handleDownloadAsset('mp4', {
+                              entry,
+                              actionId: `saved-${entry.key}`,
+                            })
+                          }
+                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300"
+                        >
+                          <Download className="w-3 h-3" />
+                          {downloadingAction === `saved-${entry.key}` ? '...' : 'Save'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteSavedExport(entry.key)}
+                          title="Remove from local browser cache"
+                          className="p-1 text-slate-500 hover:text-rose-400 transition-colors"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -701,6 +1063,145 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
           />
         </div>
       </div>
+
+      {/* In-App Local Export Preview Modal */}
+      {previewTarget && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview ${previewTarget.clipId}`}
+        >
+          <div className="w-full max-w-3xl bg-[#111724] border border-slate-700 rounded-lg overflow-hidden shadow-2xl flex flex-col max-h-[92vh]">
+            <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-3 bg-[#0B0F17]">
+              <div className="flex items-center gap-3 min-w-0">
+                <button
+                  type="button"
+                  onClick={closePreview}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 rounded transition-colors shrink-0"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  Back to Editor
+                </button>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-100 truncate">
+                    {previewTarget.clipId} · {previewTarget.title}
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono tabular-nums">
+                    {previewTarget.aspectRatio} · {(previewTarget.fileSizeBytes / 1024).toFixed(0)} KB ·{' '}
+                    {previewTarget.sourceLabel}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={closePreview}
+                aria-label="Close preview"
+                className="p-1.5 text-slate-400 hover:text-white bg-slate-800/70 hover:bg-slate-700 rounded transition-colors shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 bg-[#070A10] flex items-center justify-center overflow-auto flex-1">
+              <div
+                className={
+                  previewTarget.aspectRatio === '9:16'
+                    ? 'aspect-[9/16] h-[60vh] max-h-[540px] bg-black border border-slate-800 rounded overflow-hidden'
+                    : 'aspect-video w-full max-w-2xl bg-black border border-slate-800 rounded overflow-hidden'
+                }
+              >
+                <video
+                  key={previewTarget.objectUrl}
+                  src={previewTarget.objectUrl}
+                  controls
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain bg-black"
+                />
+              </div>
+            </div>
+
+            <div className="px-4 py-3 border-t border-slate-800 bg-[#0B0F17] flex flex-wrap items-center justify-between gap-3">
+              <span
+                className="text-[11px] font-mono text-slate-400 truncate max-w-md"
+                title={previewTarget.videoPath}
+              >
+                {previewTarget.videoPath}
+              </span>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  disabled={downloadingAction === 'modal-mp4'}
+                  onClick={() =>
+                    handleDownloadAsset('mp4', {
+                      entry: previewTarget.entry,
+                      exportResult: previewTarget.exportResult,
+                      actionId: 'modal-mp4',
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  {downloadingAction === 'modal-mp4' ? 'Saving MP4...' : 'Download MP4'}
+                </button>
+                {previewTarget.srtUrl && (
+                  <button
+                    type="button"
+                    disabled={downloadingAction === 'modal-srt'}
+                    onClick={() =>
+                      handleDownloadAsset('srt', {
+                        entry: previewTarget.entry,
+                        exportResult: previewTarget.exportResult,
+                        actionId: 'modal-srt',
+                      })
+                    }
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    SRT
+                  </button>
+                )}
+                {previewTarget.assUrl && (
+                  <button
+                    type="button"
+                    disabled={downloadingAction === 'modal-ass'}
+                    onClick={() =>
+                      handleDownloadAsset('ass', {
+                        entry: previewTarget.entry,
+                        exportResult: previewTarget.exportResult,
+                        actionId: 'modal-ass',
+                      })
+                    }
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    ASS
+                  </button>
+                )}
+                {(() => {
+                  const targetClip =
+                    clips.find((c) => c.id === previewTarget.clipId) || activeClip;
+                  if (!targetClip) return null;
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        closePreview();
+                        onOpenQueueModal(targetClip);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 text-emerald-300 font-semibold rounded transition-colors"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      Share / Queue
+                    </button>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

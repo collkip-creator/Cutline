@@ -94,6 +94,17 @@ export interface PublishJob {
   attempts: number;
 }
 
+export interface PublishChannelConfig {
+  platform: PublishPlatform;
+  enabled: boolean;
+  endpoint_url: string;
+  has_token: boolean;
+  token_preview: string;
+  payload_mode: 'multipart' | 'json';
+  default_hashtags: string[];
+  updated_at_iso: string | null;
+}
+
 export interface ArchTreeNode {
   path: string;
   layer: 'core' | 'adapter' | 'ui' | 'tests' | 'root';

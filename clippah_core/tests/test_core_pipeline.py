@@ -200,6 +200,70 @@ class CorePipelineTests(unittest.TestCase):
         categories = {c.category.value for c in batch.clips}
         self.assertGreaterEqual(len(categories), 2)
 
+    def test_channel_config_job_update_and_multipart_encoding(self) -> None:
+        from clippah_core.adapters.social_adapters import (
+            build_publishers_from_store,
+            encode_multipart_form_data,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_mp4 = tmp_path / "short.mp4"
+            fake_mp4.write_bytes(b"ftypmp42data")
+            store = PublishQueueStore(tmp_path / "queue.db")
+
+            updated_cfg = store.upsert_channel(
+                PublishPlatform.TIKTOK,
+                enabled=True,
+                endpoint_url="https://example.invalid/webhook",
+                bearer_token="secret-tok-9999",
+                payload_mode="multipart",
+                default_hashtags=["fyp", "dev"],
+            )
+            self.assertEqual(updated_cfg["payload_mode"], "multipart")
+            self.assertTrue(updated_cfg["has_token"])
+            self.assertEqual(updated_cfg["token_preview"], "...9999")
+
+            store.upsert_channel(
+                PublishPlatform.TIKTOK,
+                enabled=True,
+                endpoint_url="https://example.invalid/v2",
+                bearer_token=None,
+                payload_mode="json",
+            )
+            with_secret = store.get_channel(PublishPlatform.TIKTOK, include_secret=True)
+            self.assertEqual(with_secret["bearer_token"], "secret-tok-9999")
+
+            job = store.enqueue(
+                clip_id="clip_02",
+                clip_title="Quick Tip",
+                video_path=str(fake_mp4),
+                platform=PublishPlatform.INSTAGRAM_REELS,
+                caption_text="Original caption",
+                tags=["reels"],
+            )
+            edited = store.update_job(
+                job.job_id,
+                caption_text="Updated caption",
+                tags=["reels", "coding"],
+            )
+            self.assertIsNotNone(edited)
+            self.assertEqual(edited.caption_text, "Updated caption")  # type: ignore[union-attr]
+
+            publishers = build_publishers_from_store(store)
+            dispatched = store.dispatch_job(job.job_id, publishers)
+            self.assertIsNotNone(dispatched)
+            self.assertEqual(dispatched.status, PublishStatus.PUBLISHED)  # type: ignore[union-attr]
+
+            body, ctype = encode_multipart_form_data(
+                {"platform": "tiktok", "caption": "Updated caption"},
+                [("video", "short.mp4", "video/mp4", fake_mp4.read_bytes())],
+                boundary="TESTBND",
+            )
+            self.assertIn("multipart/form-data; boundary=TESTBND", ctype)
+            self.assertIn(b'filename="short.mp4"', body)
+            self.assertIn(b"ftypmp42data", body)
+
 
 if __name__ == "__main__":
     unittest.main()

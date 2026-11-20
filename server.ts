@@ -723,6 +723,39 @@ print(res.model_dump_json())
     }
   });
 
+  app.get('/api/queue/channels', async (_req: Request, res: Response) => {
+    try {
+      const stdout = await runPythonCli(['queue', '--db', QUEUE_DB, '--action', 'channels-list']);
+      res.json(JSON.parse(stdout));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to read social channels' });
+    }
+  });
+
+  app.put('/api/queue/channels/:platform', async (req: Request, res: Response) => {
+    try {
+      const stdout = await runPythonCli(
+        ['queue', '--db', QUEUE_DB, '--action', 'channel-upsert', '--platform', String(req.params.platform)],
+        req.body || {}
+      );
+      res.json(JSON.parse(stdout));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to update social channel' });
+    }
+  });
+
+  app.post('/api/queue/channels/:platform/test', async (req: Request, res: Response) => {
+    try {
+      const stdout = await runPythonCli(
+        ['queue', '--db', QUEUE_DB, '--action', 'channel-test', '--platform', String(req.params.platform)],
+        req.body || {}
+      );
+      res.json(JSON.parse(stdout));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Webhook test failed' });
+    }
+  });
+
   app.post('/api/queue/process', async (req: Request, res: Response) => {
     try {
       const args = ['queue', '--db', QUEUE_DB, '--action', 'process'];
@@ -731,6 +764,29 @@ print(res.model_dump_json())
       res.json(JSON.parse(stdout));
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Queue processing failed' });
+    }
+  });
+
+  app.patch('/api/queue/:jobId', async (req: Request, res: Response) => {
+    try {
+      const stdout = await runPythonCli(
+        ['queue', '--db', QUEUE_DB, '--action', 'update', '--job-id', String(req.params.jobId)],
+        req.body || {}
+      );
+      res.json(JSON.parse(stdout));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to update job' });
+    }
+  });
+
+  app.post('/api/queue/:jobId/dispatch', async (req: Request, res: Response) => {
+    try {
+      const stdout = await runPythonCli([
+        'queue', '--db', QUEUE_DB, '--action', 'dispatch', '--job-id', String(req.params.jobId),
+      ]);
+      res.json(JSON.parse(stdout));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Dispatch failed' });
     }
   });
 

@@ -28,7 +28,10 @@ from ..adapters.desktop_ffmpeg import FFmpegVideoProcessor, resolve_media_binary
 from ..adapters.desktop_ollama import OllamaHighlightEngine
 from ..adapters.desktop_whisper import FasterWhisperTranscriber
 from ..adapters.desktop_ytdlp import DesktopMediaDownloader
-from ..adapters.social_adapters import build_default_publishers
+from ..adapters.social_adapters import (
+    build_publishers_from_store,
+    test_webhook_endpoint,
+)
 from ..core.cache import TranscriptCache, compute_file_sha256
 from ..core.captions import generate_ass, generate_srt
 from ..core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
@@ -66,7 +69,6 @@ pipeline = ClippahPipeline(
     workspace_dir=VIDEOS_DIR,
 )
 queue_store = PublishQueueStore(DATA_ROOT / "clippah_queue.db")
-publishers = build_default_publishers()
 
 app = FastAPI(title="Cutline Studio Local Sidecar", version="0.1.0")
 app.add_middleware(
@@ -240,6 +242,27 @@ class QueueRequest(BaseModel):
     caption_text: str
     tags: List[str] = []
     scheduled_at_iso: Optional[str] = None
+
+
+class QueueUpdateRequest(BaseModel):
+    caption_text: Optional[str] = None
+    tags: Optional[List[str]] = None
+    platform: Optional[PublishPlatform] = None
+    scheduled_at_iso: Optional[str] = None
+    clear_schedule: bool = False
+
+
+class ChannelUpdateRequest(BaseModel):
+    enabled: bool = True
+    endpoint_url: str = ""
+    bearer_token: Optional[str] = None
+    payload_mode: str = "multipart"
+    default_hashtags: Optional[List[str]] = None
+
+
+class ChannelTestRequest(BaseModel):
+    endpoint_url: Optional[str] = None
+    bearer_token: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -546,11 +569,62 @@ def enqueue_job(req: QueueRequest):
     return queue_store.enqueue(**req.model_dump()).model_dump()
 
 
+@app.get("/api/queue/channels")
+def list_channels():
+    return queue_store.list_channels()
+
+
+@app.put("/api/queue/channels/{platform}")
+def upsert_channel(platform: PublishPlatform, req: ChannelUpdateRequest):
+    return queue_store.upsert_channel(
+        platform,
+        enabled=req.enabled,
+        endpoint_url=req.endpoint_url,
+        bearer_token=req.bearer_token,
+        payload_mode=req.payload_mode,
+        default_hashtags=req.default_hashtags,
+    )
+
+
+@app.post("/api/queue/channels/{platform}/test")
+def test_channel(platform: PublishPlatform, req: Optional[ChannelTestRequest] = None):
+    cfg = queue_store.get_channel(platform, include_secret=True)
+    endpoint = (req.endpoint_url if req and req.endpoint_url is not None else cfg.get("endpoint_url")) or ""
+    token = req.bearer_token if req and req.bearer_token is not None else cfg.get("bearer_token")
+    return test_webhook_endpoint(platform, endpoint, token)
+
+
 @app.post("/api/queue/process")
 def process_due(body: Optional[Dict[str, Any]] = None):
     include_future = bool((body or {}).get("include_future", False))
-    processed = queue_store.process_due_jobs(publishers, include_future_scheduled=include_future)
+    processed = queue_store.process_due_jobs(
+        build_publishers_from_store(queue_store),
+        include_future_scheduled=include_future,
+    )
     return [j.model_dump() for j in processed]
+
+
+@app.patch("/api/queue/{job_id}")
+def update_job(job_id: str, req: QueueUpdateRequest):
+    updated = queue_store.update_job(
+        job_id,
+        caption_text=req.caption_text,
+        tags=req.tags,
+        platform=req.platform,
+        scheduled_at_iso=req.scheduled_at_iso,
+        clear_schedule=req.clear_schedule,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Queue job not found")
+    return updated.model_dump()
+
+
+@app.post("/api/queue/{job_id}/dispatch")
+def dispatch_job(job_id: str):
+    updated = queue_store.dispatch_job(job_id, build_publishers_from_store(queue_store))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Queue job not found")
+    return updated.model_dump()
 
 
 @app.post("/api/queue/{job_id}/retry")

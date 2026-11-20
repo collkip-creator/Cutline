@@ -15,7 +15,10 @@ import sys
 
 from .adapters.desktop_ffmpeg import FFmpegVideoProcessor
 from .adapters.desktop_ollama import OllamaHighlightEngine
-from .adapters.social_adapters import build_default_publishers
+from .adapters.social_adapters import (
+    build_publishers_from_store,
+    test_webhook_endpoint,
+)
 from .core.captions import generate_ass, generate_srt
 from .core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
 from .core.queue import PublishQueueStore
@@ -48,10 +51,22 @@ def main() -> None:
     q_parser.add_argument("--db", required=True)
     q_parser.add_argument(
         "--action",
-        choices=["list", "enqueue", "process", "delete", "retry"],
+        choices=[
+            "list",
+            "enqueue",
+            "process",
+            "delete",
+            "retry",
+            "dispatch",
+            "update",
+            "channels-list",
+            "channel-upsert",
+            "channel-test",
+        ],
         required=True,
     )
     q_parser.add_argument("--job-id", default="")
+    q_parser.add_argument("--platform", default="")
     q_parser.add_argument("--include-future", action="store_true")
 
     args = parser.parse_args()
@@ -141,10 +156,45 @@ def main() -> None:
             print(job.model_dump_json())
         elif args.action == "process":
             processed = store.process_due_jobs(
-                build_default_publishers(),
+                build_publishers_from_store(store),
                 include_future_scheduled=args.include_future,
             )
             print(json.dumps([j.model_dump() for j in processed]))
+        elif args.action == "dispatch":
+            updated = store.dispatch_job(args.job_id, build_publishers_from_store(store))
+            print(updated.model_dump_json() if updated else "{}")
+        elif args.action == "update":
+            payload = _read_stdin_json()
+            updated = store.update_job(
+                args.job_id,
+                caption_text=payload.get("caption_text"),
+                tags=payload.get("tags"),
+                platform=PublishPlatform(payload["platform"]) if payload.get("platform") else None,
+                scheduled_at_iso=payload.get("scheduled_at_iso"),
+                clear_schedule=bool(payload.get("clear_schedule", False)),
+            )
+            print(updated.model_dump_json() if updated else "{}")
+        elif args.action == "channels-list":
+            print(json.dumps(store.list_channels()))
+        elif args.action == "channel-upsert":
+            payload = _read_stdin_json()
+            platform = PublishPlatform(args.platform or payload["platform"])
+            updated = store.upsert_channel(
+                platform,
+                enabled=bool(payload.get("enabled", True)),
+                endpoint_url=str(payload.get("endpoint_url", "")),
+                bearer_token=payload.get("bearer_token"),
+                payload_mode=str(payload.get("payload_mode", "multipart")),
+                default_hashtags=payload.get("default_hashtags"),
+            )
+            print(json.dumps(updated))
+        elif args.action == "channel-test":
+            payload = _read_stdin_json()
+            platform = PublishPlatform(args.platform or payload["platform"])
+            cfg = store.get_channel(platform, include_secret=True)
+            endpoint = str(payload.get("endpoint_url") or cfg.get("endpoint_url") or "")
+            token = payload.get("bearer_token") if payload.get("bearer_token") is not None else cfg.get("bearer_token")
+            print(json.dumps(test_webhook_endpoint(platform, endpoint, token)))
         elif args.action == "delete":
             ok = store.delete_job(args.job_id)
             print(json.dumps({"deleted": ok}))

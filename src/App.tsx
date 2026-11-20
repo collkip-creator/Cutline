@@ -17,6 +17,7 @@ import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
+import { SharePublishModal } from './components/SharePublishModal';
 import {
   apiFetch,
   apiUrl,
@@ -27,12 +28,14 @@ import {
   restartTauriSidecar,
   type SidecarDiagnostics,
 } from './lib/api';
+import { downloadUrlViaBlob } from './lib/localExports';
 import type {
   AspectRatio,
   ClipCandidate,
   EncodeMode,
   ExportResult,
   ProjectRecord,
+  PublishChannelConfig,
   PublishJob,
   PublishPlatform,
   Transcript,
@@ -60,6 +63,7 @@ export default function App() {
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
   const [ollamaModel, setOllamaModel] = useState('qwen2.5:14b');
   const [whisperModel, setWhisperModel] = useState('faster-whisper-small-int8');
+  const [isDownloadingBundle, setIsDownloadingBundle] = useState(false);
 
   // Render options
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>('9:16');
@@ -87,14 +91,8 @@ export default function App() {
 
   // Queue state & modal
   const [queueJobs, setQueueJobs] = useState<PublishJob[]>([]);
+  const [queueChannels, setQueueChannels] = useState<PublishChannelConfig[]>([]);
   const [queueModalClip, setQueueModalClip] = useState<ClipCandidate | null>(null);
-  const [queuePlatform, setQueuePlatform] = useState<PublishPlatform>('youtube_shorts');
-  const [queueCaption, setQueueCaption] = useState('');
-  const [queueScheduleMode, setQueueScheduleMode] = useState<'now' | 'later'>('now');
-  const [queueScheduleIso, setQueueScheduleIso] = useState(() => {
-    const dt = new Date(Date.now() + 3600_000);
-    return dt.toISOString().slice(0, 16);
-  });
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -135,8 +133,12 @@ export default function App() {
 
   const loadQueue = async () => {
     try {
-      const res = await apiFetch('/api/queue');
-      setQueueJobs(await readJsonResponse<PublishJob[]>(res));
+      const [jobsRes, chRes] = await Promise.all([
+        apiFetch('/api/queue'),
+        apiFetch('/api/queue/channels'),
+      ]);
+      setQueueJobs(await readJsonResponse<PublishJob[]>(jobsRes));
+      setQueueChannels(await readJsonResponse<PublishChannelConfig[]>(chRes));
     } catch {
       // Ignore transient cold-start poll errors
     }
@@ -525,62 +527,6 @@ export default function App() {
 
   const openQueueModal = (clip: ClipCandidate) => {
     setQueueModalClip(clip);
-    setQueueCaption(clip.caption_hook ? `${clip.caption_hook} — ${clip.title}` : clip.title);
-  };
-
-  const submitQueueJob = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!queueModalClip || !activeProject) return;
-
-    try {
-      let exportPath = lastExport?.clip_id === queueModalClip.id ? lastExport.video_path : '';
-      let srtPath = lastExport?.clip_id === queueModalClip.id ? lastExport.srt_path : null;
-
-      // Ensure the actual MP4 exists on disk before queuing so SocialPublisher verification passes
-      if (!exportPath) {
-        setIsExporting(true);
-        const expRes = await apiFetch('/api/clips/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            video_hash: activeProject.video_hash,
-            clip: queueModalClip,
-            aspect_ratio: aspectRatio,
-            encode_mode: encodeMode,
-            include_srt: true,
-            burn_captions: burnCaptions,
-          }),
-        });
-        const expData = await readJsonResponse<ExportResult>(expRes);
-        setIsExporting(false);
-        exportPath = expData.video_path;
-        srtPath = expData.srt_path;
-        setLastExport(expData);
-      }
-
-      const res = await apiFetch('/api/queue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clip_id: queueModalClip.id,
-          clip_title: queueModalClip.title,
-          video_path: exportPath || activeProject.local_path,
-          srt_path: srtPath,
-          platform: queuePlatform,
-          caption_text: queueCaption,
-          tags: queueModalClip.tags,
-          scheduled_at_iso:
-            queueScheduleMode === 'later' ? new Date(queueScheduleIso).toISOString() : null,
-        }),
-      });
-      await readJsonResponse(res);
-      setQueueModalClip(null);
-      await loadQueue();
-      setActiveTab('queue');
-    } catch (err: any) {
-      setIsExporting(false);
-      setNotice({ kind: 'error', text: err.message });
-    }
   };
 
   const navItems: Array<{ id: WorkspaceTab; label: string; icon: React.ReactNode }> = [
@@ -763,13 +709,26 @@ export default function App() {
                 {isExporting ? 'Exporting...' : 'Export Active Clip'}
               </button>
             ) : (
-              <a
-                href={apiUrl('/api/architecture/bundle')}
-                download="cutline_studio_tauri_starter.zip"
-                className="inline-block px-4 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+              <button
+                type="button"
+                disabled={isDownloadingBundle}
+                onClick={async () => {
+                  setIsDownloadingBundle(true);
+                  try {
+                    await downloadUrlViaBlob(
+                      apiUrl('/api/architecture/bundle'),
+                      'cutline_studio_tauri_starter.zip'
+                    );
+                  } catch (err: any) {
+                    setNotice({ kind: 'error', text: err?.message || 'Bundle download failed.' });
+                  } finally {
+                    setIsDownloadingBundle(false);
+                  }
+                }}
+                className="inline-block px-4 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
               >
-                Download Tauri + Python Bundle
-              </a>
+                {isDownloadingBundle ? 'Downloading Bundle...' : 'Download Tauri + Python Bundle'}
+              </button>
             )}
           </div>
         </header>
@@ -1030,12 +989,27 @@ export default function App() {
           {activeTab === 'queue' && (
             <PublishQueueView
               jobs={queueJobs}
+              channels={queueChannels}
               onRefresh={loadQueue}
               onProcessDue={async (includeFuture) => {
                 await apiFetch('/api/queue/process', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ include_future: includeFuture }),
+                });
+                await loadQueue();
+              }}
+              onDispatchJob={async (jobId) => {
+                await apiFetch(`/api/queue/${encodeURIComponent(jobId)}/dispatch`, {
+                  method: 'POST',
+                });
+                await loadQueue();
+              }}
+              onUpdateJob={async (jobId, patch) => {
+                await apiFetch(`/api/queue/${encodeURIComponent(jobId)}`, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(patch),
                 });
                 await loadQueue();
               }}
@@ -1047,6 +1021,23 @@ export default function App() {
                 await apiFetch(`/api/queue/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
                 await loadQueue();
               }}
+              onSaveChannel={async (platform, payload) => {
+                const res = await apiFetch(`/api/queue/channels/${encodeURIComponent(platform)}`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload),
+                });
+                await readJsonResponse(res);
+                await loadQueue();
+              }}
+              onTestChannel={async (platform, payload) => {
+                const res = await apiFetch(`/api/queue/channels/${encodeURIComponent(platform)}/test`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload),
+                });
+                return readJsonResponse<{ ok: boolean; status_code: number | null; message: string }>(res);
+              }}
             />
           )}
 
@@ -1056,113 +1047,29 @@ export default function App() {
         </main>
       </div>
 
-      {/* Enqueue Social Publish Modal */}
-      {queueModalClip && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-          <form
-            onSubmit={submitQueueJob}
-            className="w-full max-w-md bg-[#111724] border border-slate-700 rounded-lg p-5 space-y-4"
-          >
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <h3 className="text-sm font-semibold text-slate-100">
-                Queue Clip for Social Publishing
-              </h3>
-              <button
-                type="button"
-                onClick={() => setQueueModalClip(null)}
-                className="text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-slate-400 mb-1">Clip</label>
-                <div className="font-medium text-slate-100">
-                  {queueModalClip.id} · {queueModalClip.title}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-400 mb-1">Target Platform Adapter</label>
-                <select
-                  value={queuePlatform}
-                  onChange={(e) => setQueuePlatform(e.target.value as PublishPlatform)}
-                  className="w-full bg-[#0B0F17] border border-slate-800 rounded px-3 py-2 text-slate-100 outline-none focus:border-blue-500"
-                >
-                  <option value="youtube_shorts">YouTube Shorts</option>
-                  <option value="tiktok">TikTok</option>
-                  <option value="instagram_reels">Instagram Reels</option>
-                  <option value="x_video">X Video</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-slate-400 mb-1">Post Caption</label>
-                <textarea
-                  rows={3}
-                  value={queueCaption}
-                  onChange={(e) => setQueueCaption(e.target.value)}
-                  className="w-full bg-[#0B0F17] border border-slate-800 rounded px-3 py-2 text-slate-100 outline-none focus:border-blue-500 resize-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-400 mb-1">Dispatch Schedule</label>
-                <div className="grid grid-cols-2 gap-2 mb-2">
-                  <button
-                    type="button"
-                    onClick={() => setQueueScheduleMode('now')}
-                    className={`py-1.5 rounded border font-medium ${
-                      queueScheduleMode === 'now'
-                        ? 'bg-blue-600/20 border-blue-500 text-white'
-                        : 'bg-[#0B0F17] border-slate-800 text-slate-400'
-                    }`}
-                  >
-                    Queue Immediately
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setQueueScheduleMode('later')}
-                    className={`py-1.5 rounded border font-medium ${
-                      queueScheduleMode === 'later'
-                        ? 'bg-blue-600/20 border-blue-500 text-white'
-                        : 'bg-[#0B0F17] border-slate-800 text-slate-400'
-                    }`}
-                  >
-                    Schedule Date/Time
-                  </button>
-                </div>
-                {queueScheduleMode === 'later' && (
-                  <input
-                    type="datetime-local"
-                    value={queueScheduleIso}
-                    onChange={(e) => setQueueScheduleIso(e.target.value)}
-                    className="w-full bg-[#0B0F17] border border-slate-800 rounded px-3 py-2 font-mono text-slate-100 outline-none"
-                  />
-                )}
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => setQueueModalClip(null)}
-                className="px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={isExporting}
-                className="px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded"
-              >
-                {isExporting ? 'Rendering & Queuing...' : 'Add to SQLite Queue'}
-              </button>
-            </div>
-          </form>
-        </div>
+      {/* Share & Multi-Platform Publish Modal */}
+      {queueModalClip && activeProject && (
+        <SharePublishModal
+          clip={queueModalClip}
+          project={activeProject}
+          aspectRatio={aspectRatio}
+          encodeMode={encodeMode}
+          burnCaptions={burnCaptions}
+          lastExport={lastExport}
+          channels={queueChannels}
+          onExportCompleted={(expData) => setLastExport(expData)}
+          onQueueCompleted={async (count, dispatchedNow) => {
+            await loadQueue();
+            setNotice({
+              kind: 'info',
+              text: dispatchedNow
+                ? `Published ${count} channel job${count > 1 ? 's' : ''} through configured adapters.`
+                : `Queued ${count} social share job${count > 1 ? 's' : ''}.`,
+            });
+            setActiveTab('queue');
+          }}
+          onClose={() => setQueueModalClip(null)}
+        />
       )}
     </div>
   );
