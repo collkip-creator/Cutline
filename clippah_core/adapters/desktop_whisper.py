@@ -8,6 +8,7 @@ the exact same `Transcript` & `WordTimestamp` schema.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,8 +19,8 @@ from ..core.schemas import Transcript, TranscriptSegment, WordTimestamp
 class FasterWhisperTranscriber(Transcriber):
     def __init__(
         self,
-        model_size: str = "small",
-        device: str = "auto",
+        model_size: str = "base",
+        device: str = "cpu",
         compute_type: str = "int8",
     ) -> None:
         self.model_size = model_size
@@ -40,6 +41,7 @@ class FasterWhisperTranscriber(Transcriber):
             raise RuntimeError(
                 "faster-whisper is not installed. Run `pip install faster-whisper` on desktop."
             ) from exc
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         self._model = WhisperModel(
             self.model_size,
             device=self.device,
@@ -55,13 +57,22 @@ class FasterWhisperTranscriber(Transcriber):
         on_progress: ProgressCallback = None,
     ) -> Transcript:
         model = self._ensure_model()
-        segments_iter, info = model.transcribe(
-            str(audio_or_video_path),
-            language=language,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450},
-        )
+        try:
+            segments_iter, info = model.transcribe(
+                str(audio_or_video_path),
+                language=language,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 450},
+            )
+        except Exception:
+            # Retry without Silero VAD if onnxruntime VAD fails on host
+            segments_iter, info = model.transcribe(
+                str(audio_or_video_path),
+                language=language,
+                word_timestamps=True,
+                vad_filter=False,
+            )
 
         segments: List[TranscriptSegment] = []
         total_dur = float(getattr(info, "duration", 0.0) or 0.0)

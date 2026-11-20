@@ -100,7 +100,7 @@ class OllamaHighlightEngine(HighlightEngine):
                 body = json.loads(resp.read().decode("utf-8"))
                 content = body.get("message", {}).get("content", "{}")
                 return HighlightBatch.model_validate(json.loads(content))
-        except (url_error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001
             if not self.allow_heuristic_fallback:
                 raise RuntimeError(f"Ollama inference failed at {self.base_url}: {exc}") from exc
             return self._heuristic_extract(
@@ -166,6 +166,21 @@ class OllamaHighlightEngine(HighlightEngine):
                     ),
                     caption_hook=first_sentence[:48].upper() if first_sentence else title.upper(),
                     tags=tags,
+                )
+            )
+
+        if not candidates and segs:
+            full_text = " ".join(s.text for s in segs).strip()
+            candidates.append(
+                ClipCandidate(
+                    id="clip_01",
+                    title=(full_text[:56] or "Opening Segment"),
+                    start_sec=segs[0].start_sec,
+                    end_sec=segs[-1].end_sec,
+                    hook_score=72.0,
+                    reason="Full segment range selected for short-duration footage.",
+                    caption_hook=(full_text[:48].upper() or "HIGHLIGHT"),
+                    tags=["highlight", "local"],
                 )
             )
 

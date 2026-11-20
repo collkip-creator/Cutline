@@ -26,6 +26,12 @@ from ..core.interfaces import ProgressCallback, VideoProcessor
 from ..core.schemas import AspectRatio, EncodeMode, ExportResult, ExportSpec
 
 
+def _subprocess_kwargs() -> dict:
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
 def resolve_media_binary(name: str) -> str:
     """Locate bundled Windows/macOS/Linux binary when packaged with PyInstaller or Tauri."""
     exe_suffix = ".exe" if os.name == "nt" else ""
@@ -76,7 +82,7 @@ class FFmpegVideoProcessor(VideoProcessor):
             "json",
             str(media_path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, **_subprocess_kwargs())
         if proc.returncode != 0:
             raise RuntimeError(f"ffprobe failed: {proc.stderr.strip()}")
 
@@ -119,7 +125,7 @@ class FFmpegVideoProcessor(VideoProcessor):
             "1",
             str(output_wav_path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, **_subprocess_kwargs())
         if proc.returncode != 0:
             raise RuntimeError(f"Audio extraction failed: {proc.stderr.strip()}")
         return output_wav_path
@@ -207,7 +213,7 @@ class FFmpegVideoProcessor(VideoProcessor):
         if on_progress:
             on_progress(0.35, "Running FFmpeg render...")
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, **_subprocess_kwargs())
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg render failed: {proc.stderr[-800:]}")
 

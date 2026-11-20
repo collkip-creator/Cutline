@@ -379,7 +379,7 @@ export default function App() {
     setIsExporting(true);
     setNotice(null);
     try {
-      const res = await fetch(apiUrl('/api/clips/export'), {
+      const res = await apiFetch('/api/clips/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -391,8 +391,7 @@ export default function App() {
           burn_captions: burnCaptions,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'FFmpeg export failed');
+      const data = await readJsonResponse<ExportResult>(res);
       setLastExport(data);
       setNotice({
         kind: 'info',
@@ -414,53 +413,54 @@ export default function App() {
     e.preventDefault();
     if (!queueModalClip || !activeProject) return;
 
-    let exportPath = lastExport?.clip_id === queueModalClip.id ? lastExport.video_path : '';
-    let srtPath = lastExport?.clip_id === queueModalClip.id ? lastExport.srt_path : null;
+    try {
+      let exportPath = lastExport?.clip_id === queueModalClip.id ? lastExport.video_path : '';
+      let srtPath = lastExport?.clip_id === queueModalClip.id ? lastExport.srt_path : null;
 
-    // Ensure the actual MP4 exists on disk before queuing so SocialPublisher verification passes
-    if (!exportPath) {
-      setIsExporting(true);
-      const expRes = await fetch(apiUrl('/api/clips/export'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_hash: activeProject.video_hash,
-          clip: queueModalClip,
-          aspect_ratio: aspectRatio,
-          encode_mode: encodeMode,
-          include_srt: true,
-          burn_captions: burnCaptions,
-        }),
-      });
-      setIsExporting(false);
-      if (expRes.ok) {
-        const expData = await expRes.json();
+      // Ensure the actual MP4 exists on disk before queuing so SocialPublisher verification passes
+      if (!exportPath) {
+        setIsExporting(true);
+        const expRes = await apiFetch('/api/clips/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            video_hash: activeProject.video_hash,
+            clip: queueModalClip,
+            aspect_ratio: aspectRatio,
+            encode_mode: encodeMode,
+            include_srt: true,
+            burn_captions: burnCaptions,
+          }),
+        });
+        const expData = await readJsonResponse<ExportResult>(expRes);
+        setIsExporting(false);
         exportPath = expData.video_path;
         srtPath = expData.srt_path;
         setLastExport(expData);
       }
-    }
 
-    const res = await fetch(apiUrl('/api/queue'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        clip_id: queueModalClip.id,
-        clip_title: queueModalClip.title,
-        video_path: exportPath || activeProject.local_path,
-        srt_path: srtPath,
-        platform: queuePlatform,
-        caption_text: queueCaption,
-        tags: queueModalClip.tags,
-        scheduled_at_iso:
-          queueScheduleMode === 'later' ? new Date(queueScheduleIso).toISOString() : null,
-      }),
-    });
-
-    if (res.ok) {
+      const res = await apiFetch('/api/queue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clip_id: queueModalClip.id,
+          clip_title: queueModalClip.title,
+          video_path: exportPath || activeProject.local_path,
+          srt_path: srtPath,
+          platform: queuePlatform,
+          caption_text: queueCaption,
+          tags: queueModalClip.tags,
+          scheduled_at_iso:
+            queueScheduleMode === 'later' ? new Date(queueScheduleIso).toISOString() : null,
+        }),
+      });
+      await readJsonResponse(res);
       setQueueModalClip(null);
       await loadQueue();
       setActiveTab('queue');
+    } catch (err: any) {
+      setIsExporting(false);
+      setNotice({ kind: 'error', text: err.message });
     }
   };
 
@@ -880,7 +880,7 @@ export default function App() {
               jobs={queueJobs}
               onRefresh={loadQueue}
               onProcessDue={async (includeFuture) => {
-                await fetch(apiUrl('/api/queue/process'), {
+                await apiFetch('/api/queue/process', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ include_future: includeFuture }),
@@ -888,11 +888,11 @@ export default function App() {
                 await loadQueue();
               }}
               onRetryJob={async (jobId) => {
-                await fetch(apiUrl(`/api/queue/${encodeURIComponent(jobId)}/retry`), { method: 'POST' });
+                await apiFetch(`/api/queue/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
                 await loadQueue();
               }}
               onDeleteJob={async (jobId) => {
-                await fetch(apiUrl(`/api/queue/${encodeURIComponent(jobId)}`), { method: 'DELETE' });
+                await apiFetch(`/api/queue/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
                 await loadQueue();
               }}
             />

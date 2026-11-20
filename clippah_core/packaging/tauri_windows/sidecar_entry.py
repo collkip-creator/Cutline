@@ -20,9 +20,26 @@ def _setup_stdio_log() -> Path:
     return log_path
 
 
+def _run_transcribe_worker(wav_path: str, video_hash: str, out_json: str) -> int:
+    from clippah_core.adapters.desktop_whisper import FasterWhisperTranscriber
+
+    transcriber = FasterWhisperTranscriber(model_size="base", device="cpu", compute_type="int8")
+    transcript = transcriber.transcribe(Path(wav_path), video_hash=video_hash)
+    Path(out_json).write_text(transcript.model_dump_json(), encoding="utf-8")
+    return 0
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     _setup_stdio_log()
+
+    if len(sys.argv) >= 5 and sys.argv[1] == "--transcribe-worker":
+        try:
+            sys.exit(_run_transcribe_worker(sys.argv[2], sys.argv[3], sys.argv[4]))
+        except Exception:
+            traceback.print_exc()
+            sys.exit(1)
+
     try:
         import uvicorn
         from clippah_core.ui.tauri_sidecar import app

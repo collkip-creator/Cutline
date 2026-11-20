@@ -5,12 +5,28 @@ use tauri_plugin_shell::ShellExt;
 
 struct SidecarState(Mutex<Option<CommandChild>>);
 
+#[cfg(target_os = "windows")]
+fn kill_sidecar_tree() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "cutline-sidecar.exe", "/T"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_sidecar_tree() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
         .setup(|app| {
+            // Ensure no stale sidecar from an earlier crash holds port 43111
+            kill_sidecar_tree();
+
             let sidecar_cmd = app.shell().sidecar("cutline-sidecar")?;
             let (mut rx, child) = sidecar_cmd.spawn()?;
             if let Some(state) = app.try_state::<SidecarState>() {
@@ -45,6 +61,7 @@ pub fn run() {
                     }
                 }
             }
+            kill_sidecar_tree();
         }
     });
 }

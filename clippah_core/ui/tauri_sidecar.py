@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -28,7 +30,7 @@ from ..adapters.desktop_ytdlp import DesktopMediaDownloader
 from ..adapters.social_adapters import build_default_publishers
 from ..core.cache import TranscriptCache, compute_file_sha256
 from ..core.captions import generate_ass, generate_srt
-from ..core.grounding import snap_clip_to_words
+from ..core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
 from ..core.pipeline import ClippahPipeline
 from ..core.queue import PublishQueueStore
 from ..core.schemas import (
@@ -257,6 +259,7 @@ def create_sample():
     target = VIDEOS_DIR / sample_name
     if not target.exists():
         ffmpeg_bin = resolve_media_binary("ffmpeg")
+        kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if os.name == "nt" else {}
         subprocess.run(
             [
                 ffmpeg_bin,
@@ -269,6 +272,7 @@ def create_sample():
                 target.as_posix(),
             ],
             check=True,
+            **kwargs,
         )
     meta = video_processor.probe_media(target)
     vhash = compute_file_sha256(target)
@@ -378,7 +382,24 @@ def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
     try:
         wav_path = CACHE_DIR / f"{video_hash[:12]}_16k.wav"
         video_processor.extract_audio(Path(proj["local_path"]), wav_path)
-        tr = pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
+        if getattr(sys, "frozen", False):
+            import tempfile
+            out_json = Path(tempfile.gettempdir()) / f"cutline_tr_{video_hash[:12]}.json"
+            kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if os.name == "nt" else {}
+            proc = subprocess.run(
+                [sys.executable, "--transcribe-worker", str(wav_path), video_hash, str(out_json)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+                **kwargs,
+            )
+            if proc.returncode != 0 or not out_json.exists():
+                raise RuntimeError(proc.stderr.strip() or f"Whisper worker exited with code {proc.returncode}")
+            tr = Transcript.model_validate(json.loads(out_json.read_text(encoding="utf-8")))
+            out_json.unlink(missing_ok=True)
+        else:
+            tr = pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
         cache_store.put(tr, pipeline.transcriber.model_identifier)
         return {"transcript": tr.model_dump(), "cache_hit": False}
     except Exception as exc:  # noqa: BLE001
@@ -423,10 +444,22 @@ def extract_highlights(video_hash: str, req: HighlightsRequest):
     tr = cache_store.get(video_hash)
     if not tr:
         raise HTTPException(status_code=400, detail="Transcribe video first")
-    pipeline.highlight_engine = OllamaHighlightEngine(base_url=req.ollama_url, model=req.ollama_model)
-    clips = pipeline.find_clips(
-        tr, req.prompt, min_clip_sec=req.min_clip_sec, max_clip_sec=req.max_clip_sec, max_clips=req.max_clips
+    engine = OllamaHighlightEngine(
+        base_url=req.ollama_url,
+        model=req.ollama_model,
+        timeout_sec=10.0,
+        allow_heuristic_fallback=True,
     )
+    pipeline.highlight_engine = engine
+    try:
+        clips = pipeline.find_clips(
+            tr, req.prompt, min_clip_sec=req.min_clip_sec, max_clip_sec=req.max_clip_sec, max_clips=req.max_clips
+        )
+    except Exception:  # noqa: BLE001
+        raw = engine._heuristic_extract(
+            tr, req.prompt, min_clip_sec=req.min_clip_sec, max_clip_sec=req.max_clip_sec, max_clips=req.max_clips
+        )
+        clips = ground_and_deduplicate_clips(raw.clips, tr)
     proj["clips"] = [c.model_dump() for c in clips]
     _upsert_project(proj)
     return {"clips": proj["clips"]}
