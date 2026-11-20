@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent};
-use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
 struct SidecarState(Mutex<Option<CommandChild>>);
@@ -12,12 +12,25 @@ pub fn run() {
         .manage(SidecarState(Mutex::new(None)))
         .setup(|app| {
             let sidecar_cmd = app.shell().sidecar("cutline-sidecar")?;
-            let (_rx, child) = sidecar_cmd.spawn()?;
+            let (mut rx, child) = sidecar_cmd.spawn()?;
             if let Some(state) = app.try_state::<SidecarState>() {
                 if let Ok(mut guard) = state.0.lock() {
                     *guard = Some(child);
                 }
             }
+            tauri::async_runtime::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        CommandEvent::Stderr(line) => {
+                            eprintln!("[sidecar stderr] {}", String::from_utf8_lossy(&line));
+                        }
+                        CommandEvent::Error(err) => {
+                            eprintln!("[sidecar error] {}", err);
+                        }
+                        _ => {}
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -20,8 +20,12 @@ a = Analysis(
     hiddenimports=[
         "uvicorn.logging",
         "uvicorn.loops.auto",
+        "uvicorn.loops.asyncio",
         "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.http.h11_impl",
+        "uvicorn.protocols.websockets.auto",
         "uvicorn.lifespan.on",
+        "uvicorn.lifespan.off",
         "pydantic",
         "multipart",
     ] + fw_hidden + ct_hidden,

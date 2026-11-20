@@ -17,7 +17,7 @@ export function apiUrl(path: string): string {
 
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const url = apiUrl(path);
-  const maxAttempts = isTauriRuntime ? 6 : 1;
+  const maxAttempts = isTauriRuntime ? 20 : 1;
   let lastErr: unknown = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -26,7 +26,7 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
     } catch (err) {
       lastErr = err;
       if (attempt < maxAttempts - 1) {
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 750));
       }
     }
   }
@@ -34,7 +34,7 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   const msg = lastErr instanceof Error ? lastErr.message : String(lastErr || 'Network error');
   throw new Error(
     isTauriRuntime
-      ? `Local sidecar unreachable (${msg}). Ensure cutline-sidecar is running on 127.0.0.1:43111.`
+      ? `Local sidecar unreachable (${msg}). Check %USERPROFILE%\\.cutline_studio\\sidecar.log if cutline-sidecar failed to start on 127.0.0.1:43111.`
       : `Request to ${path} failed (${msg}). If uploading a large file over the web preview, try a shorter MP4 (<25 MB) or run the desktop Tauri app locally.`
   );
 }
