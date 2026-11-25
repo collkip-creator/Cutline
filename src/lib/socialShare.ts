@@ -1,5 +1,5 @@
 import type { AspectRatio, PublishPlatform } from '../types';
-import { apiUrl } from './api';
+import { apiUrl, isTauriRuntime, openExternalBrowserUrl } from './api';
 import { fetchBlob, triggerBlobDownload } from './localExports';
 
 export interface PlatformSpec {
@@ -35,7 +35,7 @@ export const PLATFORM_SPECS: Record<PublishPlatform, PlatformSpec> = {
     idealAspect: '9:16',
     defaultHashtags: ['fyp', 'viral'],
     uploadLabel: 'Open TikTok Upload',
-    buildStudioUrl: () => 'https://www.tiktok.com/creator-center/upload',
+    buildStudioUrl: () => 'https://www.tiktok.com/tiktokstudio/upload',
   },
   instagram_reels: {
     id: 'instagram_reels',
@@ -225,4 +225,13 @@ export async function downloadShareKitPackage(options: {
     downloaded = true;
   }
   return { copied, downloaded };
+}
+
+export async function openPlatformStudio(url: string): Promise<boolean> {
+  if (isTauriRuntime) {
+    return openExternalBrowserUrl(url);
+  }
+  if (typeof window === 'undefined') return false;
+  const win = window.open(url, '_blank', 'noopener,noreferrer');
+  return Boolean(win);
 }

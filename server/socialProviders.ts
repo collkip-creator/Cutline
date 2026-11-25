@@ -134,8 +134,8 @@ export const tikTokProvider: SocialProviderAdapter = {
 
   getMissingSecrets(): string[] {
     const missing: string[] = [];
-    if (!process.env.TIKTOK_CLIENT_KEY) missing.push('TIKTOK_CLIENT_KEY');
-    if (!process.env.TIKTOK_CLIENT_SECRET) missing.push('TIKTOK_CLIENT_SECRET');
+    if (!(process.env.TIKTOK_CLIENT_KEY || '').trim()) missing.push('TIKTOK_CLIENT_KEY');
+    if (!(process.env.TIKTOK_CLIENT_SECRET || '').trim()) missing.push('TIKTOK_CLIENT_SECRET');
     return missing;
   },
 
@@ -143,23 +143,21 @@ export const tikTokProvider: SocialProviderAdapter = {
     return this.getMissingSecrets().length === 0;
   },
 
-  buildAuthorizeUrl({ redirectUri, state, codeChallenge }): string {
-    const clientKey = process.env.TIKTOK_CLIENT_KEY!;
+  buildAuthorizeUrl({ redirectUri, state }): string {
+    const clientKey = (process.env.TIKTOK_CLIENT_KEY || '').trim();
     const params = new URLSearchParams({
       client_key: clientKey,
       scope: this.requiredScopes.join(','),
       response_type: 'code',
       redirect_uri: redirectUri,
       state,
-      code_challenge: codeChallenge,
-      code_challenge_method: 'S256',
     });
     return `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
   },
 
-  async exchangeCode({ code, redirectUri, codeVerifier }): Promise<SocialOAuthTokenResult> {
-    const clientKey = process.env.TIKTOK_CLIENT_KEY!;
-    const clientSecret = process.env.TIKTOK_CLIENT_SECRET!;
+  async exchangeCode({ code, redirectUri }): Promise<SocialOAuthTokenResult> {
+    const clientKey = (process.env.TIKTOK_CLIENT_KEY || '').trim();
+    const clientSecret = (process.env.TIKTOK_CLIENT_SECRET || '').trim();
 
     const body = new URLSearchParams({
       client_key: clientKey,
@@ -167,7 +165,6 @@ export const tikTokProvider: SocialProviderAdapter = {
       code,
       grant_type: 'authorization_code',
       redirect_uri: redirectUri,
-      code_verifier: codeVerifier,
     });
 
     const res = await fetch('https://open.tiktokapis.com/v2/oauth/token/', {
@@ -223,8 +220,8 @@ export const tikTokProvider: SocialProviderAdapter = {
     if (!refreshToken) {
       throw new Error('TikTok refresh token is missing; please reconnect your TikTok account.');
     }
-    const clientKey = process.env.TIKTOK_CLIENT_KEY!;
-    const clientSecret = process.env.TIKTOK_CLIENT_SECRET!;
+    const clientKey = (process.env.TIKTOK_CLIENT_KEY || '').trim();
+    const clientSecret = (process.env.TIKTOK_CLIENT_SECRET || '').trim();
     const body = new URLSearchParams({
       client_key: clientKey,
       client_secret: clientSecret,
@@ -361,8 +358,8 @@ export const instagramProvider: SocialProviderAdapter = {
 
   getMissingSecrets(): string[] {
     const missing: string[] = [];
-    if (!process.env.INSTAGRAM_CLIENT_ID) missing.push('INSTAGRAM_CLIENT_ID');
-    if (!process.env.INSTAGRAM_CLIENT_SECRET) missing.push('INSTAGRAM_CLIENT_SECRET');
+    if (!(process.env.INSTAGRAM_CLIENT_ID || '').trim()) missing.push('INSTAGRAM_CLIENT_ID');
+    if (!(process.env.INSTAGRAM_CLIENT_SECRET || '').trim()) missing.push('INSTAGRAM_CLIENT_SECRET');
     return missing;
   },
 
@@ -371,10 +368,8 @@ export const instagramProvider: SocialProviderAdapter = {
   },
 
   buildAuthorizeUrl({ redirectUri, state }): string {
-    const clientId = process.env.INSTAGRAM_CLIENT_ID!;
+    const clientId = (process.env.INSTAGRAM_CLIENT_ID || '').trim();
     const params = new URLSearchParams({
-      enable_fb_login: '0',
-      force_authentication: '1',
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
@@ -385,8 +380,8 @@ export const instagramProvider: SocialProviderAdapter = {
   },
 
   async exchangeCode({ code, redirectUri }): Promise<SocialOAuthTokenResult> {
-    const clientId = process.env.INSTAGRAM_CLIENT_ID!;
-    const clientSecret = process.env.INSTAGRAM_CLIENT_SECRET!;
+    const clientId = (process.env.INSTAGRAM_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.INSTAGRAM_CLIENT_SECRET || '').trim();
 
     const body = new URLSearchParams({
       client_id: clientId,
@@ -577,8 +572,8 @@ export const youtubeProvider: SocialProviderAdapter = {
 
   getMissingSecrets(): string[] {
     const missing: string[] = [];
-    if (!process.env.GOOGLE_CLIENT_ID) missing.push('GOOGLE_CLIENT_ID');
-    if (!process.env.GOOGLE_CLIENT_SECRET) missing.push('GOOGLE_CLIENT_SECRET');
+    if (!(process.env.GOOGLE_CLIENT_ID || '').trim()) missing.push('GOOGLE_CLIENT_ID');
+    if (!(process.env.GOOGLE_CLIENT_SECRET || '').trim()) missing.push('GOOGLE_CLIENT_SECRET');
     return missing;
   },
 
@@ -587,7 +582,7 @@ export const youtubeProvider: SocialProviderAdapter = {
   },
 
   buildAuthorizeUrl({ redirectUri, state }): string {
-    const clientId = process.env.GOOGLE_CLIENT_ID!;
+    const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -602,8 +597,8 @@ export const youtubeProvider: SocialProviderAdapter = {
   },
 
   async exchangeCode({ code, redirectUri }): Promise<SocialOAuthTokenResult> {
-    const clientId = process.env.GOOGLE_CLIENT_ID!;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET!;
+    const clientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
+    const clientSecret = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
 
     const body = new URLSearchParams({
       code,
@@ -798,7 +793,7 @@ export function createOAuthStateSession(
 
   const state = crypto.randomBytes(20).toString('hex');
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('hex');
   pendingOAuthSessions.set(state, {
     platform,
     redirectUri,

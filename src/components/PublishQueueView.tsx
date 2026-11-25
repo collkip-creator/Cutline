@@ -27,6 +27,7 @@ import {
   PLATFORM_SPECS,
   buildFormattedPostText,
   downloadShareKitPackage,
+  openPlatformStudio,
   parseHashtagInput,
   resolveExportMediaUrlFromPath,
   shareViaSystemSheet,
@@ -217,11 +218,18 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
     }
   };
 
-  const handleJobShareKit = async (job: PublishJob) => {
-    setBusyJobId(`kit-${job.job_id}`);
+  const handleJobShareKit = async (job: PublishJob, openStudioAfter = false) => {
+    setBusyJobId(openStudioAfter ? `launch-${job.job_id}` : `kit-${job.job_id}`);
     setActionBanner(null);
+    const spec = PLATFORM_SPECS[job.platform];
+    const postText = buildFormattedPostText(job.caption_text, job.tags);
+    const studioUrl = spec ? spec.buildStudioUrl(postText) : null;
+    const preOpenedTab =
+      openStudioAfter && studioUrl && typeof window !== 'undefined' && !(window as any).__TAURI_INTERNALS__
+        ? window.open('about:blank', '_blank')
+        : null;
+
     try {
-      const postText = buildFormattedPostText(job.caption_text, job.tags);
       const mediaUrl = resolveExportMediaUrlFromPath(job.video_path);
       const fileName = `${job.clip_id}_${job.platform}.mp4`;
       const result = await downloadShareKitPackage({
@@ -229,15 +237,27 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
         postText,
         fallbackMediaUrl: mediaUrl,
       });
+
+      if (openStudioAfter && studioUrl) {
+        if (preOpenedTab && !preOpenedTab.closed) {
+          preOpenedTab.location.href = studioUrl;
+        } else {
+          await openPlatformStudio(studioUrl);
+        }
+      }
+
       setActionBanner({
         kind: 'info',
-        text: result.downloaded
-          ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
-          : result.copied
-            ? 'Copied caption + hashtags to clipboard.'
-            : 'Ready to share.',
+        text: openStudioAfter && spec
+          ? `Downloaded ${fileName}${result.copied ? ' & copied caption' : ''} — upload in ${spec.label} and paste (Ctrl+V).`
+          : result.downloaded
+            ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
+            : result.copied
+              ? 'Copied caption + hashtags to clipboard.'
+              : 'Ready to share.',
       });
     } catch (err: any) {
+      if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close();
       setActionBanner({ kind: 'error', text: err?.message || 'Failed to prepare share kit.' });
     } finally {
       setBusyJobId(null);
@@ -529,6 +549,15 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
               {connResult.text}
             </div>
           )}
+
+          <div className="bg-[#0B0F17] border border-slate-800/80 rounded p-2.5 text-[11px] text-slate-400">
+            <span className="font-semibold text-slate-300">Webhook Payload (Free self-hosted n8n / Make / Zapier):</span>{' '}
+            Multipart POST sends binary <code className="text-slate-200">video</code> (.mp4) +{' '}
+            <code className="text-slate-200">subtitles</code> (.srt) along with{' '}
+            <code className="text-slate-200">platform</code>, <code className="text-slate-200">title</code>,{' '}
+            <code className="text-slate-200">caption</code>, <code className="text-slate-200">tags_json</code>, and{' '}
+            <code className="text-slate-200">full_post_text</code>.
+          </div>
         </div>
       )}
 
@@ -695,7 +724,7 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
                           <button
                             type="button"
                             disabled={busyJobId === `kit-${job.job_id}`}
-                            onClick={() => handleJobShareKit(job)}
+                            onClick={() => handleJobShareKit(job, false)}
                             title="Copy post text + Download MP4"
                             className="p-1.5 text-slate-300 hover:text-white bg-[#0B0F17] border border-slate-800 rounded"
                           >
@@ -715,15 +744,16 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
                           )}
 
                           {spec && (
-                            <a
-                              href={spec.buildStudioUrl(fullCopy)}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              title={spec.uploadLabel}
-                              className="p-1.5 text-slate-300 hover:text-white bg-[#0B0F17] border border-slate-800 rounded"
+                            <button
+                              type="button"
+                              disabled={busyJobId === `launch-${job.job_id}`}
+                              onClick={() => handleJobShareKit(job, true)}
+                              title={`Download MP4, copy caption & ${spec.uploadLabel}`}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-emerald-300 hover:text-white bg-emerald-600/15 hover:bg-emerald-600/30 border border-emerald-500/35 rounded"
                             >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                            </a>
+                              <ExternalLink className="w-3 h-3" />
+                              {busyJobId === `launch-${job.job_id}` ? '...' : 'Share & Open'}
+                            </button>
                           )}
 
                           <button

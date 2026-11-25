@@ -28,6 +28,7 @@ import {
   apiFetch,
   apiUrl,
   isTauriRuntime,
+  openExternalBrowserUrl,
   readJsonResponse,
   socialApiFetch,
 } from '../lib/api';
@@ -52,6 +53,7 @@ import {
   downloadShareKitPackage,
   getPlatformWarnings,
   mergePlatformTags,
+  openPlatformStudio,
   parseHashtagInput,
   shareViaSystemSheet,
   supportsNativeFileShare,
@@ -153,6 +155,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const [instantBusy, setInstantBusy] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
   const [copiedCopy, setCopiedCopy] = useState(false);
+  const [blockedStudioUrl, setBlockedStudioUrl] = useState<{ label: string; url: string } | null>(null);
 
   const clipDurationSec = Math.max(0.5, clip.end_sec - clip.start_sec);
   const parsedUserTags = useMemo(() => parseHashtagInput(hashtagInput), [hashtagInput]);
@@ -349,6 +352,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const handleDownloadShareKit = async () => {
     setInstantBusy('kit');
     setStatusMessage(null);
+    setBlockedStudioUrl(null);
     try {
       const exp = await ensureExportedAsset();
       const cached = await getLocalExport(makeLocalExportKey(project.video_hash, exp)).catch(() => null);
@@ -367,6 +371,55 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       });
     } catch (err: any) {
       setStatusMessage({ kind: 'error', text: err?.message || 'Share kit download failed.' });
+    } finally {
+      setInstantBusy(null);
+    }
+  };
+
+  const handleQuickShareAndOpen = async () => {
+    setInstantBusy('launch');
+    setStatusMessage(null);
+    setBlockedStudioUrl(null);
+
+    const studioUrl = activePreviewSpec.buildStudioUrl(previewPostText);
+    // Pre-open tab synchronously on Web so browser popup blockers don't block after async export
+    const preOpenedTab =
+      !isTauriRuntime && typeof window !== 'undefined'
+        ? window.open('about:blank', '_blank')
+        : null;
+
+    try {
+      const exp = await ensureExportedAsset();
+      const cached = await getLocalExport(makeLocalExportKey(project.video_hash, exp)).catch(() => null);
+      const filename = buildExportFilename(clip.id, exp.aspect_ratio, 'mp4');
+      const res = await downloadShareKitPackage({
+        filename,
+        postText: previewPostText,
+        videoBlob: cached?.video_blob || null,
+        fallbackMediaUrl: apiUrl(exp.video_url),
+      });
+
+      let opened = false;
+      if (isTauriRuntime) {
+        opened = await openExternalBrowserUrl(studioUrl);
+      } else if (preOpenedTab && !preOpenedTab.closed) {
+        preOpenedTab.location.href = studioUrl;
+        opened = true;
+      }
+
+      if (!opened) {
+        setBlockedStudioUrl({ label: activePreviewSpec.uploadLabel, url: studioUrl });
+      }
+
+      setStatusMessage({
+        kind: 'info',
+        text: opened
+          ? `Downloaded ${filename}${res.copied ? ' & copied caption/tags' : ''} — upload it in ${activePreviewSpec.label} and paste (Ctrl+V / Cmd+V).`
+          : `Downloaded ${filename}${res.copied ? ' & copied caption/tags' : ''}. Click "${activePreviewSpec.uploadLabel}" below to finish posting.`,
+      });
+    } catch (err: any) {
+      if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close();
+      setStatusMessage({ kind: 'error', text: err?.message || 'Quick Share failed.' });
     } finally {
       setInstantBusy(null);
     }
@@ -496,6 +549,20 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
             <button
               type="button"
               onClick={() => {
+                setShareTab('queue');
+                setStatusMessage(null);
+              }}
+              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                shareTab === 'queue'
+                  ? 'bg-emerald-600/20 text-emerald-200 border border-emerald-500/40'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              Share Kit & Queue (Free)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setShareTab('direct');
                 setStatusMessage(null);
               }}
@@ -505,21 +572,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
                   : 'text-slate-400 hover:text-slate-200 border border-transparent'
               }`}
             >
-              Connected Accounts ({connectedProviderIds.length}/3)
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShareTab('queue');
-                setStatusMessage(null);
-              }}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-                shareTab === 'queue'
-                  ? 'bg-slate-800 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Queue / Schedule / Share Kit
+              Direct OAuth ({connectedProviderIds.length}/3)
             </button>
           </div>
 
@@ -956,57 +1009,83 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
                 })()}
 
                 {/* Instant Share Now Row (Zero-Config Local & Web Actions) */}
-                <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-800/80">
+                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800/80">
+                  <button
+                    type="button"
+                    disabled={instantBusy !== null}
+                    onClick={handleQuickShareAndOpen}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-white font-semibold transition-colors"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    {instantBusy === 'launch'
+                      ? 'Preparing MP4...'
+                      : `Share to ${activePreviewSpec.shortLabel} (Download + Copy + Open)`}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={instantBusy !== null}
+                    onClick={handleDownloadShareKit}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-medium"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    {instantBusy === 'kit' ? 'Preparing MP4...' : 'Download + Copy'}
+                  </button>
+
                   <button
                     type="button"
                     onClick={handleCopyPostText}
                     className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-slate-200"
                   >
                     {copiedCopy ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                    {copiedCopy ? 'Copied Copy' : `Copy ${activePreviewSpec.shortLabel} Copy`}
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={instantBusy === 'kit'}
-                    onClick={handleDownloadShareKit}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/35 border border-blue-500/40 rounded text-blue-300 font-medium"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    {instantBusy === 'kit' ? 'Preparing MP4...' : 'Copy + Download MP4'}
+                    {copiedCopy ? 'Copied' : 'Copy Caption'}
                   </button>
 
                   {anyShareSupported && (
                     <button
                       type="button"
-                      disabled={instantBusy === 'native'}
+                      disabled={instantBusy !== null}
                       onClick={handleNativeShare}
                       title={
                         fileShareSupported
                           ? 'Share MP4 file directly through OS Share Sheet'
                           : 'Share post copy through OS Share Sheet'
                       }
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 rounded text-emerald-300 font-medium"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-emerald-300 font-medium"
                     >
                       <Share2 className="w-3.5 h-3.5" />
                       {instantBusy === 'native'
                         ? 'Opening Share...'
                         : fileShareSupported
-                          ? 'Share File (OS Sheet)'
-                          : 'Share Text (OS Sheet)'}
+                          ? 'OS Share Sheet'
+                          : 'Share Text'}
                     </button>
                   )}
 
-                  <a
-                    href={activePreviewSpec.buildStudioUrl(previewPostText)}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => openPlatformStudio(activePreviewSpec.buildStudioUrl(previewPostText))}
                     className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-200 ml-auto"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
                     {activePreviewSpec.uploadLabel}
-                  </a>
+                  </button>
                 </div>
+
+                {blockedStudioUrl && (
+                  <div className="flex items-center justify-between gap-2 pt-1 text-[11px] text-amber-200">
+                    <span>Browser blocked opening the studio tab automatically.</span>
+                    <a
+                      href={blockedStudioUrl.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded shrink-0"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      {blockedStudioUrl.label}
+                    </a>
+                  </div>
+                )}
               </div>
 
               {/* Queue Dispatch Timing */}
