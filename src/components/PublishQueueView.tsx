@@ -22,6 +22,8 @@ import type {
   PublishPlatform,
   PublishStatus,
 } from '../types';
+import { isTauriRuntime } from '../lib/api';
+import { findLocalExportByMatch } from '../lib/localExports';
 import {
   ALL_PLATFORMS,
   PLATFORM_SPECS,
@@ -225,16 +227,18 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
     const postText = buildFormattedPostText(job.caption_text, job.tags);
     const studioUrl = spec ? spec.buildStudioUrl(postText) : null;
     const preOpenedTab =
-      openStudioAfter && studioUrl && typeof window !== 'undefined' && !(window as any).__TAURI_INTERNALS__
+      openStudioAfter && studioUrl && typeof window !== 'undefined' && !isTauriRuntime
         ? window.open('about:blank', '_blank')
         : null;
 
     try {
+      const cached = await findLocalExportByMatch(job.clip_id, job.video_path).catch(() => null);
       const mediaUrl = resolveExportMediaUrlFromPath(job.video_path);
       const fileName = `${job.clip_id}_${job.platform}.mp4`;
       const result = await downloadShareKitPackage({
         filename: fileName,
         postText,
+        videoBlob: cached?.video_blob || null,
         fallbackMediaUrl: mediaUrl,
       });
 
@@ -246,16 +250,23 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
         }
       }
 
-      setActionBanner({
-        kind: 'info',
-        text: openStudioAfter && spec
-          ? `Downloaded ${fileName}${result.copied ? ' & copied caption' : ''} — upload in ${spec.label} and paste (Ctrl+V).`
-          : result.downloaded
-            ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
-            : result.copied
-              ? 'Copied caption + hashtags to clipboard.'
-              : 'Ready to share.',
-      });
+      if (result.warning) {
+        setActionBanner({
+          kind: 'error',
+          text: `${result.copied ? 'Copied caption to clipboard. ' : ''}${result.warning}`,
+        });
+      } else {
+        setActionBanner({
+          kind: 'info',
+          text: openStudioAfter && spec
+            ? `Downloaded ${fileName}${result.copied ? ' & copied caption' : ''} — upload in ${spec.label} and paste (Ctrl+V).`
+            : result.downloaded
+              ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
+              : result.copied
+                ? 'Copied caption + hashtags to clipboard.'
+                : 'Ready to share.',
+        });
+      }
     } catch (err: any) {
       if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close();
       setActionBanner({ kind: 'error', text: err?.message || 'Failed to prepare share kit.' });
@@ -269,11 +280,13 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
     setActionBanner(null);
     try {
       const postText = buildFormattedPostText(job.caption_text, job.tags);
+      const cached = await findLocalExportByMatch(job.clip_id, job.video_path).catch(() => null);
       const mediaUrl = resolveExportMediaUrlFromPath(job.video_path);
       const outcome = await shareViaSystemSheet({
         title: job.clip_title,
         postText,
         filename: `${job.clip_id}_${job.platform}.mp4`,
+        videoBlob: cached?.video_blob || null,
         fallbackMediaUrl: mediaUrl,
       });
       if (outcome !== 'cancelled') {

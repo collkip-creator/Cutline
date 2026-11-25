@@ -1,6 +1,6 @@
 import type { AspectRatio, PublishPlatform } from '../types';
 import { apiUrl, isTauriRuntime, openExternalBrowserUrl } from './api';
-import { fetchBlob, triggerBlobDownload } from './localExports';
+import { fetchBlob, triggerAnchorDownload, triggerBlobDownload } from './localExports';
 
 export interface PlatformSpec {
   id: PublishPlatform;
@@ -204,7 +204,7 @@ export async function downloadShareKitPackage(options: {
   postText: string;
   videoBlob?: Blob | null;
   fallbackMediaUrl?: string | null;
-}): Promise<{ copied: boolean; downloaded: boolean }> {
+}): Promise<{ copied: boolean; downloaded: boolean; warning?: string }> {
   let copied = false;
   try {
     if (navigator.clipboard?.writeText) {
@@ -216,15 +216,28 @@ export async function downloadShareKitPackage(options: {
   }
 
   let downloaded = false;
+  let warning: string | undefined;
   let blob = options.videoBlob || null;
   if (!blob && options.fallbackMediaUrl) {
-    blob = await fetchBlob(options.fallbackMediaUrl);
+    try {
+      blob = await fetchBlob(options.fallbackMediaUrl);
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      // HTTP 404/410 means the file does not exist on disk anymore
+      if (/404|410|not found/i.test(msg)) {
+        warning = 'Exported MP4 is missing on disk; re-export the clip from Clip Studio.';
+      } else {
+        // Network/CORS/auth-redirect blocked fetch() -> fall back to native browser download link
+        triggerAnchorDownload(options.fallbackMediaUrl, options.filename);
+        downloaded = true;
+      }
+    }
   }
   if (blob) {
     triggerBlobDownload(blob, options.filename);
     downloaded = true;
   }
-  return { copied, downloaded };
+  return { copied, downloaded, warning };
 }
 
 export async function openPlatformStudio(url: string): Promise<boolean> {

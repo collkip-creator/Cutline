@@ -43,6 +43,17 @@ export function triggerBlobDownload(blob: Blob, filename: string): void {
   }, 15_000);
 }
 
+export function triggerAnchorDownload(url: string, filename: string): void {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
 export async function fetchBlob(url: string): Promise<Blob> {
   const res = await fetch(url);
   if (!res.ok) {
@@ -139,6 +150,26 @@ export async function listLocalExports(videoHash?: string): Promise<LocalExportE
     return rows.sort((a, b) => b.saved_at_iso.localeCompare(a.saved_at_iso));
   } finally {
     db.close();
+  }
+}
+
+export async function findLocalExportByMatch(
+  clipId: string,
+  videoPath?: string
+): Promise<LocalExportEntry | null> {
+  try {
+    const all = await listLocalExports();
+    const targetName = videoPath ? videoPath.replace(/\\/g, '/').split('/').pop() : '';
+    if (targetName) {
+      const byPath = all.find((e) => {
+        const storedName = (e.video_path || '').replace(/\\/g, '/').split('/').pop();
+        return storedName === targetName;
+      });
+      if (byPath) return byPath;
+    }
+    return all.find((e) => e.clip_id === clipId) ?? null;
+  } catch {
+    return null;
   }
 }
 
