@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Crosshair, FileText, Plus, Send, Trash2 } from 'lucide-react';
-import type { AspectRatio, ClipCandidate, Transcript } from '../types';
+import { Crosshair, FileText, Frown, Minus, Plus, Send, Smile, Trash2 } from 'lucide-react';
+import type { AspectRatio, ClipCandidate, ClipSentiment, Transcript } from '../types';
 import { apiUrl } from '../lib/api';
 
 interface ClipInspectorTableProps {
@@ -138,6 +138,31 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
                         <option value="entertainment">entertainment</option>
                         <option value="insight">insight</option>
                       </select>
+                      {clip.sentiment && (() => {
+                        const sentiment: ClipSentiment = clip.sentiment;
+                        const badgeStyles: Record<ClipSentiment, string> = {
+                          Positive: 'bg-emerald-950/60 text-emerald-300 border-emerald-800/80',
+                          Negative: 'bg-rose-950/60 text-rose-300 border-rose-800/80',
+                          Neutral: 'bg-slate-800/70 text-slate-300 border-slate-700/80',
+                        };
+                        const SentimentIcon =
+                          sentiment === 'Positive'
+                            ? Smile
+                            : sentiment === 'Negative'
+                              ? Frown
+                              : Minus;
+                        return (
+                          <div>
+                            <span
+                              title={`Transcript sentiment: ${sentiment}`}
+                              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[11px] font-sans font-medium ${badgeStyles[sentiment]}`}
+                            >
+                              <SentimentIcon className="w-3 h-3" />
+                              {sentiment}
+                            </span>
+                          </div>
+                        );
+                      })()}
                       {clip.snapped_to_words && (
                         <div className="text-[11px] font-sans text-emerald-400">Snapped</div>
                       )}

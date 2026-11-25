@@ -132,7 +132,7 @@ export function ensureThreeTags(
       break;
     }
   }
-  return unique.slice(0, targetCount);
+  return unique.slice(0, Math.max(targetCount, normalizedUser.length));
 }
 
 export function mapPublishToSocialPlatform(

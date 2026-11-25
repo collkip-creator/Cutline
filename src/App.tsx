@@ -7,6 +7,7 @@ import {
   Link2,
   Menu,
   Scissors,
+  Search,
   Sparkles,
   Upload,
   Video,
@@ -34,6 +35,7 @@ import { downloadUrlViaBlob } from './lib/localExports';
 import type {
   AspectRatio,
   ClipCandidate,
+  ClipSentiment,
   EncodeMode,
   ExportResult,
   ProjectRecord,
@@ -44,6 +46,209 @@ import type {
 } from './types';
 
 type WorkspaceTab = 'studio' | 'queue' | 'architecture' | 'hardware';
+
+const HASHTAG_STOPWORDS = new Set([
+  'about', 'after', 'again', 'against', 'almost', 'alone', 'along', 'already',
+  'also', 'although', 'always', 'among', 'another', 'around', 'because', 'before',
+  'being', 'below', 'between', 'both', 'could', 'doing', 'during', 'either',
+  'enough', 'every', 'everyone', 'everything', 'first', 'found', 'getting', 'going',
+  'gonna', 'great', 'having', 'herself', 'himself', 'however', 'instead', 'into',
+  'just', 'knowing', 'later', 'least', 'little', 'looks', 'making', 'maybe',
+  'might', 'more', 'most', 'mostly', 'much', 'myself', 'never', 'nothing',
+  'often', 'other', 'others', 'outside', 'people', 'perhaps', 'quite', 'rather',
+  'really', 'right', 'should', 'since', 'some', 'someone', 'something', 'sometimes',
+  'still', 'such', 'taking', 'thank', 'thanks', 'their', 'theirs', 'them',
+  'themselves', 'then', 'there', 'these', 'they', 'thing', 'things', 'think',
+  'thinking', 'this', 'those', 'though', 'three', 'through', 'today', 'together',
+  'trying', 'under', 'until', 'using', 'very', 'want', 'wanna', 'water', 'welcome',
+  'well', 'were', 'what', 'whatever', 'when', 'where', 'whereas', 'whether',
+  'which', 'while', 'whole', 'whose', 'will', 'with', 'within', 'without',
+  'would', 'yeah', 'your', 'yours', 'yourself',
+]);
+
+const SOCIAL_TOPIC_PATTERNS: Array<{ pattern: RegExp; tag: string }> = [
+  { pattern: /\b(ai|llm|model|ollama|whisper|neural|gpt|prompt|transcrib)\b/i, tag: '#AIWorkflow' },
+  { pattern: /\b(local|offline|privacy|private|latency|edge|server|upload|gigabyte)\b/i, tag: '#LocalAI' },
+  { pattern: /\b(video|clip|edit|editing|ffmpeg|caption|subtitle|render|frame|aspect|vertical)\b/i, tag: '#VideoEditing' },
+  { pattern: /\b(creator|youtube|tiktok|instagram|social|audience|viral|retention|hook)\b/i, tag: '#ContentCreator' },
+  { pattern: /\b(podcast|interview|mic|audio|voice|speak|speaker)\b/i, tag: '#PodcastClips' },
+  { pattern: /\b(code|coding|python|typescript|react|api|software|developer|build|app)\b/i, tag: '#SoftwareDev' },
+  { pattern: /\b(productiv|workflow|automat|fast|speed|tip|hack|habit|system)\b/i, tag: '#ProductivityTips' },
+  { pattern: /\b(business|startup|founder|growth|client|sales|marketing|brand)\b/i, tag: '#CreatorEconomy' },
+  { pattern: /\b(story|funny|laugh|crazy|moment|reaction|banter)\b/i, tag: '#StoryTime' },
+  { pattern: /\b(learn|lesson|mistake|secret|truth|advice|guide|tutorial)\b/i, tag: '#LearnOnShorts' },
+];
+
+function generateTranscriptHashtags(
+  clip: ClipCandidate,
+  transcriptData: Transcript | null,
+  count = 3
+): string[] {
+  const existingKeys = new Set(
+    (clip.tags || [])
+      .map((t) => t.trim().replace(/^#+/, '').toLowerCase())
+      .filter(Boolean)
+  );
+
+  const segmentText = transcriptData?.segments
+    .filter((s) => s.end_sec >= clip.start_sec && s.start_sec <= clip.end_sec)
+    .map((s) => s.text)
+    .join(' ')
+    .trim();
+
+  const contextText = [segmentText, clip.title, clip.caption_hook, clip.reason]
+    .filter(Boolean)
+    .join(' ');
+
+  const generated: string[] = [];
+  const seenKeys = new Set<string>(existingKeys);
+
+  const tryPush = (rawTag: string) => {
+    const cleanBody = rawTag.replace(/^#+/, '').replace(/[^a-zA-Z0-9]/g, '');
+    if (!cleanBody || cleanBody.length < 3) return false;
+    const key = cleanBody.toLowerCase();
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    generated.push(`#${cleanBody}`);
+    return true;
+  };
+
+  // 1. Score standout spoken keywords from the clip's transcript segment
+  const keywordCounts = new Map<string, number>();
+  const words = (segmentText || contextText)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !/^\d+$/.test(w) && !HASHTAG_STOPWORDS.has(w));
+
+  for (const w of words) {
+    keywordCounts.set(w, (keywordCounts.get(w) || 0) + 1);
+  }
+
+  const rankedKeywords = Array.from(keywordCounts.entries())
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return b[0].length - a[0].length;
+    })
+    .map(([word]) => word.charAt(0).toUpperCase() + word.slice(1));
+
+  // Take up to 2 grounded keywords from the spoken segment first
+  for (const kw of rankedKeywords) {
+    if (generated.length >= 2) break;
+    tryPush(kw);
+  }
+
+  // 2. Match high-signal social topic hashtags based on transcript segment + clip context
+  for (const rule of SOCIAL_TOPIC_PATTERNS) {
+    if (generated.length >= count) break;
+    if (rule.pattern.test(contextText)) {
+      tryPush(rule.tag);
+    }
+  }
+
+  // 3. Fill any remaining slots up to 3 from additional keywords or category defaults
+  for (const kw of rankedKeywords) {
+    if (generated.length >= count) break;
+    tryPush(kw);
+  }
+
+  const categoryFallbacks: Record<string, string[]> = {
+    hook: ['#ViralHooks', '#Shorts', '#ContentCreator'],
+    lesson: ['#QuickTip', '#LearnOnShorts', '#Shorts'],
+    entertainment: ['#StoryTime', '#CreatorClips', '#Shorts'],
+    insight: ['#DeepDive', '#ProTip', '#Shorts'],
+  };
+  for (const fallback of categoryFallbacks[clip.category || 'insight'] || ['#Shorts', '#Reels', '#Clips']) {
+    if (generated.length >= count) break;
+    tryPush(fallback);
+  }
+  for (const extra of ['#Shorts', '#Reels', '#Trending', '#Highlights']) {
+    if (generated.length >= count) break;
+    tryPush(extra);
+  }
+
+  return generated.slice(0, count);
+}
+
+const POSITIVE_SENTIMENT_WORDS = new Set([
+  'amazing', 'awesome', 'best', 'better', 'breakthrough', 'brilliant', 'clean',
+  'confident', 'delight', 'easy', 'effective', 'efficient', 'enjoy', 'excellent',
+  'excited', 'exciting', 'fantastic', 'fast', 'fastest', 'favorite', 'free',
+  'friendly', 'fun', 'gain', 'genius', 'glad', 'good', 'great', 'growth',
+  'happy', 'helpful', 'highlight', 'huge', 'ideal', 'impressive', 'improve',
+  'improved', 'incredible', 'insightful', 'inspire', 'inspiring', 'instant',
+  'joy', 'laugh', 'love', 'loved', 'lovely', 'lucky', 'master', 'nice',
+  'optimal', 'outstanding', 'perfect', 'positive', 'powerful', 'pro',
+  'productive', 'progress', 'proud', 'reliable', 'remarkable', 'save', 'saved',
+  'seamless', 'simple', 'smart', 'smooth', 'solve', 'solved', 'special',
+  'strong', 'strongest', 'succeed', 'success', 'successful', 'super',
+  'superpower', 'thank', 'thanks', 'thrilled', 'top', 'trust', 'useful',
+  'valuable', 'victory', 'win', 'winner', 'winning', 'wonderful', 'wow', 'yes',
+]);
+
+const NEGATIVE_SENTIMENT_WORDS = new Set([
+  'afraid', 'angry', 'annoying', 'awful', 'bad', 'broken', 'bug', 'bugs',
+  'chaos', 'collapse', 'complain', 'confusing', 'crash', 'crashed', 'crashes',
+  'crisis', 'critical', 'damage', 'danger', 'dangerous', 'dead', 'delay',
+  'difficult', 'disaster', 'disappointing', 'doubt', 'error', 'errors', 'fail',
+  'failed', 'failing', 'fails', 'failure', 'fake', 'fault', 'fear', 'flaw',
+  'frustrating', 'frustration', 'garbage', 'hard', 'harm', 'hate', 'horrible',
+  'hurt', 'impossible', 'issue', 'issues', 'lag', 'lagging', 'late', 'lose',
+  'loser', 'losing', 'loss', 'lost', 'mess', 'mistake', 'mistakes', 'negative',
+  'nightmare', 'pain', 'painful', 'panic', 'poor', 'problem', 'problems',
+  'regret', 'reject', 'risk', 'risky', 'ruin', 'sad', 'scam', 'scary', 'slow',
+  'sorry', 'spam', 'stuck', 'struggle', 'stupid', 'suffer', 'terrible',
+  'threat', 'tired', 'toxic', 'trash', 'trouble', 'ugly', 'unable',
+  'unfortunate', 'unhappy', 'useless', 'warn', 'warning', 'waste', 'wasted',
+  'weak', 'worse', 'worst', 'wrong',
+]);
+
+const NEGATION_WORDS = new Set([
+  'not', 'never', 'no', 'dont', 'doesnt', 'didnt', 'wont', 'cant', 'cannot',
+  'isnt', 'arent', 'wasnt', 'werent', 'without', 'hardly', 'barely',
+]);
+
+function analyzeTranscriptSentiment(
+  clip: Pick<ClipCandidate, 'start_sec' | 'end_sec' | 'title' | 'caption_hook' | 'reason'>,
+  transcriptData: Transcript | null
+): ClipSentiment {
+  const segmentText = transcriptData?.segments
+    .filter((s) => s.end_sec >= clip.start_sec && s.start_sec <= clip.end_sec)
+    .map((s) => s.text)
+    .join(' ')
+    .trim();
+
+  const sourceText =
+    segmentText ||
+    [clip.title, clip.caption_hook, clip.reason].filter(Boolean).join(' ').trim();
+
+  if (!sourceText) return 'Neutral';
+
+  const tokens = sourceText
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  let score = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const negated =
+      (i >= 1 && NEGATION_WORDS.has(tokens[i - 1])) ||
+      (i >= 2 && NEGATION_WORDS.has(tokens[i - 2]));
+
+    if (POSITIVE_SENTIMENT_WORDS.has(token)) {
+      score += negated ? -1 : 1;
+    } else if (NEGATIVE_SENTIMENT_WORDS.has(token)) {
+      score += negated ? 0.5 : -1;
+    }
+  }
+
+  if (score >= 1) return 'Positive';
+  if (score <= -1) return 'Negative';
+  return 'Neutral';
+}
 
 export default function App() {
   const desktopAuthParams =
@@ -102,6 +307,7 @@ export default function App() {
 
   // Transcript drawer
   const [showTranscriptDrawer, setShowTranscriptDrawer] = useState(false);
+  const [transcriptSearch, setTranscriptSearch] = useState('');
   const [srtImportText, setSrtImportText] = useState('');
 
   // Queue state & modal
@@ -141,6 +347,7 @@ export default function App() {
       setClips(projectClips);
       setActiveClipId(projectClips[0]?.id || null);
       setLastExport(null);
+      setTranscriptSearch('');
     } catch (err: any) {
       setNotice({ kind: 'error', text: err.message });
     }
@@ -385,11 +592,23 @@ export default function App() {
         }
       );
       const data = await readJsonResponse<{ clips: ClipCandidate[] }>(res);
-      setClips(data.clips);
-      setActiveClipId(data.clips[0]?.id || null);
+      const enrichedClips = (data.clips || []).map((clip) => {
+        const autoHashtags = generateTranscriptHashtags(clip, currentTranscript, 3);
+        const sentiment = analyzeTranscriptSentiment(clip, currentTranscript);
+        return {
+          ...clip,
+          sentiment,
+          tags: [...(clip.tags || []), ...autoHashtags],
+        };
+      });
+      setClips(enrichedClips);
+      setActiveClipId(enrichedClips[0]?.id || null);
+      if (enrichedClips.length > 0) {
+        await persistClips(activeProject.video_hash, enrichedClips);
+      }
       setNotice({
         kind: 'info',
-        text: `Extracted ${data.clips.length} word-grounded clips from cached transcript.`,
+        text: `Extracted ${enrichedClips.length} word-grounded clips with 3 transcript-based hashtags each.`,
       });
     } catch (err: any) {
       setNotice({ kind: 'error', text: err.message });
@@ -406,7 +625,11 @@ export default function App() {
       body: JSON.stringify({ clip, transcript }),
     });
     const snapped = await readJsonResponse<ClipCandidate>(res);
-    const next = clips.map((c) => (c.id === clip.id ? snapped : c));
+    const updatedSnapped: ClipCandidate = {
+      ...snapped,
+      sentiment: analyzeTranscriptSentiment(snapped, transcript),
+    };
+    const next = clips.map((c) => (c.id === clip.id ? updatedSnapped : c));
     setClips(next);
     await persistClips(activeProject.video_hash, next);
   };
@@ -485,7 +708,7 @@ export default function App() {
       ? spokenText.split(/[.!?]/)[0].trim().slice(0, 44).toUpperCase() || 'HIGHLIGHT'
       : 'KEY TAKEAWAY';
 
-    const created: ClipCandidate = {
+    const baseClip: ClipCandidate = {
       id,
       title: autoTitle,
       category: 'insight',
@@ -497,6 +720,11 @@ export default function App() {
       reason: 'Manually marked start/end range',
       caption_hook: autoHook,
       tags: ['manual'],
+    };
+    const created: ClipCandidate = {
+      ...baseClip,
+      sentiment: analyzeTranscriptSentiment(baseClip, transcript),
+      tags: [...baseClip.tags, ...generateTranscriptHashtags(baseClip, transcript, 3)],
     };
     const next = [...clips, created].sort((a, b) => a.start_sec - b.start_sec);
     setClips(next);
@@ -906,23 +1134,70 @@ export default function App() {
                 )}
 
                 {/* Collapsible Cached Transcript & SRT Import Drawer */}
-                {showTranscriptDrawer && activeProject && (
-                  <div className="pt-3 border-t border-slate-800/80 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <div className="text-xs font-semibold text-slate-200">
-                        Cached Word-Timestamped Segments
+                {showTranscriptDrawer && activeProject && (() => {
+                  const allSegments = transcript?.segments || [];
+                  const query = transcriptSearch.trim().toLowerCase();
+                  const filteredSegments = query
+                    ? allSegments.filter(
+                        (seg) =>
+                          seg.text.toLowerCase().includes(query) ||
+                          `${seg.start_sec.toFixed(2)}–${seg.end_sec.toFixed(2)}`.includes(query)
+                      )
+                    : allSegments;
+
+                  return (
+                    <div className="pt-3 border-t border-slate-800/80 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-slate-200">
+                            Cached Word-Timestamped Segments
+                          </span>
+                          <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                            {query
+                              ? `${filteredSegments.length} / ${allSegments.length} matches`
+                              : `${allSegments.length} segs`}
+                          </span>
+                        </div>
+                        <div className="relative">
+                          <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                          <input
+                            type="text"
+                            value={transcriptSearch}
+                            onChange={(e) => setTranscriptSearch(e.target.value)}
+                            placeholder="Filter segments by spoken words or timestamp..."
+                            aria-label="Search transcript segments"
+                            className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded pl-8 pr-7 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 outline-none"
+                          />
+                          {transcriptSearch && (
+                            <button
+                              type="button"
+                              onClick={() => setTranscriptSearch('')}
+                              aria-label="Clear transcript search"
+                              className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                        <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 max-h-48 overflow-y-auto space-y-2 text-xs">
+                          {filteredSegments.length > 0 ? (
+                            filteredSegments.map((seg) => (
+                              <div key={seg.id} className="leading-relaxed">
+                                <span className="font-mono tabular-nums text-blue-400 mr-2">
+                                  [{seg.start_sec.toFixed(2)}–{seg.end_sec.toFixed(2)}]
+                                </span>
+                                <span className="text-slate-200">{seg.text}</span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="py-6 text-center text-slate-400 text-xs">
+                              {query
+                                ? `No transcript segments match "${transcriptSearch.trim()}".`
+                                : 'No transcript segments cached yet.'}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 max-h-52 overflow-y-auto space-y-2 text-xs">
-                        {transcript?.segments.map((seg) => (
-                          <div key={seg.id} className="leading-relaxed">
-                            <span className="font-mono tabular-nums text-blue-400 mr-2">
-                              [{seg.start_sec.toFixed(2)}–{seg.end_sec.toFixed(2)}]
-                            </span>
-                            <span className="text-slate-200">{seg.text}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold text-slate-200">
@@ -944,8 +1219,9 @@ export default function App() {
                         className="w-full h-44 bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded p-2.5 text-[11px] font-mono text-slate-200 outline-none resize-none"
                       />
                     </div>
-                  </div>
-                )}
+                    </div>
+                  );
+                })()}
               </div>
 
               {activeProject ? (

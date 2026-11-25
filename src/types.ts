@@ -29,11 +29,13 @@ export interface Transcript {
 }
 
 export type ClipCategory = 'lesson' | 'entertainment' | 'insight' | 'hook';
+export type ClipSentiment = 'Positive' | 'Negative' | 'Neutral';
 
 export interface ClipCandidate {
   id: string;
   title: string;
   category?: ClipCategory;
+  sentiment?: ClipSentiment;
   start_sec: number;
   end_sec: number;
   hook_score: number;
