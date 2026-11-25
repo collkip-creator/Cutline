@@ -1,9 +1,13 @@
 import { initializeApp } from 'firebase/app';
 import {
   GoogleAuthProvider,
+  browserPopupRedirectResolver,
   getAuth,
+  getRedirectResult,
   onAuthStateChanged,
+  signInWithCredential,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   type Unsubscribe,
   type User,
@@ -141,12 +145,124 @@ export async function ensureUserProfileDoc(user: User): Promise<void> {
   }
 }
 
-export async function signInWithGoogleForSocial(): Promise<User> {
+function buildGoogleAuthProvider(): GoogleAuthProvider {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
-  const cred = await signInWithPopup(auth, provider);
+  return provider;
+}
+
+export interface FirebaseAuthErrorInfo {
+  code: string;
+  isPopupBlocked: boolean;
+  message: string;
+}
+
+export function classifyFirebaseAuthError(error: unknown): FirebaseAuthErrorInfo {
+  const errObj = error as { code?: string; message?: string } | null;
+  const rawCode = String(errObj?.code || '');
+  const rawMsg = error instanceof Error ? error.message : String(error || 'Authentication failed.');
+
+  if (rawCode === 'auth/popup-blocked' || rawMsg.includes('auth/popup-blocked')) {
+    return {
+      code: 'auth/popup-blocked',
+      isPopupBlocked: true,
+      message:
+        'Your browser blocked the Google Sign-In popup (common inside embedded preview frames). Allow popups for this site or open the app in a new tab.',
+    };
+  }
+  if (rawCode === 'auth/popup-closed-by-user' || rawMsg.includes('auth/popup-closed-by-user')) {
+    return {
+      code: 'auth/popup-closed-by-user',
+      isPopupBlocked: false,
+      message: 'Google Sign-In popup was closed before completing sign-in.',
+    };
+  }
+  if (
+    rawCode === 'auth/cancelled-popup-request' ||
+    rawMsg.includes('auth/cancelled-popup-request')
+  ) {
+    return {
+      code: 'auth/cancelled-popup-request',
+      isPopupBlocked: false,
+      message: 'A sign-in popup is already open. Complete or close it and try again.',
+    };
+  }
+  if (rawCode === 'auth/unauthorized-domain' || rawMsg.includes('auth/unauthorized-domain')) {
+    return {
+      code: 'auth/unauthorized-domain',
+      isPopupBlocked: false,
+      message: `Current domain (${typeof window !== 'undefined' ? window.location.hostname : ''}) is not in Firebase Authorized Domains.`,
+    };
+  }
+  return {
+    code: rawCode || 'auth/unknown',
+    isPopupBlocked: false,
+    message: rawMsg,
+  };
+}
+
+export function isRunningInIframe(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+export async function signInWithGoogleForSocial(): Promise<User> {
+  const provider = buildGoogleAuthProvider();
+  // Invoke signInWithPopup immediately inside the click stack frame before any awaits
+  const cred = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
   await ensureUserProfileDoc(cred.user);
   return cred.user;
+}
+
+export async function signInWithGooglePopupForDesktopBridge(): Promise<{
+  idToken: string;
+  accessToken: string;
+  email: string;
+}> {
+  const provider = buildGoogleAuthProvider();
+  const result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
+  const oauthCred = GoogleAuthProvider.credentialFromResult(result);
+  await ensureUserProfileDoc(result.user);
+  return {
+    idToken: oauthCred?.idToken || '',
+    accessToken: oauthCred?.accessToken || '',
+    email: result.user.email || result.user.displayName || '',
+  };
+}
+
+export async function signInWithGoogleCredentialTokens(
+  idToken: string,
+  accessToken?: string
+): Promise<User> {
+  const trimmedId = idToken.trim();
+  const trimmedAccess = (accessToken || '').trim();
+  if (!trimmedId && !trimmedAccess) {
+    throw new Error('Missing Google OAuth idToken or accessToken for desktop sign-in.');
+  }
+  const credential = GoogleAuthProvider.credential(
+    trimmedId || null,
+    trimmedAccess || null
+  );
+  const result = await signInWithCredential(auth, credential);
+  await ensureUserProfileDoc(result.user);
+  return result.user;
+}
+
+export async function signInWithGoogleRedirect(): Promise<void> {
+  const provider = buildGoogleAuthProvider();
+  await signInWithRedirect(auth, provider, browserPopupRedirectResolver);
+}
+
+export async function completeGoogleRedirectIfPresent(): Promise<User | null> {
+  const cred = await getRedirectResult(auth, browserPopupRedirectResolver);
+  if (cred?.user) {
+    await ensureUserProfileDoc(cred.user);
+    return cred.user;
+  }
+  return null;
 }
 
 export async function signOutFirebase(): Promise<void> {

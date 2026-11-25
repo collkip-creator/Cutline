@@ -779,13 +779,16 @@ interface PendingOAuthSession {
   redirectUri: string;
   codeVerifier: string;
   createdAt: number;
+  desktopCallback?: string;
+  desktopState?: string;
 }
 
 const pendingOAuthSessions = new Map<string, PendingOAuthSession>();
 
 export function createOAuthStateSession(
   platform: SupportedSocialPlatform,
-  redirectUri: string
+  redirectUri: string,
+  desktopOptions?: { desktopCallback?: string; desktopState?: string }
 ): { state: string; codeVerifier: string; codeChallenge: string } {
   // Prune stale sessions (> 10 minutes)
   const cutoff = Date.now() - 10 * 60_000;
@@ -801,6 +804,8 @@ export function createOAuthStateSession(
     redirectUri,
     codeVerifier,
     createdAt: Date.now(),
+    desktopCallback: desktopOptions?.desktopCallback,
+    desktopState: desktopOptions?.desktopState,
   });
   return { state, codeVerifier, codeChallenge };
 }

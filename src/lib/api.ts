@@ -1,7 +1,8 @@
 /**
  * Resolves API and media URLs cleanly across both runtimes:
  * - Web / Express server (default): relative path ('')
- * - Tauri v2 Desktop WebView: routes directly to local FastAPI sidecar (127.0.0.1:43111)
+ * - Tauri v2 Desktop WebView: routes local media/FFmpeg calls to 127.0.0.1:43111
+ *   and social OAuth / publishing calls to the hosted Express cloud backend.
  */
 export const isTauriRuntime =
   typeof window !== 'undefined' &&
@@ -9,6 +10,41 @@ export const isTauriRuntime =
 
 export const API_BASE_URL: string =
   import.meta.env.VITE_SIDECAR_URL || (isTauriRuntime ? 'http://127.0.0.1:43111' : '');
+
+export const DEFAULT_DEV_APP_URL =
+  'https://ais-dev-qvfa2liarlhd3elkox55tu-415526218247.europe-west2.run.app';
+export const DEFAULT_SHARED_APP_URL =
+  'https://ais-pre-qvfa2liarlhd3elkox55tu-415526218247.europe-west2.run.app';
+
+const CLOUD_URL_STORAGE_KEY = 'cutline_cloud_app_url';
+
+export function getCloudAppUrl(): string {
+  if (!isTauriRuntime && typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  try {
+    const saved = localStorage.getItem(CLOUD_URL_STORAGE_KEY)?.trim().replace(/\/+$/, '');
+    if (saved && /^https?:\/\//i.test(saved)) return saved;
+  } catch {
+    // ignore storage access issues
+  }
+  const envUrl = String(import.meta.env.VITE_CLOUD_APP_URL || '').trim().replace(/\/+$/, '');
+  return envUrl || DEFAULT_DEV_APP_URL;
+}
+
+export function setCloudAppUrl(url: string): string {
+  const cleaned = url.trim().replace(/\/+$/, '');
+  try {
+    if (cleaned) {
+      localStorage.setItem(CLOUD_URL_STORAGE_KEY, cleaned);
+    } else {
+      localStorage.removeItem(CLOUD_URL_STORAGE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+  return getCloudAppUrl();
+}
 
 export interface SidecarDiagnostics {
   running: boolean;
@@ -23,6 +59,49 @@ export interface SidecarDiagnostics {
 export function apiUrl(path: string): string {
   if (!path.startsWith('/')) return `${API_BASE_URL}/${path}`;
   return `${API_BASE_URL}${path}`;
+}
+
+export function socialApiUrl(path: string): string {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return isTauriRuntime ? `${getCloudAppUrl()}${normalized}` : normalized;
+}
+
+export async function socialApiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const target = socialApiUrl(path);
+  try {
+    return await fetch(target, init);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err || 'Network error');
+    if (isTauriRuntime) {
+      throw new Error(
+        `Could not reach Cutline Cloud OAuth backend (${getCloudAppUrl()}): ${msg}. Verify the Cloud App URL in Social Accounts settings.`
+      );
+    }
+    throw new Error(`Request to ${path} failed (${msg}).`);
+  }
+}
+
+export async function openExternalBrowserUrl(url: string): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  if (isTauriRuntime) {
+    const internals = (window as unknown as Record<string, any>).__TAURI_INTERNALS__;
+    if (internals?.invoke) {
+      try {
+        await internals.invoke('open_external_url', { url });
+        return true;
+      } catch {
+        try {
+          await internals.invoke('plugin:shell|open', { path: url });
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+  const win = window.open(url, '_blank', 'noopener,noreferrer');
+  return Boolean(win);
 }
 
 export async function getTauriSidecarDiagnostics(): Promise<SidecarDiagnostics | null> {

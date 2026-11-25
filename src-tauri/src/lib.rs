@@ -209,6 +209,21 @@ fn restart_sidecar(app: AppHandle, state: State<'_, SidecarState>) {
     spawn_sidecar(&app, &state);
 }
 
+#[tauri::command]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    let allowed = trimmed.starts_with("https://")
+        || trimmed.starts_with("http://127.0.0.1:")
+        || trimmed.starts_with("http://localhost:");
+    if !allowed {
+        return Err("Only https:// or local loopback URLs can be opened externally.".to_string());
+    }
+    #[allow(deprecated)]
+    app.shell()
+        .open(trimmed, None)
+        .map_err(|e| format!("Failed to open system browser: {}", e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shared_state = SidecarState(Arc::new(Mutex::new(SidecarInner::default())));
@@ -219,7 +234,8 @@ pub fn run() {
         .manage(shared_state)
         .invoke_handler(tauri::generate_handler![
             get_sidecar_diagnostics,
-            restart_sidecar
+            restart_sidecar,
+            open_external_url
         ])
         .setup(move |app| {
             spawn_sidecar(app.handle(), &setup_state);

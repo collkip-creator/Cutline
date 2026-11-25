@@ -9,6 +9,7 @@ The React frontend communicates over http://127.0.0.1:43111 with zero cloud call
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import html
 import json
 import os
 from pathlib import Path
@@ -16,11 +17,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -263,6 +267,117 @@ class ChannelUpdateRequest(BaseModel):
 class ChannelTestRequest(BaseModel):
     endpoint_url: Optional[str] = None
     bearer_token: Optional[str] = None
+
+
+_desktop_auth_lock = threading.Lock()
+_desktop_auth_results: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_desktop_auth_store() -> None:
+    cutoff = time.time() - 900
+    stale = [k for k, v in _desktop_auth_results.items() if v.get("received_at", 0) < cutoff]
+    for k in stale:
+        _desktop_auth_results.pop(k, None)
+
+
+@app.post("/api/desktop-auth/callback")
+@app.get("/api/desktop-auth/callback")
+async def desktop_auth_callback(request: Request):
+    params: Dict[str, str] = {k: str(v) for k, v in request.query_params.items()}
+    if request.method == "POST":
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type", "").lower()
+        if "application/json" in content_type and raw_body:
+            try:
+                parsed = json.loads(raw_body.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        if v is not None:
+                            params[str(k)] = v if isinstance(v, str) else json.dumps(v)
+            except Exception:
+                pass
+        elif raw_body:
+            parsed_qs = parse_qs(raw_body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            for k, vals in parsed_qs.items():
+                if vals:
+                    params[k] = vals[0]
+
+    state = params.get("state", "").strip()
+    if not state:
+        return HTMLResponse(
+            "<html><body style='font-family:system-ui;background:#0b0f17;color:#e2e8f0;padding:32px;text-align:center'>"
+            "<h3>Missing desktop auth state</h3><p>Close this tab and retry sign-in from Cutline Studio.</p></body></html>",
+            status_code=400,
+        )
+
+    connection_obj: Any = None
+    raw_conn = params.get("connection_json") or params.get("connection")
+    if raw_conn:
+        try:
+            connection_obj = json.loads(raw_conn)
+        except Exception:
+            connection_obj = None
+
+    payload = {
+        "idToken": params.get("id_token") or params.get("idToken") or "",
+        "accessToken": params.get("access_token") or params.get("accessToken") or "",
+        "email": params.get("email") or "",
+        "error": params.get("error") or "",
+        "connection": connection_obj,
+        "received_at": time.time(),
+    }
+    with _desktop_auth_lock:
+        _prune_desktop_auth_store()
+        _desktop_auth_results[state] = payload
+
+    err_msg = payload["error"]
+    title = "Sign-In Error" if err_msg else "Connected to Cutline Studio"
+    detail = (
+        html.escape(err_msg)
+        if err_msg
+        else "Authentication succeeded. You can close this browser tab and return to Cutline Studio."
+    )
+    page = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>{title}</title>
+    <style>
+      body {{ font-family: system-ui, -apple-system, sans-serif; background: #0b0f17; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+      .card {{ background: #111724; border: 1px solid #334155; border-radius: 10px; padding: 28px; max-width: 440px; text-align: center; }}
+      h2 {{ margin: 0 0 8px; font-size: 17px; }}
+      p {{ margin: 0; font-size: 13px; color: #94a3b8; line-height: 1.5; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>{title}</h2>
+      <p>{detail}</p>
+    </div>
+    <script>setTimeout(function() {{ try {{ window.close(); }} catch (e) {{}} }}, 900);</script>
+  </body>
+</html>"""
+    return HTMLResponse(page)
+
+
+@app.get("/api/desktop-auth/poll")
+def desktop_auth_poll(state: str):
+    cleaned = state.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="state is required")
+    with _desktop_auth_lock:
+        _prune_desktop_auth_store()
+        item = _desktop_auth_results.pop(cleaned, None)
+    if item is None:
+        return {"status": "pending"}
+    return {
+        "status": "ready",
+        "idToken": item.get("idToken", ""),
+        "accessToken": item.get("accessToken", ""),
+        "email": item.get("email", ""),
+        "error": item.get("error", ""),
+        "connection": item.get("connection"),
+    }
 
 
 @app.get("/api/health")

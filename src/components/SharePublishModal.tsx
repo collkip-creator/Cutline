@@ -24,8 +24,16 @@ import type {
   PublishChannelConfig,
   PublishPlatform,
 } from '../types';
-import { apiFetch, apiUrl, readJsonResponse } from '../lib/api';
 import {
+  apiFetch,
+  apiUrl,
+  isTauriRuntime,
+  readJsonResponse,
+  socialApiFetch,
+} from '../lib/api';
+import { startDesktopBrowserGoogleSignIn } from '../lib/desktopAuth';
+import {
+  classifyFirebaseAuthError,
   saveSocialConnection,
   signInWithGoogleForSocial,
   type SocialConnectionRecord,
@@ -124,6 +132,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const [isPublishingDirect, setIsPublishingDirect] = useState(false);
   const [directResults, setDirectResults] = useState<DirectPublishResult[] | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const [modalPopupBlocked, setModalPopupBlocked] = useState(false);
 
   // Queue / Share Kit state
   const [selectedPlatforms, setSelectedPlatforms] = useState<PublishPlatform[]>(['youtube_shorts']);
@@ -247,13 +256,36 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       const idToken = await authUser.getIdToken();
       const fullCaption = buildFormattedPostText(caption, parsedUserTags);
 
+      let publishVideoUrl = exp.video_url;
+      let publishLocalPath: string | undefined = exp.video_path;
+
+      // In Tauri desktop runtime, the rendered MP4 lives on the user's PC (127.0.0.1:43111);
+      // upload it to the cloud Express backend so TikTok/Instagram Reels/YouTube can access it.
+      if (isTauriRuntime) {
+        const localRes = await fetch(apiUrl(exp.video_url));
+        if (!localRes.ok) {
+          throw new Error(`Could not read exported clip from local sidecar (${localRes.status}).`);
+        }
+        const blob = await localRes.blob();
+        const form = new FormData();
+        form.append('video', blob, buildExportFilename(clip.id, exp.aspect_ratio, 'mp4'));
+        const stageRes = await socialApiFetch('/api/social/upload-media', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${idToken}` },
+          body: form,
+        });
+        const staged = await readJsonResponse<{ videoUrl: string; localVideoPath: string }>(stageRes);
+        publishVideoUrl = staged.videoUrl;
+        publishLocalPath = staged.localVideoPath;
+      }
+
       const connectionPayload: Partial<Record<SocialPlatformId, SocialConnectionRecord>> = {};
       for (const pid of directPlatforms) {
         const conn = socialConnections[pid];
         if (conn) connectionPayload[pid] = conn;
       }
 
-      const res = await apiFetch('/api/social/publish', {
+      const res = await socialApiFetch('/api/social/publish', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -262,8 +294,8 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
         body: JSON.stringify({
           userId: authUser.uid,
           platforms: directPlatforms,
-          videoUrl: exp.video_url,
-          localVideoPath: exp.video_path,
+          videoUrl: publishVideoUrl,
+          localVideoPath: publishLocalPath,
           caption: fullCaption,
           privacy,
           connections: connectionPayload,
@@ -507,37 +539,88 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
           {shareTab === 'direct' ? (
             <>
               {!authUser && (
-                <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="font-semibold text-slate-200">
-                      Sign in with Google to unlock Direct OAuth Publishing
+                <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="font-semibold text-slate-200">
+                        Sign in with Google to unlock Direct OAuth Publishing
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        Your connected TikTok, Instagram Reels, and YouTube Shorts tokens are loaded
+                        from Firestore.
+                      </div>
                     </div>
-                    <div className="text-[11px] text-slate-400 mt-0.5">
-                      Your connected TikTok, Instagram Reels, and YouTube Shorts tokens are loaded
-                      from Firestore.
-                    </div>
+                    <button
+                      type="button"
+                      disabled={isSigningIn}
+                      onClick={async () => {
+                        if (isTauriRuntime) {
+                          setIsSigningIn(true);
+                          setModalPopupBlocked(false);
+                          setStatusMessage({
+                            kind: 'info',
+                            text: 'Complete Google Sign-In in your system browser tab...',
+                          });
+                          startDesktopBrowserGoogleSignIn({
+                            onSuccess: () => {
+                              setIsSigningIn(false);
+                              setStatusMessage({
+                                kind: 'info',
+                                text: 'Signed in via browser. Select your connected platforms below.',
+                              });
+                            },
+                            onError: (msg) => {
+                              setIsSigningIn(false);
+                              setStatusMessage({ kind: 'error', text: msg });
+                            },
+                          });
+                          return;
+                        }
+                        const signInPromise = signInWithGoogleForSocial();
+                        setIsSigningIn(true);
+                        setModalPopupBlocked(false);
+                        setStatusMessage(null);
+                        try {
+                          await signInPromise;
+                        } catch (err: unknown) {
+                          const info = classifyFirebaseAuthError(err);
+                          setModalPopupBlocked(info.isPopupBlocked);
+                          setStatusMessage({
+                            kind: 'error',
+                            text: info.message,
+                          });
+                        } finally {
+                          setIsSigningIn(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded"
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      {isSigningIn
+                        ? isTauriRuntime
+                          ? 'Waiting for Browser...'
+                          : 'Signing in...'
+                        : isTauriRuntime
+                          ? 'Sign in via Browser'
+                          : 'Sign in with Google'}
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    disabled={isSigningIn}
-                    onClick={async () => {
-                      setIsSigningIn(true);
-                      try {
-                        await signInWithGoogleForSocial();
-                      } catch (err: any) {
-                        setStatusMessage({
-                          kind: 'error',
-                          text: err?.message || 'Google sign-in failed.',
-                        });
-                      } finally {
-                        setIsSigningIn(false);
-                      }
-                    }}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded"
-                  >
-                    <LogIn className="w-3.5 h-3.5" />
-                    {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
-                  </button>
+                  {modalPopupBlocked && typeof window !== 'undefined' && (
+                    <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800 text-[11px]">
+                      <a
+                        href={window.location.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        Open App in New Tab
+                      </a>
+                      <span className="text-slate-400">
+                        Opening in a new tab bypasses embedded iframe popup blockers.
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
 

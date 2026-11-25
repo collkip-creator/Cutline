@@ -383,6 +383,17 @@ const upload = multer({
   limits: { fileSize: 500 * 1024 * 1024 },
 });
 
+const socialExportUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, EXPORTS_DIR),
+    filename: (_req, file, cb) => {
+      const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      cb(null, `desktop_${Date.now()}_${safe}`);
+    },
+  }),
+  limits: { fileSize: 250 * 1024 * 1024 },
+});
+
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
@@ -833,6 +844,31 @@ print(res.model_dump_json())
   // -------------------------------------------------------------------------
   // Multi-Platform OAuth Routes & Social Publishing Dispatcher
   // -------------------------------------------------------------------------
+  const isAllowedLoopbackCallback = (url: string): boolean =>
+    /^http:\/\/(127\.0\.0\.1|localhost):\d+\//i.test(url.trim());
+
+  // Allow Tauri desktop WebView (http://tauri.localhost / tauri://localhost) to call auth & social APIs
+  app.use(['/api/auth', '/api/social'], (req: Request, res: Response, next) => {
+    const origin = String(req.headers.origin || '');
+    if (
+      origin === 'http://tauri.localhost' ||
+      origin === 'https://tauri.localhost' ||
+      origin === 'tauri://localhost' ||
+      origin.startsWith('http://localhost:') ||
+      origin.startsWith('http://127.0.0.1:')
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    }
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.get('/api/auth/providers/status', (req: Request, res: Response) => {
     const providers = (Object.keys(SOCIAL_PROVIDERS) as SupportedSocialPlatform[]).map((pid) => {
       const adapter = SOCIAL_PROVIDERS[pid];
@@ -867,8 +903,18 @@ print(res.model_dump_json())
         return;
       }
 
+      const rawDesktopCallback = String(req.query.desktop_callback || '').trim();
+      const desktopCallback = isAllowedLoopbackCallback(rawDesktopCallback)
+        ? rawDesktopCallback
+        : undefined;
+      const desktopState = String(req.query.desktop_state || '').trim() || undefined;
+
       const redirectUri = buildProviderRedirectUri(provider.platform, req);
-      const { state, codeChallenge } = createOAuthStateSession(provider.platform, redirectUri);
+      const { state, codeChallenge } = createOAuthStateSession(
+        provider.platform,
+        redirectUri,
+        desktopCallback ? { desktopCallback, desktopState } : undefined
+      );
       res.cookie(`cutline_oauth_state_${provider.platform}`, state, {
         httpOnly: true,
         secure: true,
@@ -922,6 +968,44 @@ print(res.model_dump_json())
 </html>`;
   };
 
+  const renderDesktopLoopbackPostHtml = (
+    callbackUrl: string,
+    desktopState: string,
+    fields: { connection_json?: string; error?: string },
+    title: string,
+    detail: string
+  ) => {
+    const esc = (s: string) =>
+      s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${esc(title)}</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; background: #0b0f17; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+      .card { background: #111724; border: 1px solid #334155; border-radius: 10px; padding: 24px; max-width: 420px; text-align: center; }
+      h2 { margin: 0 0 8px; font-size: 16px; }
+      p { margin: 0 0 16px; font-size: 13px; color: #94a3b8; }
+      button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>${esc(title)}</h2>
+      <p>${esc(detail)}</p>
+      <form id="bridgeForm" method="POST" action="${esc(callbackUrl)}">
+        <input type="hidden" name="state" value="${esc(desktopState)}" />
+        ${fields.connection_json ? `<input type="hidden" name="connection_json" value="${esc(fields.connection_json)}" />` : ''}
+        ${fields.error ? `<input type="hidden" name="error" value="${esc(fields.error)}" />` : ''}
+        <button type="submit">Return to Cutline Studio</button>
+      </form>
+    </div>
+    <script>document.getElementById('bridgeForm').submit();</script>
+  </body>
+</html>`;
+  };
+
   app.get(
     ['/api/auth/:platform/callback', '/api/auth/:platform/callback/'],
     async (req: Request, res: Response) => {
@@ -940,9 +1024,26 @@ print(res.model_dump_json())
         return;
       }
 
+      const state = String(req.query.state || '').trim();
+      const session = state ? consumeOAuthStateSession(state) : null;
+
       const oauthError = String(req.query.error || '').trim();
       if (oauthError) {
         const desc = String(req.query.error_description || oauthError);
+        if (session?.desktopCallback && session.desktopState) {
+          res
+            .status(400)
+            .send(
+              renderDesktopLoopbackPostHtml(
+                session.desktopCallback,
+                session.desktopState,
+                { error: desc },
+                `${provider.displayName} Authorization Declined`,
+                desc
+              )
+            );
+          return;
+        }
         res
           .status(400)
           .send(
@@ -956,8 +1057,6 @@ print(res.model_dump_json())
       }
 
       const code = String(req.query.code || '').trim();
-      const state = String(req.query.state || '').trim();
-      const session = state ? consumeOAuthStateSession(state) : null;
       const cookieState = req.cookies?.[`cutline_oauth_state_${provider.platform}`];
       res.clearCookie(`cutline_oauth_state_${provider.platform}`, {
         httpOnly: true,
@@ -1005,6 +1104,19 @@ print(res.model_dump_json())
           scopes: tokenData.scopes,
         };
 
+        if (session?.desktopCallback && session.desktopState) {
+          res.send(
+            renderDesktopLoopbackPostHtml(
+              session.desktopCallback,
+              session.desktopState,
+              { connection_json: JSON.stringify(connection) },
+              `${provider.displayName} Connected`,
+              `Connected ${connection.accountName} (${connection.handle}). Returning to Cutline Studio desktop...`
+            )
+          );
+          return;
+        }
+
         res.send(
           renderPopupCallbackHtml(
             { type: 'OAUTH_AUTH_SUCCESS', platform: provider.platform, connection },
@@ -1014,6 +1126,20 @@ print(res.model_dump_json())
         );
       } catch (err: any) {
         const msg = err?.message || `Failed to complete ${provider.displayName} OAuth callback.`;
+        if (session?.desktopCallback && session.desktopState) {
+          res
+            .status(500)
+            .send(
+              renderDesktopLoopbackPostHtml(
+                session.desktopCallback,
+                session.desktopState,
+                { error: msg },
+                `${provider.displayName} Connection Failed`,
+                msg
+              )
+            );
+          return;
+        }
         res
           .status(500)
           .send(
@@ -1024,6 +1150,29 @@ print(res.model_dump_json())
             )
           );
       }
+    }
+  );
+
+  app.post(
+    '/api/social/upload-media',
+    socialExportUpload.single('video'),
+    (req: Request, res: Response) => {
+      const authHeader = String(req.headers.authorization || '');
+      if (!authHeader.startsWith('Bearer ') || authHeader.slice(7).trim().length < 20) {
+        if (req.file?.path && fs.existsSync(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
+        res.status(401).json({ error: 'Firebase authentication required to stage social media.' });
+        return;
+      }
+      if (!req.file) {
+        res.status(400).json({ error: 'Video file missing in multipart upload.' });
+        return;
+      }
+      res.json({
+        videoUrl: `/media/exports/${req.file.filename}`,
+        localVideoPath: req.file.path,
+      });
     }
   );
 

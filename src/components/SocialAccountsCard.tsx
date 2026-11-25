@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import {
   Check,
   Copy,
+  ExternalLink,
+  Globe,
   KeyRound,
   Link2,
   LogIn,
@@ -12,11 +14,29 @@ import {
   Unlink,
   X,
 } from 'lucide-react';
-import { apiFetch, readJsonResponse } from '../lib/api';
 import {
+  DEFAULT_DEV_APP_URL,
+  DEFAULT_SHARED_APP_URL,
+  getCloudAppUrl,
+  isTauriRuntime,
+  openExternalBrowserUrl,
+  readJsonResponse,
+  setCloudAppUrl,
+  socialApiFetch,
+} from '../lib/api';
+import {
+  signInWithManualDesktopCode,
+  startDesktopBrowserGoogleSignIn,
+  startDesktopBrowserSocialOAuth,
+  type DesktopAuthSessionController,
+} from '../lib/desktopAuth';
+import {
+  classifyFirebaseAuthError,
   disconnectSocialConnection,
+  isRunningInIframe,
   saveSocialConnection,
   signInWithGoogleForSocial,
+  signInWithGoogleRedirect,
   signOutFirebase,
   type SocialConnectionRecord,
   type SocialPlatformId,
@@ -88,23 +108,35 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
   const [providerStatuses, setProviderStatuses] = useState<ProviderConfigStatus[]>([]);
   const [busyPlatform, setBusyPlatform] = useState<SocialPlatformId | 'auth' | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [popupBlockedHint, setPopupBlockedHint] = useState(false);
+  const [manualAuthUrl, setManualAuthUrl] = useState<{ platform: SocialPlatformId; url: string } | null>(null);
   const [copiedUri, setCopiedUri] = useState<string | null>(null);
+
+  // Tauri desktop bridge UI state
+  const [showDesktopOptions, setShowDesktopOptions] = useState(false);
+  const [desktopCodeInput, setDesktopCodeInput] = useState('');
+  const [cloudUrlInput, setCloudUrlInput] = useState(() => getCloudAppUrl());
+  const [activeBridgeUrl, setActiveBridgeUrl] = useState<string | null>(null);
+  const desktopControllerRef = useRef<DesktopAuthSessionController | null>(null);
 
   const loadProviderStatuses = async () => {
     try {
-      const res = await apiFetch('/api/auth/providers/status');
+      const res = await socialApiFetch('/api/auth/providers/status');
       const data = await readJsonResponse<{ providers: ProviderConfigStatus[] }>(res);
       setProviderStatuses(data.providers || []);
     } catch {
-      // Ignore transient cold start errors
+      // Ignore transient cold start or offline cloud URL errors
     }
   };
 
   useEffect(() => {
     void loadProviderStatuses();
+    return () => {
+      desktopControllerRef.current?.cancel();
+    };
   }, []);
 
-  // Listen for OAuth popup cross-origin postMessage callbacks
+  // Listen for OAuth popup cross-origin postMessage callbacks (Web runtime)
   useEffect(() => {
     const onMessage = async (event: MessageEvent) => {
       const origin = event.origin || '';
@@ -151,18 +183,99 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
     return () => window.removeEventListener('message', onMessage);
   }, [authUser, onStatusBanner]);
 
+  const cancelActiveDesktopFlow = () => {
+    desktopControllerRef.current?.cancel();
+    desktopControllerRef.current = null;
+    setActiveBridgeUrl(null);
+    setBusyPlatform(null);
+  };
+
   const handleGoogleSignIn = async () => {
+    if (isTauriRuntime) {
+      desktopControllerRef.current?.cancel();
+      setBusyPlatform('auth');
+      setLocalError(null);
+      setPopupBlockedHint(false);
+
+      const ctrl = startDesktopBrowserGoogleSignIn({
+        onSuccess: (user) => {
+          desktopControllerRef.current = null;
+          setActiveBridgeUrl(null);
+          setBusyPlatform(null);
+          onStatusBanner?.({
+            kind: 'info',
+            text: `Signed in as ${user.email || user.uid}. Firestore socialConnections ready.`,
+          });
+        },
+        onError: (msg, needsRebuild) => {
+          desktopControllerRef.current = null;
+          setActiveBridgeUrl(null);
+          setBusyPlatform(null);
+          setLocalError(msg);
+          if (needsRebuild) setShowDesktopOptions(true);
+        },
+      });
+      desktopControllerRef.current = ctrl;
+      setActiveBridgeUrl(ctrl.bridgeUrl);
+      return;
+    }
+
+    // Web runtime: invoke Firebase popup synchronously inside the click handler
+    const signInPromise = signInWithGoogleForSocial();
     setBusyPlatform('auth');
     setLocalError(null);
+    setPopupBlockedHint(false);
     try {
-      const user = await signInWithGoogleForSocial();
+      const user = await signInPromise;
       onStatusBanner?.({
         kind: 'info',
         text: `Signed in as ${user.email || user.uid}. Firestore socialConnections ready.`,
       });
-    } catch (err: any) {
-      setLocalError(err?.message || 'Google Sign-In failed or was cancelled.');
+    } catch (err: unknown) {
+      const info = classifyFirebaseAuthError(err);
+      setLocalError(info.message);
+      setPopupBlockedHint(info.isPopupBlocked);
     } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const handleApplyDesktopCode = async () => {
+    setBusyPlatform('auth');
+    setLocalError(null);
+    try {
+      const user = await signInWithManualDesktopCode(desktopCodeInput);
+      setDesktopCodeInput('');
+      setShowDesktopOptions(false);
+      onStatusBanner?.({
+        kind: 'info',
+        text: `Signed in as ${user.email || user.uid} via Desktop Sign-In Code.`,
+      });
+    } catch (err: any) {
+      setLocalError(err?.message || 'Invalid Desktop Sign-In Code.');
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const handleSaveCloudUrl = async (nextUrl: string) => {
+    const saved = setCloudAppUrl(nextUrl);
+    setCloudUrlInput(saved);
+    await loadProviderStatuses();
+    onStatusBanner?.({
+      kind: 'info',
+      text: `Cloud OAuth backend set to ${saved}.`,
+    });
+  };
+
+  const handleGoogleRedirectSignIn = async () => {
+    setBusyPlatform('auth');
+    setLocalError(null);
+    try {
+      await signInWithGoogleRedirect();
+    } catch (err: unknown) {
+      const info = classifyFirebaseAuthError(err);
+      setLocalError(info.message);
       setBusyPlatform(null);
     }
   };
@@ -172,23 +285,61 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
       setLocalError('Sign in with Google above before connecting social publishing accounts.');
       return;
     }
+
+    if (isTauriRuntime) {
+      desktopControllerRef.current?.cancel();
+      setBusyPlatform(platform);
+      setLocalError(null);
+      setManualAuthUrl(null);
+      const ctrl = startDesktopBrowserSocialOAuth({
+        userId: authUser.uid,
+        platform,
+        onSuccess: (conn) => {
+          desktopControllerRef.current = null;
+          setActiveBridgeUrl(null);
+          setBusyPlatform(null);
+          onStatusBanner?.({
+            kind: 'info',
+            text: `Connected ${PLATFORM_META[conn.platform]?.title || conn.platform} (${conn.handle || conn.accountName}) to Firestore.`,
+          });
+        },
+        onError: (msg) => {
+          desktopControllerRef.current = null;
+          setActiveBridgeUrl(null);
+          setBusyPlatform(null);
+          setLocalError(msg);
+        },
+      });
+      desktopControllerRef.current = ctrl;
+      setActiveBridgeUrl(ctrl.bridgeUrl);
+      return;
+    }
+
     setBusyPlatform(platform);
     setLocalError(null);
-    try {
-      const res = await apiFetch(`/api/auth/${encodeURIComponent(platform)}/start`);
-      const data = await readJsonResponse<{ url: string; redirectUri: string }>(res);
+    setManualAuthUrl(null);
 
-      // Open OAuth provider authorization URL directly in popup (required for AI Studio iframe)
-      const popup = window.open(
-        data.url,
-        `cutline_oauth_${platform}`,
-        'width=600,height=720,menubar=no,toolbar=no,status=no'
-      );
-      if (!popup) {
-        setLocalError('Popup was blocked by browser settings. Allow popups for this site and retry.');
+    // Open blank popup synchronously during click gesture so async /start fetch never triggers popup blockers
+    const popup = window.open(
+      'about:blank',
+      `cutline_oauth_${platform}`,
+      'width=600,height=720,menubar=no,toolbar=no,status=no'
+    );
+
+    try {
+      const res = await socialApiFetch(`/api/auth/${encodeURIComponent(platform)}/start`);
+      const data = await readJsonResponse<{ url: string; redirectUri: string }>(res);
+      if (popup && !popup.closed) {
+        popup.location.href = data.url;
+      } else {
+        setManualAuthUrl({ platform, url: data.url });
+        setLocalError(
+          `Popup was blocked for ${PLATFORM_META[platform].title}. Click "Open ${PLATFORM_META[platform].title} Login" below or allow popups.`
+        );
         setBusyPlatform(null);
       }
     } catch (err: any) {
+      if (popup && !popup.closed) popup.close();
       setLocalError(err?.message || `Unable to start ${platform} OAuth flow.`);
       setBusyPlatform(null);
     }
@@ -218,7 +369,7 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
     setLocalError(null);
     try {
       const idToken = await authUser.getIdToken();
-      const res = await apiFetch('/api/social/refresh', {
+      const res = await socialApiFetch('/api/social/refresh', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -274,7 +425,18 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {isTauriRuntime && (
+            <button
+              type="button"
+              onClick={() => setShowDesktopOptions((v) => !v)}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 text-slate-300 rounded"
+            >
+              <Globe className="w-3.5 h-3.5" />
+              Desktop Auth Bridge
+            </button>
+          )}
+
           {!authReady ? (
             <span className="text-xs text-slate-400">Checking Firebase session...</span>
           ) : authUser ? (
@@ -301,22 +463,193 @@ export const SocialAccountsCard: React.FC<SocialAccountsCardProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
             >
               <LogIn className="w-3.5 h-3.5" />
-              {busyPlatform === 'auth' ? 'Signing in...' : 'Sign in with Google'}
+              {busyPlatform === 'auth'
+                ? isTauriRuntime
+                  ? 'Waiting for Browser...'
+                  : 'Signing in...'
+                : isTauriRuntime
+                  ? 'Sign in with Google (Browser)'
+                  : 'Sign in with Google'}
             </button>
           )}
         </div>
       </div>
 
+      {/* Waiting for system browser sign-in / OAuth banner in Tauri */}
+      {isTauriRuntime && busyPlatform !== null && activeBridgeUrl && (
+        <div className="px-3.5 py-2.5 rounded border border-blue-500/40 bg-blue-950/30 text-xs text-blue-100 flex flex-wrap items-center justify-between gap-2">
+          <span>
+            Complete authorization in your system browser tab. Cutline Studio will sign in
+            automatically when it finishes.
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => openExternalBrowserUrl(activeBridgeUrl)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium"
+            >
+              <ExternalLink className="w-3 h-3" />
+              Re-open Browser
+            </button>
+            <button
+              type="button"
+              onClick={cancelActiveDesktopFlow}
+              className="px-2 py-1 text-slate-300 hover:text-white"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Tauri Desktop Bridge Options (Cloud Backend Host & Manual Sign-In Code Fallback) */}
+      {isTauriRuntime && showDesktopOptions && (
+        <div className="bg-[#0B0F17] border border-slate-800 rounded p-3.5 space-y-3 text-xs">
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="font-semibold text-slate-200">
+                Cloud Auth & Social OAuth Backend URL
+              </label>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleSaveCloudUrl(DEFAULT_DEV_APP_URL)}
+                  className="px-2 py-0.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-200 rounded"
+                >
+                  Use Dev URL
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSaveCloudUrl(DEFAULT_SHARED_APP_URL)}
+                  className="px-2 py-0.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-200 rounded"
+                >
+                  Use Shared URL
+                </button>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="url"
+                value={cloudUrlInput}
+                onChange={(e) => setCloudUrlInput(e.target.value)}
+                className="flex-1 bg-[#111724] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 font-mono text-[11px] text-slate-200 outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => handleSaveCloudUrl(cloudUrlInput)}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded font-medium"
+              >
+                Save Host
+              </button>
+            </div>
+          </div>
+
+          {!authUser && (
+            <div className="pt-2 border-t border-slate-800 space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="font-semibold text-slate-200">
+                  Manual Desktop Sign-In Code (Works Even Before Rebuilding .exe)
+                </label>
+                <button
+                  type="button"
+                  onClick={() => openExternalBrowserUrl(`${getCloudAppUrl()}/?desktop_auth=1`)}
+                  className="inline-flex items-center gap-1 text-[11px] text-blue-400 hover:text-blue-300"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  Get Code in Browser
+                </button>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={desktopCodeInput}
+                  onChange={(e) => setDesktopCodeInput(e.target.value)}
+                  placeholder='Paste {"idToken":"...","accessToken":"..."} from browser'
+                  className="flex-1 bg-[#111724] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 font-mono text-[11px] text-slate-200 outline-none"
+                />
+                <button
+                  type="button"
+                  disabled={busyPlatform === 'auth' || !desktopCodeInput.trim()}
+                  onClick={handleApplyDesktopCode}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-45 text-white rounded font-semibold"
+                >
+                  Sign In
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {localError && (
-        <div className="px-3 py-2 rounded border border-rose-500/40 bg-rose-950/40 text-xs text-rose-200 flex items-center justify-between gap-2">
-          <span>{localError}</span>
-          <button
-            type="button"
-            onClick={() => setLocalError(null)}
-            className="text-rose-300 hover:text-white shrink-0"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+        <div className="px-3.5 py-2.5 rounded border border-rose-500/40 bg-rose-950/40 text-xs text-rose-200 space-y-2.5">
+          <div className="flex items-start justify-between gap-2">
+            <span>{localError}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setLocalError(null);
+                setPopupBlockedHint(false);
+                setManualAuthUrl(null);
+              }}
+              className="text-rose-300 hover:text-white shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {popupBlockedHint && !isTauriRuntime && (
+            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-rose-500/25">
+              {typeof window !== 'undefined' && (
+                <a
+                  href={window.location.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded transition-colors"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Open App in New Tab
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 text-slate-200 rounded transition-colors"
+              >
+                <RefreshCw className="w-3 h-3" />
+                Retry Popup
+              </button>
+              {!isRunningInIframe() && (
+                <button
+                  type="button"
+                  onClick={handleGoogleRedirectSignIn}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 text-slate-200 rounded transition-colors"
+                >
+                  <LogIn className="w-3 h-3" />
+                  Use Redirect Sign-In
+                </button>
+              )}
+              {isRunningInIframe() && (
+                <span className="text-[11px] text-rose-200/85">
+                  Tip: Click &ldquo;Open App in New Tab&rdquo; or allow popups in your browser bar.
+                </span>
+              )}
+            </div>
+          )}
+
+          {manualAuthUrl && (
+            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-rose-500/25">
+              <a
+                href={manualAuthUrl.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                Open {PLATFORM_META[manualAuthUrl.platform].title} Login
+              </a>
+            </div>
+          )}
         </div>
       )}
 

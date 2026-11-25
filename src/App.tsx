@@ -16,11 +16,14 @@ import {
 import { ArchitectureView } from './components/ArchitectureView';
 import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
+import { DesktopAuthBridgeScreen } from './components/DesktopAuthBridgeScreen';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { HardwareTradeoffsView } from './components/HardwareTradeoffsView';
 import { PublishQueueView } from './components/PublishQueueView';
 import { SharePublishModal } from './components/SharePublishModal';
 import {
+  classifyFirebaseAuthError,
+  completeGoogleRedirectIfPresent,
   ensureUserProfileDoc,
   subscribeAuthUser,
   subscribeSocialConnections,
@@ -53,6 +56,19 @@ import type {
 type WorkspaceTab = 'studio' | 'queue' | 'architecture' | 'hardware';
 
 export default function App() {
+  const desktopAuthParams =
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  if (desktopAuthParams?.get('desktop_auth') === '1') {
+    return (
+      <ErrorBoundary>
+        <DesktopAuthBridgeScreen
+          callbackUrl={desktopAuthParams.get('callback') || ''}
+          state={desktopAuthParams.get('state') || ''}
+        />
+      </ErrorBoundary>
+    );
+  }
+
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('studio');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
@@ -210,6 +226,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void completeGoogleRedirectIfPresent().catch((err: unknown) => {
+      const info = classifyFirebaseAuthError(err);
+      setNotice({ kind: 'error', text: info.message });
+    });
     const unsub = subscribeAuthUser((user) => {
       setAuthUser(user);
       setAuthReady(true);
