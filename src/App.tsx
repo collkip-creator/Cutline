@@ -5,15 +5,19 @@ import {
   FileText,
   FolderGit2,
   Link2,
+  Loader2,
   Menu,
+  Mic,
   Scissors,
   Search,
   Sparkles,
   Upload,
   Video,
+  Wand2,
   X,
 } from 'lucide-react';
 import { ArchitectureView } from './components/ArchitectureView';
+import { AudioTranscribeView } from './components/AudioTranscribeView';
 import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { DesktopAuthBridgeScreen } from './components/DesktopAuthBridgeScreen';
@@ -45,7 +49,7 @@ import type {
   Transcript,
 } from './types';
 
-type WorkspaceTab = 'studio' | 'queue' | 'architecture' | 'hardware';
+type WorkspaceTab = 'studio' | 'transcribe' | 'queue' | 'architecture' | 'hardware';
 
 const HASHTAG_STOPWORDS = new Set([
   'about', 'after', 'again', 'against', 'almost', 'alone', 'along', 'already',
@@ -302,6 +306,7 @@ export default function App() {
   const [isLoadingSample, setIsLoadingSample] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [isGeneratingViralClips, setIsGeneratingViralClips] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
 
@@ -617,6 +622,73 @@ export default function App() {
     }
   };
 
+  const handleGenerateAiViralClips = async (retranscribe = false) => {
+    if (!activeProject) return;
+    setIsGeneratingViralClips(true);
+    setNotice({
+      kind: 'info',
+      text: 'Transcribing entire video audio and analyzing transcript with Gemini AI for viral clips...',
+    });
+    try {
+      const res = await apiFetch(
+        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/ai-viral-clips`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            retranscribe,
+            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+            max_clip_sec: 45,
+            max_clips: 6,
+          }),
+        }
+      );
+      const data = await readJsonResponse<{
+        transcript: Transcript;
+        clips: ClipCandidate[];
+        cache_hit: boolean;
+        transcript_model: string;
+        analysis_model: string;
+        note?: string;
+      }>(res);
+
+      setTranscript(data.transcript);
+      setCacheHit(true);
+
+      const enrichedClips = (data.clips || []).map((clip) => {
+        const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
+        const tags =
+          existingTags.length >= 3
+            ? existingTags
+            : [...existingTags, ...generateTranscriptHashtags(clip, data.transcript, 3 - existingTags.length)];
+        const sentiment = clip.sentiment || analyzeTranscriptSentiment(clip, data.transcript);
+        return {
+          ...clip,
+          sentiment,
+          tags,
+        };
+      });
+
+      setClips(enrichedClips);
+      setActiveClipId(enrichedClips[0]?.id || null);
+      if (enrichedClips.length > 0) {
+        await persistClips(activeProject.video_hash, enrichedClips);
+      }
+      await loadProjects(false);
+
+      const baseMsg = `AI transcribed ${data.transcript.segments.length} segments and generated ${enrichedClips.length} viral clips.`;
+      setNotice({
+        kind: 'info',
+        text: data.note ? `${baseMsg} (${data.note})` : baseMsg,
+      });
+    } catch (err: any) {
+      setNotice({ kind: 'error', text: err?.message || 'AI viral clip generation failed.' });
+    } finally {
+      setIsGeneratingViralClips(false);
+    }
+  };
+
   const handleSnapToWords = async (clip: ClipCandidate) => {
     if (!transcript || !activeProject) return;
     const res = await apiFetch('/api/clips/snap', {
@@ -772,8 +844,54 @@ export default function App() {
     setQueueModalClip(clip);
   };
 
+  const handleSaveVoiceTranscriptToProject = async (rawText: string) => {
+    if (!activeProject || !rawText.trim()) return;
+    const sentences = rawText
+      .trim()
+      .split(/(?<=[.!?])\s+|\r?\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const lines = sentences.length > 0 ? sentences : [rawText.trim()];
+    const totalDur = Math.max(4, activeProject.duration_sec || lines.length * 4);
+    const step = totalDur / lines.length;
+    const formatSrtTs = (sec: number) => {
+      const clamped = Math.max(0, sec);
+      const hrs = Math.floor(clamped / 3600);
+      const mins = Math.floor((clamped % 3600) / 60);
+      const secs = Math.floor(clamped % 60);
+      const ms = Math.round((clamped - Math.floor(clamped)) * 1000);
+      return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+    };
+    const srt = lines
+      .map((line, idx) => {
+        const start = idx * step;
+        const end = Math.max(start + 0.6, (idx + 1) * step - 0.1);
+        return `${idx + 1}\n${formatSrtTs(start)} --> ${formatSrtTs(end)}\n${line}`;
+      })
+      .join('\n\n');
+
+    const res = await apiFetch(
+      `/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ srt }),
+      }
+    );
+    const data = await readJsonResponse<{ transcript: Transcript }>(res);
+    setTranscript(data.transcript);
+    setCacheHit(true);
+    setNotice({
+      kind: 'info',
+      text: `Saved voice transcription to "${activeProject.title}" transcript cache (${data.transcript.segments.length} segments).`,
+    });
+    setActiveTab('studio');
+    setShowTranscriptDrawer(true);
+  };
+
   const navItems: Array<{ id: WorkspaceTab; label: string; icon: React.ReactNode }> = [
     { id: 'studio', label: 'Clip Studio', icon: <Scissors className="w-4 h-4" /> },
+    { id: 'transcribe', label: 'Transcribe Audio', icon: <Mic className="w-4 h-4" /> },
     { id: 'queue', label: 'Social & Queue', icon: <CalendarClock className="w-4 h-4" /> },
     { id: 'architecture', label: 'Architecture & Code', icon: <FolderGit2 className="w-4 h-4" /> },
     { id: 'hardware', label: 'Mobile & Hardware', icon: <Cpu className="w-4 h-4" /> },
@@ -781,6 +899,7 @@ export default function App() {
 
   const breadcrumbTitle: Record<WorkspaceTab, string> = {
     studio: 'Clip Studio',
+    transcribe: 'Transcribe Audio',
     queue: 'Social Share & Publish Queue',
     architecture: 'Architecture & Code',
     hardware: 'Mobile & Hardware Trade-offs',
@@ -1099,9 +1218,18 @@ export default function App() {
                     />
                     <button
                       type="button"
-                      disabled={isTranscribing}
+                      onClick={() => setActiveTab('transcribe')}
+                      title="Dictate prompt or voice memo with microphone"
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                    >
+                      <Mic className="w-3.5 h-3.5 text-blue-400" />
+                      Voice Input
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isTranscribing || isGeneratingViralClips}
                       onClick={() => handleTranscribe(activeProject.video_hash, Boolean(transcript))}
-                      className="px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                      className="px-3 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
                       {isTranscribing
                         ? 'Transcribing...'
@@ -1119,12 +1247,31 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      disabled={isExtracting || isTranscribing}
+                      disabled={isExtracting || isTranscribing || isGeneratingViralClips}
                       onClick={handleExtractHighlights}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded transition-colors whitespace-nowrap shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
                       <Sparkles className="w-3.5 h-3.5" />
                       {isExtracting ? 'Extracting...' : 'Extract Clips'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isGeneratingViralClips || isExtracting || isTranscribing}
+                      onClick={() => handleGenerateAiViralClips(false)}
+                      title="Transcribe the full video audio and analyze the transcript with Gemini AI to generate viral clips"
+                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded transition-colors whitespace-nowrap shrink-0"
+                    >
+                      {isGeneratingViralClips ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Generating Viral Clips...
+                        </>
+                      ) : (
+                        <>
+                          <Wand2 className="w-3.5 h-3.5" />
+                          AI Transcribe & Viral Clips
+                        </>
+                      )}
                     </button>
                     <span className="text-[11px] font-mono tabular-nums text-slate-400 ml-auto">
                       {cacheHit ? 'Transcript cached · 0ms ASR' : 'Uncached'} · SHA256{' '}
@@ -1276,6 +1423,21 @@ export default function App() {
                 </div>
               )}
             </div>
+          )}
+
+          {activeTab === 'transcribe' && (
+            <AudioTranscribeView
+              activeProject={activeProject}
+              onUseAsHighlightPrompt={(text) => {
+                setPrompt(text);
+                setActiveTab('studio');
+                setNotice({
+                  kind: 'info',
+                  text: 'Applied voice transcription as your Clip Studio highlight extraction prompt.',
+                });
+              }}
+              onSaveAsProjectTranscript={handleSaveVoiceTranscriptToProject}
+            />
           )}
 
           {activeTab === 'queue' && (

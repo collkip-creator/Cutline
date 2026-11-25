@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
@@ -24,6 +25,15 @@ import {
   persistRefreshedTokensToFirestore,
   type SupportedSocialPlatform,
 } from './server/firestoreRest.ts';
+import {
+  TRANSCRIBE_MODEL,
+  VIRAL_ANALYSIS_MODEL,
+  analyzeTranscriptForViralClips,
+  formatGeminiError,
+  normalizeAudioMimeType,
+  transcribeAudioBuffer,
+  transcribeVideoChunksWithGemini,
+} from './server/gemini.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -198,6 +208,67 @@ function runPythonCli(args: string[], stdinPayload?: unknown): Promise<string> {
     }
     proc.stdin.end();
   });
+}
+
+async function extractVideoAudioChunks(
+  localPath: string,
+  durationSec: number,
+  videoHash: string
+): Promise<Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }>> {
+  const safeDuration = Math.max(1, durationSec || 30);
+  const chunkLenSec = 600; // 10-minute chunks (~3.6 MB per MP3 chunk at 48kbps)
+  const chunkCount = Math.max(1, Math.ceil(safeDuration / chunkLenSec));
+  const chunks: Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }> = [];
+  const tempPaths: string[] = [];
+
+  try {
+    for (let i = 0; i < chunkCount; i++) {
+      const startSec = i * chunkLenSec;
+      const chunkDur = Math.min(chunkLenSec, Math.max(1, safeDuration - startSec));
+      const tmpPath = path.join(
+        DATA_DIR,
+        'cache',
+        `${videoHash.slice(0, 12)}_chunk_${i}_${Date.now()}.mp3`
+      );
+      tempPaths.push(tmpPath);
+
+      const args = ['-y'];
+      if (chunkCount > 1) {
+        args.push('-ss', String(startSec), '-t', String(chunkDur));
+      }
+      args.push(
+        '-i', localPath,
+        '-vn',
+        '-ac', '1',
+        '-ar', '16000',
+        '-c:a', 'libmp3lame',
+        '-b:a', '48k',
+        tmpPath
+      );
+
+      await execFileAsync('ffmpeg', args);
+      if (fs.existsSync(tmpPath)) {
+        const buffer = fs.readFileSync(tmpPath);
+        if (buffer.length > 0) {
+          chunks.push({
+            buffer,
+            mimeType: 'audio/mp3',
+            startSec,
+            durationSec: chunkDur,
+          });
+        }
+      }
+    }
+    return chunks;
+  } finally {
+    for (const p of tempPaths) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        // Ignore temp file cleanup errors
+      }
+    }
+  }
 }
 
 function buildSegmentedTranscriptFromLines(
@@ -394,11 +465,16 @@ const socialExportUpload = multer({
   limits: { fileSize: 250 * 1024 * 1024 },
 });
 
+const audioMemoryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
   app.use(cookieParser());
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '25mb' }));
 
   // Serve media files with HTTP Range support for smooth <video> scrubbing
   app.use('/media/videos', express.static(VIDEOS_DIR));
@@ -563,6 +639,31 @@ async function startServer() {
       return;
     }
 
+    if (req.body?.provider === 'gemini') {
+      try {
+        const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+        const aiTranscript = await transcribeVideoChunksWithGemini({
+          videoHash: hash,
+          sourcePath: project.local_path,
+          totalDurationSec: project.duration_sec,
+          chunks,
+        });
+        if (aiTranscript.segments.length === 0) {
+          res.status(422).json({
+            error: 'No spoken dialogue was detected in the video audio track.',
+          });
+          return;
+        }
+        writeCachedTranscript(aiTranscript);
+        res.json({ transcript: aiTranscript, cache_hit: false, model: TRANSCRIBE_MODEL });
+        return;
+      } catch (err) {
+        const formatted = formatGeminiError(err);
+        res.status(formatted.status).json({ error: formatted.message });
+        return;
+      }
+    }
+
     // Check if faster-whisper is installed in local Python environment
     try {
       await execFileAsync('python3', ['-c', 'import faster_whisper']);
@@ -583,6 +684,25 @@ print(res.model_dump_json())
       res.json({ transcript, cache_hit: false });
       return;
     } catch {
+      if (process.env.GEMINI_API_KEY?.trim()) {
+        try {
+          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+          const aiTranscript = await transcribeVideoChunksWithGemini({
+            videoHash: hash,
+            sourcePath: project.local_path,
+            totalDurationSec: project.duration_sec,
+            chunks,
+          });
+          if (aiTranscript.segments.length > 0) {
+            writeCachedTranscript(aiTranscript);
+            res.json({ transcript: aiTranscript, cache_hit: false, model: TRANSCRIBE_MODEL });
+            return;
+          }
+        } catch {
+          // Fall through to local draft only if user didn't explicitly request Gemini provider
+        }
+      }
+
       // Fallback: align clean editable segments to the real probed video duration
       const fallbackLines = [
         `Analyzing ${project.title} locally with zero cloud rendering or remote ASR calls.`,
@@ -622,6 +742,127 @@ print(res.model_dump_json())
       return;
     }
     res.status(400).json({ error: 'Provide either srt string or transcript object' });
+  });
+
+  app.post(
+    '/api/audio/transcribe',
+    audioMemoryUpload.single('audio'),
+    async (req: Request, res: Response) => {
+      try {
+        let audioBuffer: Buffer | null = null;
+        let mimeType = 'audio/webm';
+        const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+
+        if (req.file?.buffer && req.file.buffer.length > 0) {
+          audioBuffer = req.file.buffer;
+          mimeType = normalizeAudioMimeType(
+            (typeof req.body?.mimeType === 'string' && req.body.mimeType) || req.file.mimetype,
+            req.file.originalname
+          );
+        } else if (typeof req.body?.audioBase64 === 'string' && req.body.audioBase64.trim()) {
+          const rawBase64 = req.body.audioBase64.trim().replace(/^data:[^;]+;base64,/, '');
+          audioBuffer = Buffer.from(rawBase64, 'base64');
+          mimeType = normalizeAudioMimeType(req.body?.mimeType);
+        }
+
+        if (!audioBuffer || audioBuffer.length === 0) {
+          res.status(400).json({ error: 'No audio recording was provided for transcription.' });
+          return;
+        }
+
+        const result = await transcribeAudioBuffer({
+          audioBuffer,
+          mimeType,
+          prompt,
+        });
+
+        res.json(result);
+      } catch (err) {
+        const formatted = formatGeminiError(err);
+        res.status(formatted.status).json({ error: formatted.message });
+      }
+    }
+  );
+
+  app.post('/api/projects/:hash/ai-viral-clips', async (req: Request, res: Response) => {
+    const hash = String(req.params.hash);
+    const project = readProjects().find((p) => p.video_hash === hash);
+    if (!project) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+
+    const retranscribe = Boolean(req.body?.retranscribe);
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+    const minClipSec = Number(req.body?.min_clip_sec || 6);
+    const maxClipSec = Number(req.body?.max_clip_sec || 45);
+    const maxClips = Number(req.body?.max_clips || 6);
+
+    try {
+      let transcript = readCachedTranscript(hash) as any;
+      const isDraftTranscript =
+        !transcript ||
+        transcript.model_name === 'local-timed-draft' ||
+        transcript.model_name === 'silent-track-draft';
+      let cacheHit = !retranscribe && !isDraftTranscript && Boolean(transcript?.segments?.length);
+      let note: string | undefined;
+
+      if (!cacheHit) {
+        if (!project.has_audio) {
+          if (!transcript?.segments?.length) {
+            res.status(422).json({
+              error: 'This video has no audio track to transcribe. Import an .srt transcript to run AI viral clip analysis.',
+            });
+            return;
+          }
+          note = 'No audio track detected; analyzed the cached transcript instead.';
+        } else {
+          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+          const aiTranscript = await transcribeVideoChunksWithGemini({
+            videoHash: hash,
+            sourcePath: project.local_path,
+            totalDurationSec: project.duration_sec,
+            chunks,
+          });
+
+          if (aiTranscript.segments.length > 0) {
+            transcript = aiTranscript;
+            writeCachedTranscript(aiTranscript);
+          } else if (transcript?.segments?.length) {
+            note =
+              'No spoken dialogue was detected in the audio track; analyzed existing cached transcript segments instead.';
+          } else {
+            res.status(422).json({
+              error: 'No spoken dialogue was detected in this video audio track. Upload a video with speech or import an .srt transcript.',
+            });
+            return;
+          }
+        }
+      }
+
+      const clips = await analyzeTranscriptForViralClips({
+        transcript,
+        prompt,
+        minClipSec,
+        maxClipSec,
+        maxClips,
+      });
+
+      project.clips = clips;
+      upsertProject(project);
+
+      res.json({
+        transcript,
+        clips,
+        cache_hit: cacheHit,
+        transcript_model: transcript.model_name || TRANSCRIBE_MODEL,
+        analysis_model: VIRAL_ANALYSIS_MODEL,
+        note,
+      });
+    } catch (err) {
+      const formatted = formatGeminiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
   });
 
   app.post('/api/projects/:hash/highlights', async (req: Request, res: Response) => {
@@ -847,8 +1088,8 @@ print(res.model_dump_json())
   const isAllowedLoopbackCallback = (url: string): boolean =>
     /^http:\/\/(127\.0\.0\.1|localhost):\d+\//i.test(url.trim());
 
-  // Allow Tauri desktop WebView (http://tauri.localhost / tauri://localhost) to call auth & social APIs
-  app.use(['/api/auth', '/api/social'], (req: Request, res: Response, next) => {
+  // Allow Tauri desktop WebView (http://tauri.localhost / tauri://localhost) to call auth, audio & social APIs
+  app.use(['/api/auth', '/api/social', '/api/audio'], (req: Request, res: Response, next) => {
     const origin = String(req.headers.origin || '');
     if (
       origin === 'http://tauri.localhost' ||
