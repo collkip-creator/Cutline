@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import type { User } from 'firebase/auth';
 import {
   CalendarClock,
   Check,
@@ -22,31 +21,22 @@ import type {
   PublishPlatform,
   PublishStatus,
 } from '../types';
-import { isTauriRuntime } from '../lib/api';
 import { findLocalExportByMatch } from '../lib/localExports';
 import {
   ALL_PLATFORMS,
   PLATFORM_SPECS,
   buildFormattedPostText,
   downloadShareKitPackage,
-  openPlatformStudio,
   parseHashtagInput,
   resolveExportMediaUrlFromPath,
   shareViaSystemSheet,
   supportsNavigatorShare,
 } from '../lib/socialShare';
-import {
-  type SocialConnectionRecord,
-  type SocialPlatformId,
-} from '../lib/firebase';
-import { SocialAccountsCard } from './SocialAccountsCard';
+import { ShareLandingModal } from './ShareLandingModal';
 
 interface PublishQueueViewProps {
   jobs: PublishJob[];
   channels: PublishChannelConfig[];
-  authUser: User | null;
-  authReady: boolean;
-  socialConnections: Record<SocialPlatformId, SocialConnectionRecord | null>;
   onRefresh: () => Promise<void>;
   onProcessDue: (includeFuture: boolean) => Promise<void>;
   onDispatchJob: (jobId: string) => Promise<void>;
@@ -90,9 +80,6 @@ const STATUS_DISPLAY: Record<PublishStatus, { label: string; colorClass: string 
 export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
   jobs,
   channels,
-  authUser,
-  authReady,
-  socialConnections,
   onRefresh,
   onProcessDue,
   onDispatchJob,
@@ -128,6 +115,13 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
   const [editScheduleMode, setEditScheduleMode] = useState<'now' | 'later'>('now');
   const [editScheduleIso, setEditScheduleIso] = useState('');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
+
+  // Pre-filled Share / Schedule Landing Modal
+  const [landingJobId, setLandingJobId] = useState<string | null>(null);
+  const landingJob = useMemo(
+    () => (landingJobId ? jobs.find((j) => j.job_id === landingJobId) || null : null),
+    [landingJobId, jobs]
+  );
 
   const channelMap = useMemo(() => {
     const map = new Map<PublishPlatform, PublishChannelConfig>();
@@ -220,17 +214,10 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
     }
   };
 
-  const handleJobShareKit = async (job: PublishJob, openStudioAfter = false) => {
-    setBusyJobId(openStudioAfter ? `launch-${job.job_id}` : `kit-${job.job_id}`);
+  const handleJobShareKit = async (job: PublishJob) => {
+    setBusyJobId(`kit-${job.job_id}`);
     setActionBanner(null);
-    const spec = PLATFORM_SPECS[job.platform];
     const postText = buildFormattedPostText(job.caption_text, job.tags);
-    const studioUrl = spec ? spec.buildStudioUrl(postText) : null;
-    const preOpenedTab =
-      openStudioAfter && studioUrl && typeof window !== 'undefined' && !isTauriRuntime
-        ? window.open('about:blank', '_blank')
-        : null;
-
     try {
       const cached = await findLocalExportByMatch(job.clip_id, job.video_path).catch(() => null);
       const mediaUrl = resolveExportMediaUrlFromPath(job.video_path);
@@ -242,14 +229,6 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
         fallbackMediaUrl: mediaUrl,
       });
 
-      if (openStudioAfter && studioUrl) {
-        if (preOpenedTab && !preOpenedTab.closed) {
-          preOpenedTab.location.href = studioUrl;
-        } else {
-          await openPlatformStudio(studioUrl);
-        }
-      }
-
       if (result.warning) {
         setActionBanner({
           kind: 'error',
@@ -258,17 +237,14 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
       } else {
         setActionBanner({
           kind: 'info',
-          text: openStudioAfter && spec
-            ? `Downloaded ${fileName}${result.copied ? ' & copied caption' : ''} — upload in ${spec.label} and paste (Ctrl+V).`
-            : result.downloaded
-              ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
-              : result.copied
-                ? 'Copied caption + hashtags to clipboard.'
-                : 'Ready to share.',
+          text: result.downloaded
+            ? `Saved ${fileName}${result.copied ? ' and copied caption + hashtags' : ''}.`
+            : result.copied
+              ? 'Copied caption + hashtags to clipboard.'
+              : 'Ready to share.',
         });
       }
     } catch (err: any) {
-      if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close();
       setActionBanner({ kind: 'error', text: err?.message || 'Failed to prepare share kit.' });
     } finally {
       setBusyJobId(null);
@@ -347,14 +323,6 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
 
   return (
     <div className="space-y-4">
-      {/* Unified Connected Social Accounts Card (TikTok, Instagram Reels, YouTube Shorts) */}
-      <SocialAccountsCard
-        authUser={authUser}
-        authReady={authReady}
-        connections={socialConnections}
-        onStatusBanner={setActionBanner}
-      />
-
       {/* Header & Controls */}
       <div className="bg-[#111724] border border-slate-800/90 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div>
@@ -737,7 +705,7 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
                           <button
                             type="button"
                             disabled={busyJobId === `kit-${job.job_id}`}
-                            onClick={() => handleJobShareKit(job, false)}
+                            onClick={() => handleJobShareKit(job)}
                             title="Copy post text + Download MP4"
                             className="p-1.5 text-slate-300 hover:text-white bg-[#0B0F17] border border-slate-800 rounded"
                           >
@@ -759,13 +727,24 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
                           {spec && (
                             <button
                               type="button"
-                              disabled={busyJobId === `launch-${job.job_id}`}
-                              onClick={() => handleJobShareKit(job, true)}
-                              title={`Download MP4, copy caption & ${spec.uploadLabel}`}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-emerald-300 hover:text-white bg-emerald-600/15 hover:bg-emerald-600/30 border border-emerald-500/35 rounded"
+                              onClick={() => setLandingJobId(job.job_id)}
+                              title={
+                                job.scheduled_at_iso
+                                  ? 'Open pre-filled Schedule Landing with clip, caption & 3 tags'
+                                  : 'Open pre-filled Share Landing with clip, caption & 3 tags'
+                              }
+                              className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded border whitespace-nowrap ${
+                                job.scheduled_at_iso
+                                  ? 'text-amber-200 hover:text-white bg-amber-500/15 hover:bg-amber-500/30 border-amber-500/40'
+                                  : 'text-emerald-300 hover:text-white bg-emerald-600/15 hover:bg-emerald-600/30 border-emerald-500/35'
+                              }`}
                             >
-                              <ExternalLink className="w-3 h-3" />
-                              {busyJobId === `launch-${job.job_id}` ? '...' : 'Share & Open'}
+                              {job.scheduled_at_iso ? (
+                                <CalendarClock className="w-3 h-3" />
+                              ) : (
+                                <ExternalLink className="w-3 h-3" />
+                              )}
+                              {job.scheduled_at_iso ? 'Schedule & Open' : 'Share & Open'}
                             </button>
                           )}
 
@@ -925,6 +904,27 @@ export const PublishQueueView: React.FC<PublishQueueViewProps> = ({
             </div>
           </form>
         </div>
+      )}
+
+      {landingJob && (
+        <ShareLandingModal
+          target={{
+            jobId: landingJob.job_id,
+            clipId: landingJob.clip_id,
+            clipTitle: landingJob.clip_title,
+            videoPath: landingJob.video_path,
+            platform: landingJob.platform,
+            captionText: landingJob.caption_text,
+            tags: landingJob.tags,
+            scheduledAtIso: landingJob.scheduled_at_iso,
+            status: landingJob.status,
+            publishedUrl: landingJob.published_url,
+          }}
+          channels={channels}
+          onUpdateJob={onUpdateJob}
+          onDispatchJob={onDispatchJob}
+          onClose={() => setLandingJobId(null)}
+        />
       )}
     </div>
   );

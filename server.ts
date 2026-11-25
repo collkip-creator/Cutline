@@ -1212,6 +1212,10 @@ print(res.model_dump_json())
       const rawPrivacy = String(req.body?.privacy || 'public').toLowerCase();
       const privacy: SocialPrivacy =
         rawPrivacy === 'private' || rawPrivacy === 'unlisted' ? rawPrivacy : 'public';
+      const scheduledAt =
+        typeof req.body?.scheduledAt === 'string' && req.body.scheduledAt.trim()
+          ? req.body.scheduledAt.trim()
+          : null;
       const connections = (req.body?.connections || {}) as Record<string, any>;
 
       // Execute per-platform independently so one failure never blocks or hides others
@@ -1224,6 +1228,7 @@ print(res.model_dump_json())
             localVideoPath: resolvedLocalPath,
             caption,
             privacy,
+            scheduledAt,
             firebaseIdToken,
             connectionOverride: connections?.[platform] || null,
           })

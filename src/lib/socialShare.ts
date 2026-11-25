@@ -22,7 +22,7 @@ export const PLATFORM_SPECS: Record<PublishPlatform, PlatformSpec> = {
     maxDurationSec: 60,
     maxChars: 100,
     idealAspect: '9:16',
-    defaultHashtags: ['Shorts'],
+    defaultHashtags: ['Shorts', 'viral', 'clips'],
     uploadLabel: 'Open YouTube Studio',
     buildStudioUrl: () => 'https://studio.youtube.com/',
   },
@@ -33,7 +33,7 @@ export const PLATFORM_SPECS: Record<PublishPlatform, PlatformSpec> = {
     maxDurationSec: 180,
     maxChars: 2200,
     idealAspect: '9:16',
-    defaultHashtags: ['fyp', 'viral'],
+    defaultHashtags: ['fyp', 'viral', 'trending'],
     uploadLabel: 'Open TikTok Upload',
     buildStudioUrl: () => 'https://www.tiktok.com/tiktokstudio/upload',
   },
@@ -44,7 +44,7 @@ export const PLATFORM_SPECS: Record<PublishPlatform, PlatformSpec> = {
     maxDurationSec: 90,
     maxChars: 2200,
     idealAspect: '9:16',
-    defaultHashtags: ['reels'],
+    defaultHashtags: ['reels', 'viral', 'instagram'],
     uploadLabel: 'Open Instagram',
     buildStudioUrl: () => 'https://www.instagram.com/',
   },
@@ -55,7 +55,7 @@ export const PLATFORM_SPECS: Record<PublishPlatform, PlatformSpec> = {
     maxDurationSec: 140,
     maxChars: 280,
     idealAspect: '16:9',
-    defaultHashtags: [],
+    defaultHashtags: ['video', 'clips', 'trending'],
     uploadLabel: 'Open X Compose',
     buildStudioUrl: (postText: string) =>
       `https://x.com/intent/tweet?text=${encodeURIComponent(postText.slice(0, 280))}`,
@@ -96,6 +96,62 @@ export function mergePlatformTags(
   return Array.from(
     new Set(combined.map((t) => t.trim().replace(/^#+/, '')).filter(Boolean))
   );
+}
+
+/**
+ * Guarantees a minimum/target set of 3 curated hashtags for the Share & Schedule Landing page,
+ * preserving user-defined tags first and topping up from channel/platform defaults.
+ */
+export function ensureThreeTags(
+  userTags: string[],
+  platform: PublishPlatform,
+  channelDefaults?: string[],
+  targetCount = 3
+): string[] {
+  const normalizedUser = userTags
+    .map((t) => t.trim().replace(/^#+/, ''))
+    .filter(Boolean);
+  const fallbacks = [
+    ...(channelDefaults || []),
+    ...PLATFORM_SPECS[platform].defaultHashtags,
+    'clips',
+    'highlights',
+    'viral',
+  ]
+    .map((t) => t.trim().replace(/^#+/, ''))
+    .filter(Boolean);
+
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const tag of [...normalizedUser, ...fallbacks]) {
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(tag);
+    if (unique.length >= Math.max(targetCount, normalizedUser.length)) {
+      break;
+    }
+  }
+  return unique.slice(0, targetCount);
+}
+
+export function mapPublishToSocialPlatform(
+  platform: PublishPlatform
+): 'youtube' | 'tiktok' | 'instagram' | null {
+  if (platform === 'youtube_shorts') return 'youtube';
+  if (platform === 'tiktok') return 'tiktok';
+  if (platform === 'instagram_reels') return 'instagram';
+  return null;
+}
+
+export function toLocalDatetimeInputValue(isoOrMs?: string | number | null): string {
+  const date = isoOrMs ? new Date(isoOrMs) : new Date(Date.now() + 3600_000);
+  if (Number.isNaN(date.getTime())) {
+    return toLocalDatetimeInputValue(Date.now() + 3600_000);
+  }
+  const offsetMin = date.getTimezoneOffset();
+  const local = new Date(date.getTime() - offsetMin * 60_000);
+  return local.toISOString().slice(0, 16);
 }
 
 export function buildFormattedPostText(caption: string, tags: string[]): string {

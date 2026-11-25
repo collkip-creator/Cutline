@@ -1,19 +1,14 @@
 import React, { useMemo, useState } from 'react';
-import type { User } from 'firebase/auth';
 import {
   AlertTriangle,
   Check,
-  CheckCircle2,
   Copy,
   Download,
   ExternalLink,
-  Link2,
-  LogIn,
   Send,
   Share2,
   Sparkles,
   X,
-  XCircle,
 } from 'lucide-react';
 import type {
   AspectRatio,
@@ -27,19 +22,8 @@ import type {
 import {
   apiFetch,
   apiUrl,
-  isTauriRuntime,
-  openExternalBrowserUrl,
   readJsonResponse,
-  socialApiFetch,
 } from '../lib/api';
-import { startDesktopBrowserGoogleSignIn } from '../lib/desktopAuth';
-import {
-  classifyFirebaseAuthError,
-  saveSocialConnection,
-  signInWithGoogleForSocial,
-  type SocialConnectionRecord,
-  type SocialPlatformId,
-} from '../lib/firebase';
 import {
   buildExportFilename,
   cacheExportInLocalStorage,
@@ -51,39 +35,16 @@ import {
   PLATFORM_SPECS,
   buildFormattedPostText,
   downloadShareKitPackage,
+  ensureThreeTags,
   getPlatformWarnings,
-  mergePlatformTags,
-  openPlatformStudio,
   parseHashtagInput,
   shareViaSystemSheet,
   supportsNativeFileShare,
   supportsNavigatorShare,
+  toLocalDatetimeInputValue,
   trimCopyForLimit,
 } from '../lib/socialShare';
-
-type SocialPrivacy = 'public' | 'unlisted' | 'private';
-
-interface DirectPublishResult {
-  platform: SocialPlatformId;
-  ok: boolean;
-  postId?: string;
-  publishedUrl?: string;
-  status: string;
-  error?: string;
-  tokenRefreshed?: boolean;
-  refreshedConnection?: Omit<SocialConnectionRecord, 'updatedAtIso'>;
-}
-
-const DIRECT_PROVIDERS: Array<{
-  id: SocialPlatformId;
-  label: string;
-  accent: string;
-  maxCaptionChars: number;
-}> = [
-  { id: 'tiktok', label: 'TikTok', accent: 'text-cyan-300', maxCaptionChars: 2200 },
-  { id: 'instagram', label: 'Instagram Reels', accent: 'text-pink-300', maxCaptionChars: 2200 },
-  { id: 'youtube', label: 'YouTube Shorts', accent: 'text-rose-300', maxCaptionChars: 100 },
-];
+import { ShareLandingModal, type ShareLandingTarget } from './ShareLandingModal';
 
 interface SharePublishModalProps {
   clip: ClipCandidate;
@@ -93,9 +54,6 @@ interface SharePublishModalProps {
   burnCaptions: boolean;
   lastExport: ExportResult | null;
   channels: PublishChannelConfig[];
-  authUser: User | null;
-  socialConnections: Record<SocialPlatformId, SocialConnectionRecord | null>;
-  onGoToAccounts?: () => void;
   onExportCompleted: (result: ExportResult) => void;
   onQueueCompleted: (queuedCount: number, dispatchedNow: boolean) => Promise<void>;
   onClose: () => void;
@@ -109,33 +67,10 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   burnCaptions,
   lastExport,
   channels,
-  authUser,
-  socialConnections,
-  onGoToAccounts,
   onExportCompleted,
   onQueueCompleted,
   onClose,
 }) => {
-  const connectedProviderIds = useMemo(
-    () =>
-      DIRECT_PROVIDERS.filter((p) => Boolean(socialConnections[p.id])).map((p) => p.id),
-    [socialConnections]
-  );
-
-  const [shareTab, setShareTab] = useState<'direct' | 'queue'>(() =>
-    connectedProviderIds.length > 0 ? 'direct' : 'queue'
-  );
-
-  // Direct OAuth publish state
-  const [directPlatforms, setDirectPlatforms] = useState<SocialPlatformId[]>(() =>
-    connectedProviderIds.length > 0 ? connectedProviderIds : []
-  );
-  const [privacy, setPrivacy] = useState<SocialPrivacy>('public');
-  const [isPublishingDirect, setIsPublishingDirect] = useState(false);
-  const [directResults, setDirectResults] = useState<DirectPublishResult[] | null>(null);
-  const [isSigningIn, setIsSigningIn] = useState(false);
-  const [modalPopupBlocked, setModalPopupBlocked] = useState(false);
-
   // Queue / Share Kit state
   const [selectedPlatforms, setSelectedPlatforms] = useState<PublishPlatform[]>(['youtube_shorts']);
   const [previewPlatform, setPreviewPlatform] = useState<PublishPlatform>('youtube_shorts');
@@ -148,14 +83,14 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const [appendPlatformDefaults, setAppendPlatformDefaults] = useState(true);
   const [scheduleMode, setScheduleMode] = useState<'now' | 'dispatch' | 'later'>('now');
   const [scheduleIso, setScheduleIso] = useState<string>(() =>
-    new Date(Date.now() + 3600_000).toISOString().slice(0, 16)
+    toLocalDatetimeInputValue(Date.now() + 3600_000)
   );
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [instantBusy, setInstantBusy] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
   const [copiedCopy, setCopiedCopy] = useState(false);
-  const [blockedStudioUrl, setBlockedStudioUrl] = useState<{ label: string; url: string } | null>(null);
+  const [landingTarget, setLandingTarget] = useState<ShareLandingTarget | null>(null);
 
   const clipDurationSec = Math.max(0.5, clip.end_sec - clip.start_sec);
   const parsedUserTags = useMemo(() => parseHashtagInput(hashtagInput), [hashtagInput]);
@@ -170,25 +105,20 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const previewChannel = channelMap.get(previewPlatform);
   const previewTags = useMemo(
     () =>
-      mergePlatformTags(
-        parsedUserTags,
-        previewPlatform,
-        appendPlatformDefaults,
-        previewChannel?.default_hashtags
-      ),
+      appendPlatformDefaults
+        ? ensureThreeTags(
+            parsedUserTags,
+            previewPlatform,
+            previewChannel?.default_hashtags,
+            3
+          )
+        : parsedUserTags,
     [parsedUserTags, previewPlatform, appendPlatformDefaults, previewChannel]
   );
   const previewPostText = useMemo(
     () => buildFormattedPostText(caption, previewTags),
     [caption, previewTags]
   );
-
-  const toggleDirectPlatform = (pid: SocialPlatformId) => {
-    if (!socialConnections[pid]) return;
-    setDirectPlatforms((prev) =>
-      prev.includes(pid) ? prev.filter((p) => p !== pid) : [...prev, pid]
-    );
-  };
 
   const togglePlatform = (platform: PublishPlatform) => {
     setSelectedPlatforms((prev) => {
@@ -234,107 +164,6 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
     return expData;
   };
 
-  const handleDirectPublish = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!authUser) {
-      setStatusMessage({
-        kind: 'error',
-        text: 'Sign in with Google first to publish using your connected social accounts.',
-      });
-      return;
-    }
-    if (directPlatforms.length === 0) {
-      setStatusMessage({
-        kind: 'error',
-        text: 'Select at least one connected social account above.',
-      });
-      return;
-    }
-
-    setIsPublishingDirect(true);
-    setDirectResults(null);
-    setStatusMessage(null);
-    try {
-      const exp = await ensureExportedAsset();
-      const idToken = await authUser.getIdToken();
-      const fullCaption = buildFormattedPostText(caption, parsedUserTags);
-
-      let publishVideoUrl = exp.video_url;
-      let publishLocalPath: string | undefined = exp.video_path;
-
-      // In Tauri desktop runtime, the rendered MP4 lives on the user's PC (127.0.0.1:43111);
-      // upload it to the cloud Express backend so TikTok/Instagram Reels/YouTube can access it.
-      if (isTauriRuntime) {
-        const localRes = await fetch(apiUrl(exp.video_url));
-        if (!localRes.ok) {
-          throw new Error(`Could not read exported clip from local sidecar (${localRes.status}).`);
-        }
-        const blob = await localRes.blob();
-        const form = new FormData();
-        form.append('video', blob, buildExportFilename(clip.id, exp.aspect_ratio, 'mp4'));
-        const stageRes = await socialApiFetch('/api/social/upload-media', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${idToken}` },
-          body: form,
-        });
-        const staged = await readJsonResponse<{ videoUrl: string; localVideoPath: string }>(stageRes);
-        publishVideoUrl = staged.videoUrl;
-        publishLocalPath = staged.localVideoPath;
-      }
-
-      const connectionPayload: Partial<Record<SocialPlatformId, SocialConnectionRecord>> = {};
-      for (const pid of directPlatforms) {
-        const conn = socialConnections[pid];
-        if (conn) connectionPayload[pid] = conn;
-      }
-
-      const res = await socialApiFetch('/api/social/publish', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({
-          userId: authUser.uid,
-          platforms: directPlatforms,
-          videoUrl: publishVideoUrl,
-          localVideoPath: publishLocalPath,
-          caption: fullCaption,
-          privacy,
-          connections: connectionPayload,
-        }),
-      });
-      const data = await readJsonResponse<{ results: DirectPublishResult[] }>(res);
-      const results = data.results || [];
-      setDirectResults(results);
-
-      // Persist any refreshed OAuth tokens back to Firestore
-      for (const r of results) {
-        if (r.refreshedConnection) {
-          try {
-            await saveSocialConnection(authUser.uid, r.refreshedConnection);
-          } catch {
-            // Token persistence error is non-fatal for display
-          }
-        }
-      }
-
-      const succeeded = results.filter((r) => r.ok).length;
-      const failed = results.length - succeeded;
-      setStatusMessage({
-        kind: failed > 0 && succeeded === 0 ? 'error' : 'info',
-        text:
-          failed === 0
-            ? `Published clip to ${succeeded} platform${succeeded === 1 ? '' : 's'}.`
-            : `Completed: ${succeeded} succeeded, ${failed} failed. Inspect per-platform results below.`,
-      });
-    } catch (err: any) {
-      setStatusMessage({ kind: 'error', text: err?.message || 'Direct social publish failed.' });
-    } finally {
-      setIsPublishingDirect(false);
-    }
-  };
-
   const handleCopyPostText = async () => {
     try {
       await navigator.clipboard?.writeText(previewPostText);
@@ -352,7 +181,6 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   const handleDownloadShareKit = async () => {
     setInstantBusy('kit');
     setStatusMessage(null);
-    setBlockedStudioUrl(null);
     try {
       const exp = await ensureExportedAsset();
       const cached = await getLocalExport(makeLocalExportKey(project.video_hash, exp)).catch(() => null);
@@ -376,50 +204,31 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
     }
   };
 
-  const handleQuickShareAndOpen = async () => {
+  const handleOpenLandingPage = async () => {
     setInstantBusy('launch');
     setStatusMessage(null);
-    setBlockedStudioUrl(null);
-
-    const studioUrl = activePreviewSpec.buildStudioUrl(previewPostText);
-    // Pre-open tab synchronously on Web so browser popup blockers don't block after async export
-    const preOpenedTab =
-      !isTauriRuntime && typeof window !== 'undefined'
-        ? window.open('about:blank', '_blank')
-        : null;
-
     try {
       const exp = await ensureExportedAsset();
       const cached = await getLocalExport(makeLocalExportKey(project.video_hash, exp)).catch(() => null);
-      const filename = buildExportFilename(clip.id, exp.aspect_ratio, 'mp4');
-      const res = await downloadShareKitPackage({
-        filename,
-        postText: previewPostText,
+      const scheduledIso =
+        scheduleMode === 'later' && scheduleIso && !Number.isNaN(Date.parse(scheduleIso))
+          ? new Date(scheduleIso).toISOString()
+          : null;
+
+      setLandingTarget({
+        clipId: clip.id,
+        clipTitle: clip.title,
+        videoPath: exp.video_path,
+        videoUrl: exp.video_url,
         videoBlob: cached?.video_blob || null,
-        fallbackMediaUrl: apiUrl(exp.video_url),
-      });
-
-      let opened = false;
-      if (isTauriRuntime) {
-        opened = await openExternalBrowserUrl(studioUrl);
-      } else if (preOpenedTab && !preOpenedTab.closed) {
-        preOpenedTab.location.href = studioUrl;
-        opened = true;
-      }
-
-      if (!opened) {
-        setBlockedStudioUrl({ label: activePreviewSpec.uploadLabel, url: studioUrl });
-      }
-
-      setStatusMessage({
-        kind: 'info',
-        text: opened
-          ? `Downloaded ${filename}${res.copied ? ' & copied caption/tags' : ''} — upload it in ${activePreviewSpec.label} and paste (Ctrl+V / Cmd+V).`
-          : `Downloaded ${filename}${res.copied ? ' & copied caption/tags' : ''}. Click "${activePreviewSpec.uploadLabel}" below to finish posting.`,
+        aspectRatio: exp.aspect_ratio,
+        platform: previewPlatform,
+        captionText: caption.trim() || clip.title,
+        tags: previewTags,
+        scheduledAtIso: scheduledIso,
       });
     } catch (err: any) {
-      if (preOpenedTab && !preOpenedTab.closed) preOpenedTab.close();
-      setStatusMessage({ kind: 'error', text: err?.message || 'Quick Share failed.' });
+      setStatusMessage({ kind: 'error', text: err?.message || 'Failed to prepare landing page.' });
     } finally {
       setInstantBusy(null);
     }
@@ -464,11 +273,11 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       const createdIds: string[] = [];
       for (const platform of selectedPlatforms) {
         const ch = channelMap.get(platform);
-        const tagsForPlatform = mergePlatformTags(
+        const tagsForPlatform = ensureThreeTags(
           parsedUserTags,
           platform,
-          appendPlatformDefaults,
-          ch?.default_hashtags
+          ch?.default_hashtags,
+          3
         );
         const captionForPlatform =
           platform === 'x_video'
@@ -521,7 +330,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
       aria-label={`Share & Publish ${clip.id}`}
     >
       <form
-        onSubmit={shareTab === 'direct' ? handleDirectPublish : handleSubmitQueue}
+        onSubmit={handleSubmitQueue}
         className="w-full max-w-2xl bg-[#111724] border border-slate-700 rounded-lg overflow-hidden shadow-2xl flex flex-col max-h-[92vh]"
       >
         <div className="px-5 py-3.5 border-b border-slate-800 bg-[#0B0F17] flex items-center justify-between gap-3">
@@ -543,319 +352,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
           </button>
         </div>
 
-        {/* Workflow Switcher */}
-        <div className="px-5 pt-3 pb-2 border-b border-slate-800/80 bg-[#0D131F] flex flex-wrap items-center justify-between gap-2">
-          <div className="inline-flex items-center gap-1 p-0.5 bg-[#0B0F17] border border-slate-800 rounded">
-            <button
-              type="button"
-              onClick={() => {
-                setShareTab('queue');
-                setStatusMessage(null);
-              }}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-                shareTab === 'queue'
-                  ? 'bg-emerald-600/20 text-emerald-200 border border-emerald-500/40'
-                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
-              }`}
-            >
-              Share Kit & Queue (Free)
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShareTab('direct');
-                setStatusMessage(null);
-              }}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
-                shareTab === 'direct'
-                  ? 'bg-blue-600/25 text-blue-200 border border-blue-500/40'
-                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
-              }`}
-            >
-              Direct OAuth ({connectedProviderIds.length}/3)
-            </button>
-          </div>
-
-          {onGoToAccounts && (
-            <button
-              type="button"
-              onClick={onGoToAccounts}
-              className="inline-flex items-center gap-1 text-[11px] text-blue-400 hover:text-blue-300"
-            >
-              <Link2 className="w-3 h-3" />
-              Manage Social Accounts
-            </button>
-          )}
-        </div>
-
         <div className="p-5 overflow-y-auto space-y-4 text-xs">
-          {shareTab === 'direct' ? (
-            <>
-              {!authUser && (
-                <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 space-y-2.5">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <div className="font-semibold text-slate-200">
-                        Sign in with Google to unlock Direct OAuth Publishing
-                      </div>
-                      <div className="text-[11px] text-slate-400 mt-0.5">
-                        Your connected TikTok, Instagram Reels, and YouTube Shorts tokens are loaded
-                        from Firestore.
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={isSigningIn}
-                      onClick={async () => {
-                        if (isTauriRuntime) {
-                          setIsSigningIn(true);
-                          setModalPopupBlocked(false);
-                          setStatusMessage({
-                            kind: 'info',
-                            text: 'Complete Google Sign-In in your system browser tab...',
-                          });
-                          startDesktopBrowserGoogleSignIn({
-                            onSuccess: () => {
-                              setIsSigningIn(false);
-                              setStatusMessage({
-                                kind: 'info',
-                                text: 'Signed in via browser. Select your connected platforms below.',
-                              });
-                            },
-                            onError: (msg) => {
-                              setIsSigningIn(false);
-                              setStatusMessage({ kind: 'error', text: msg });
-                            },
-                          });
-                          return;
-                        }
-                        const signInPromise = signInWithGoogleForSocial();
-                        setIsSigningIn(true);
-                        setModalPopupBlocked(false);
-                        setStatusMessage(null);
-                        try {
-                          await signInPromise;
-                        } catch (err: unknown) {
-                          const info = classifyFirebaseAuthError(err);
-                          setModalPopupBlocked(info.isPopupBlocked);
-                          setStatusMessage({
-                            kind: 'error',
-                            text: info.message,
-                          });
-                        } finally {
-                          setIsSigningIn(false);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded"
-                    >
-                      <LogIn className="w-3.5 h-3.5" />
-                      {isSigningIn
-                        ? isTauriRuntime
-                          ? 'Waiting for Browser...'
-                          : 'Signing in...'
-                        : isTauriRuntime
-                          ? 'Sign in via Browser'
-                          : 'Sign in with Google'}
-                    </button>
-                  </div>
-                  {modalPopupBlocked && typeof window !== 'undefined' && (
-                    <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800 text-[11px]">
-                      <a
-                        href={window.location.href}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded"
-                      >
-                        <ExternalLink className="w-3 h-3" />
-                        Open App in New Tab
-                      </a>
-                      <span className="text-slate-400">
-                        Opening in a new tab bypasses embedded iframe popup blockers.
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Connected Accounts Multi-Select */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-slate-300 font-medium">
-                    Select Connected Platforms ({directPlatforms.length} selected)
-                  </label>
-                  {connectedProviderIds.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setDirectPlatforms(connectedProviderIds)}
-                      className="text-[11px] text-blue-400 hover:text-blue-300"
-                    >
-                      Select all connected ({connectedProviderIds.length})
-                    </button>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                  {DIRECT_PROVIDERS.map((prov) => {
-                    const conn = socialConnections[prov.id];
-                    const checked = directPlatforms.includes(prov.id);
-                    return (
-                      <button
-                        key={prov.id}
-                        type="button"
-                        disabled={!conn}
-                        onClick={() => toggleDirectPlatform(prov.id)}
-                        className={`p-3 rounded border text-left transition-colors ${
-                          !conn
-                            ? 'bg-[#0B0F17]/60 border-slate-800/80 opacity-60 cursor-not-allowed'
-                            : checked
-                              ? 'bg-blue-600/20 border-blue-500 text-white'
-                              : 'bg-[#0B0F17] border-slate-800 text-slate-300 hover:border-slate-700'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className={`font-semibold text-xs ${prov.accent}`}>
-                            {prov.label}
-                          </span>
-                          <span
-                            className={`w-3.5 h-3.5 rounded-sm border flex items-center justify-center ${
-                              checked
-                                ? 'bg-blue-500 border-blue-400 text-white'
-                                : 'border-slate-600'
-                            }`}
-                          >
-                            {checked && <Check className="w-2.5 h-2.5" />}
-                          </span>
-                        </div>
-                        <div className="text-[11px] mt-1 truncate text-slate-300">
-                          {conn ? conn.handle || conn.accountName : 'Not connected'}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {connectedProviderIds.length === 0 && authUser && (
-                  <div className="bg-[#0B0F17] border border-slate-800 rounded p-3 flex items-center justify-between gap-3 text-[11px] text-slate-300">
-                    <span>No social accounts are connected yet. Connect TikTok, Instagram, or YouTube in Social Accounts.</span>
-                    {onGoToAccounts && (
-                      <button
-                        type="button"
-                        onClick={onGoToAccounts}
-                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded shrink-0"
-                      >
-                        Connect Accounts
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Caption / Title + Hashtags + Privacy */}
-              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-                <div className="sm:col-span-8 space-y-1.5">
-                  <label className="block text-slate-300 font-medium">
-                    Caption / YouTube Title
-                  </label>
-                  <textarea
-                    rows={3}
-                    value={caption}
-                    onChange={(e) => setCaption(e.target.value)}
-                    placeholder="Enter your hook caption or Shorts title..."
-                    className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-slate-100 outline-none resize-none"
-                  />
-                </div>
-
-                <div className="sm:col-span-4 space-y-2">
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1">Hashtags</label>
-                    <input
-                      type="text"
-                      value={hashtagInput}
-                      onChange={(e) => setHashtagInput(e.target.value)}
-                      placeholder="#Shorts #creator"
-                      className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 font-mono text-[11px] text-slate-200 outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1">Visibility</label>
-                    <select
-                      value={privacy}
-                      onChange={(e) => setPrivacy(e.target.value as SocialPrivacy)}
-                      className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-2.5 py-1.5 text-slate-100 outline-none"
-                    >
-                      <option value="public">Public</option>
-                      <option value="unlisted">Unlisted (YouTube / Mutual on TikTok)</option>
-                      <option value="private">Private / Self Only</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              {/* Per-Platform Dispatch Results */}
-              {directResults && directResults.length > 0 && (
-                <div className="space-y-2 bg-[#0B0F17] border border-slate-800 rounded p-3">
-                  <div className="text-[11px] font-semibold text-slate-300">
-                    Per-Platform Publish Results
-                  </div>
-                  <div className="space-y-2">
-                    {directResults.map((res) => {
-                      const meta = DIRECT_PROVIDERS.find((p) => p.id === res.platform);
-                      return (
-                        <div
-                          key={res.platform}
-                          className={`p-2.5 rounded border flex items-start justify-between gap-3 ${
-                            res.ok
-                              ? 'bg-emerald-950/30 border-emerald-500/35 text-emerald-200'
-                              : 'bg-rose-950/35 border-rose-500/40 text-rose-200'
-                          }`}
-                        >
-                          <div className="flex items-start gap-2 min-w-0">
-                            {res.ok ? (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                            ) : (
-                              <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                            )}
-                            <div className="min-w-0">
-                              <div className="font-semibold text-xs flex flex-wrap items-center gap-2">
-                                <span>{meta?.label || res.platform}</span>
-                                <span className="font-mono text-[10px] opacity-80">
-                                  {res.status}
-                                  {res.tokenRefreshed ? ' · token refreshed' : ''}
-                                </span>
-                              </div>
-                              {res.error && (
-                                <div className="text-[11px] text-rose-300 mt-0.5 break-words">
-                                  {res.error}
-                                </div>
-                              )}
-                              {res.postId && (
-                                <div className="font-mono text-[10px] text-emerald-300/90 mt-0.5">
-                                  ID: {res.postId}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-
-                          {res.publishedUrl && (
-                            <a
-                              href={res.publishedUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 text-[11px] text-emerald-200 shrink-0"
-                            >
-                              <ExternalLink className="w-3 h-3" />
-                              View
-                            </a>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <>
               {/* Multi-Platform Target Picker */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
@@ -1008,18 +505,20 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
                   );
                 })()}
 
-                {/* Instant Share Now Row (Zero-Config Local & Web Actions) */}
+                {/* Instant Share Now Row (Opens Pre-Filled Share / Schedule Landing Page) */}
                 <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800/80">
                   <button
                     type="button"
                     disabled={instantBusy !== null}
-                    onClick={handleQuickShareAndOpen}
+                    onClick={handleOpenLandingPage}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-white font-semibold transition-colors"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
                     {instantBusy === 'launch'
-                      ? 'Preparing MP4...'
-                      : `Share to ${activePreviewSpec.shortLabel} (Download + Copy + Open)`}
+                      ? 'Preparing Clip...'
+                      : scheduleMode === 'later'
+                        ? `Open Schedule Landing (${activePreviewSpec.shortLabel})`
+                        : `Share & Open ${activePreviewSpec.shortLabel} Landing`}
                   </button>
 
                   <button
@@ -1061,31 +560,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
                           : 'Share Text'}
                     </button>
                   )}
-
-                  <button
-                    type="button"
-                    onClick={() => openPlatformStudio(activePreviewSpec.buildStudioUrl(previewPostText))}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800/70 hover:bg-slate-700 border border-slate-700 rounded text-slate-200 ml-auto"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    {activePreviewSpec.uploadLabel}
-                  </button>
                 </div>
-
-                {blockedStudioUrl && (
-                  <div className="flex items-center justify-between gap-2 pt-1 text-[11px] text-amber-200">
-                    <span>Browser blocked opening the studio tab automatically.</span>
-                    <a
-                      href={blockedStudioUrl.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded shrink-0"
-                    >
-                      <ExternalLink className="w-3 h-3" />
-                      {blockedStudioUrl.label}
-                    </a>
-                  </div>
-                )}
               </div>
 
               {/* Queue Dispatch Timing */}
@@ -1135,8 +610,6 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
                   />
                 )}
               </div>
-            </>
-          )}
 
           {statusMessage && (
             <div
@@ -1163,36 +636,31 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
               onClick={onClose}
               className="px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
             >
-              {directResults ? 'Done' : 'Cancel'}
+              Cancel
             </button>
-            {shareTab === 'direct' ? (
-              <button
-                type="submit"
-                disabled={isPublishingDirect || !authUser || directPlatforms.length === 0}
-                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
-              >
-                <Send className="w-3.5 h-3.5" />
-                {isPublishingDirect
-                  ? 'Rendering & Publishing...'
-                  : `Publish to ${directPlatforms.length} Platform${directPlatforms.length === 1 ? '' : 's'}`}
-              </button>
-            ) : (
-              <button
-                type="submit"
-                disabled={isSubmitting || selectedPlatforms.length === 0}
-                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
-              >
-                <Send className="w-3.5 h-3.5" />
-                {isSubmitting
-                  ? 'Rendering & Queuing...'
-                  : scheduleMode === 'dispatch'
-                    ? `Publish to ${selectedPlatforms.length} Channel${selectedPlatforms.length > 1 ? 's' : ''}`
-                    : `Add ${selectedPlatforms.length} Job${selectedPlatforms.length > 1 ? 's' : ''} to Queue`}
-              </button>
-            )}
+            <button
+              type="submit"
+              disabled={isSubmitting || selectedPlatforms.length === 0}
+              className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
+            >
+              <Send className="w-3.5 h-3.5" />
+              {isSubmitting
+                ? 'Rendering & Queuing...'
+                : scheduleMode === 'dispatch'
+                  ? `Publish to ${selectedPlatforms.length} Channel${selectedPlatforms.length > 1 ? 's' : ''}`
+                  : `Add ${selectedPlatforms.length} Job${selectedPlatforms.length > 1 ? 's' : ''} to Queue`}
+            </button>
           </div>
         </div>
       </form>
+
+      {landingTarget && (
+        <ShareLandingModal
+          target={landingTarget}
+          channels={channels}
+          onClose={() => setLandingTarget(null)}
+        />
+      )}
     </div>
   );
 };

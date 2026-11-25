@@ -70,6 +70,7 @@ export interface SocialProviderAdapter {
     localVideoPath?: string;
     caption: string;
     privacy: SocialPrivacy;
+    scheduledAt?: string | null;
   }): Promise<{ postId?: string; publishedUrl?: string; status: string }>;
 }
 
@@ -685,11 +686,31 @@ export const youtubeProvider: SocialProviderAdapter = {
     };
   },
 
-  async publishVideo({ accessToken, videoUrl, localVideoPath, caption, privacy }) {
+  async publishVideo({ accessToken, videoUrl, localVideoPath, caption, privacy, scheduledAt }) {
     const videoBytes = await readVideoBinary(videoUrl, localVideoPath);
     const lines = caption.trim().split('\n');
     const title = (lines[0] || 'Cutline Short').slice(0, 100);
+    const extractedTags = Array.from(
+      new Set(
+        (caption.match(/#([A-Za-z0-9_]+)/g) || [])
+          .map((t) => t.replace(/^#+/, '').trim())
+          .filter(Boolean)
+      )
+    );
+    const ytTags = Array.from(new Set(['Shorts', ...extractedTags])).slice(0, 15);
     const description = caption.includes('#Shorts') ? caption : `${caption}\n\n#Shorts`;
+
+    // YouTube Data API v3 requires privacyStatus: 'private' whenever publishAt is supplied
+    const parsedScheduleMs = scheduledAt ? Date.parse(scheduledAt) : NaN;
+    const isScheduledFuture =
+      Number.isFinite(parsedScheduleMs) && parsedScheduleMs > Date.now() + 60_000;
+    const youtubeStatus: Record<string, any> = {
+      privacyStatus: isScheduledFuture ? 'private' : privacy,
+      selfDeclaredMadeForKids: false,
+    };
+    if (isScheduledFuture) {
+      youtubeStatus.publishAt = new Date(parsedScheduleMs).toISOString();
+    }
 
     // Resumable upload init
     const initRes = await fetch(
@@ -706,13 +727,10 @@ export const youtubeProvider: SocialProviderAdapter = {
           snippet: {
             title,
             description: description.slice(0, 5000),
-            tags: ['Shorts'],
+            tags: ytTags,
             categoryId: '22',
           },
-          status: {
-            privacyStatus: privacy,
-            selfDeclaredMadeForKids: false,
-          },
+          status: youtubeStatus,
         }),
       }
     );
@@ -748,7 +766,7 @@ export const youtubeProvider: SocialProviderAdapter = {
     return {
       postId: uploadJson.id,
       publishedUrl: `https://youtube.com/shorts/${uploadJson.id}`,
-      status: 'published',
+      status: isScheduledFuture ? 'scheduled' : 'published',
     };
   },
 };
@@ -823,6 +841,7 @@ export async function publishClipToPlatform(params: {
   localVideoPath?: string;
   caption: string;
   privacy: SocialPrivacy;
+  scheduledAt?: string | null;
   firebaseIdToken?: string;
   connectionOverride?: ServerSocialConnection | null;
 }): Promise<SocialPublishResult> {
@@ -833,6 +852,7 @@ export async function publishClipToPlatform(params: {
     localVideoPath,
     caption,
     privacy,
+    scheduledAt,
     firebaseIdToken,
     connectionOverride,
   } = params;
@@ -905,6 +925,7 @@ export async function publishClipToPlatform(params: {
       localVideoPath,
       caption,
       privacy,
+      scheduledAt,
     });
 
     const refreshedConn: ServerSocialConnection | undefined = tokenRefreshed
