@@ -15,14 +15,20 @@
     "clips": [
       {
         "id": "clip_01",
-        "title": "Silent video track detected for silent_clip",
-        "start_sec": 0.03,
-        "end_sec": 12,
-        "hook_score": 65,
-        "reason": "Matched 1 brief terms and 0 retention cues.",
-        "caption_hook": "SILENT VIDEO TRACK DETECTED FOR SILENT_CLIP",
+        "title": "How to Handle a Silent Video Track",
+        "category": "lesson",
+        "sentiment": "Neutral",
+        "start_sec": 0.15,
+        "end_sec": 11.82,
+        "hook_score": 4,
+        "lesson_score": 7,
+        "entertainment_score": 2,
+        "caption_hook": "NO AUDIO? DO THIS FIRST!",
+        "reason": "This full-length segment provides a clear, actionable workflow instruction for handling silent video tracks before exporting.",
         "tags": [
-          "silent"
+          "#VideoEditing",
+          "#ShortsTips",
+          "#ContentCreation"
         ],
         "snapped_to_words": true
       }
@@ -41,7 +47,27 @@
     "fps": 25,
     "has_audio": true,
     "created_at_iso": "2026-11-20T08:56:29.234Z",
-    "clips": []
+    "clips": [
+      {
+        "id": "clip_01",
+        "title": "Local Video Analysis Without Cloud Rendering",
+        "category": "hook",
+        "sentiment": "Positive",
+        "start_sec": 0.15,
+        "end_sec": 4.88,
+        "hook_score": 8,
+        "lesson_score": 9,
+        "entertainment_score": 6,
+        "caption_hook": "ZERO CLOUD VIDEO EDITING WORKFLOW",
+        "reason": "The clip opens with a strong privacy and speed hook about zero cloud rendering and rapidly delivers a complete local FFmpeg export workflow.",
+        "tags": [
+          "#VideoEditing",
+          "#FFmpeg",
+          "#LocalAI"
+        ],
+        "snapped_to_words": true
+      }
+    ]
   },
   {
     "video_hash": "f5891dfc887461f285684a80a1063a4790a8f14995efa1dd448702442cbcd064",
@@ -58,66 +84,59 @@
     "created_at_iso": "2026-11-20T07:13:32.079Z",
     "clips": [
       {
-        "id": "clip_02",
-        "title": "Sending gigabytes of raw 4K footage to remote servers wa",
-        "start_sec": 5.03,
-        "end_sec": 14.993,
-        "hook_score": 98,
-        "reason": "Matched 3 brief terms and 3 retention cues.",
-        "caption_hook": "SENDING GIGABYTES OF RAW 4K FOOTAGE TO REMOTE SE",
+        "id": "clip_01",
+        "title": "Why Cloud AI Editors Stall",
+        "category": "hook",
+        "sentiment": "Negative",
+        "start_sec": 0.15,
+        "end_sec": 9.84,
+        "hook_score": 9,
+        "lesson_score": 7,
+        "entertainment_score": 6,
+        "caption_hook": "STOP UPLOADING 4K FOOTAGE TO CLOUD AI",
+        "reason": "Opens with a relatable question and immediately exposes a frustrating 4K upload bottleneck that hooks video editors.",
         "tags": [
-          "and",
-          "instead",
-          "latency",
-          "local"
+          "#VideoEditing",
+          "#AIVideo",
+          "#TechTips"
+        ],
+        "snapped_to_words": true
+      },
+      {
+        "id": "clip_02",
+        "title": "Zero-Millisecond Local AI Caching",
+        "category": "insight",
+        "sentiment": "Positive",
+        "start_sec": 10.15,
+        "end_sec": 19.83,
+        "hook_score": 8,
+        "lesson_score": 9,
+        "entertainment_score": 6,
+        "caption_hook": "LOCAL AI EDITING IN 0 MILLISECONDS",
+        "reason": "Delivers a strong contrarian payoff by pairing local privacy with an attention-grabbing zero-millisecond caching claim.",
+        "tags": [
+          "#FasterWhisper",
+          "#LocalAI",
+          "#DevTips"
         ],
         "snapped_to_words": true
       },
       {
         "id": "clip_03",
-        "title": "Instead, keeping transcription local with faster-whisper",
-        "start_sec": 10.03,
-        "end_sec": 19.991,
-        "hook_score": 98,
-        "reason": "Matched 4 brief terms and 4 retention cues.",
-        "caption_hook": "INSTEAD, KEEPING TRANSCRIPTION LOCAL WITH FASTER",
+        "title": "Word-Exact Hooks and Android Porting",
+        "category": "lesson",
+        "sentiment": "Positive",
+        "start_sec": 20.15,
+        "end_sec": 29.85,
+        "hook_score": 7,
+        "lesson_score": 9,
+        "entertainment_score": 5,
+        "caption_hook": "NEVER SLICE A HOOK SYLLABLE AGAIN",
+        "reason": "Hooks technical creators with a concrete fix for clipped audio openings before bridging to cross-platform Android architecture.",
         "tags": [
-          "and",
-          "caching",
-          "instead",
-          "latency"
-        ],
-        "snapped_to_words": true
-      },
-      {
-        "id": "clip_04",
-        "title": "Even better, content-addressed transcript caching means ",
-        "start_sec": 15.03,
-        "end_sec": 24.998,
-        "hook_score": 83,
-        "reason": "Matched 2 brief terms and 2 retention cues.",
-        "caption_hook": "EVEN BETTER, CONTENT-ADDRESSED TRANSCRIPT CACHIN",
-        "tags": [
-          "caching",
-          "hooks",
-          "never",
-          "zero"
-        ],
-        "snapped_to_words": true
-      },
-      {
-        "id": "clip_05",
-        "title": "Every LLM timestamp gets snapped to exact word boundarie",
-        "start_sec": 20.03,
-        "end_sec": 30,
-        "hook_score": 84.5,
-        "reason": "Matched 3 brief terms and 1 retention cues.",
-        "caption_hook": "EVERY LLM TIMESTAMP GETS SNAPPED TO EXACT WORD B",
-        "tags": [
-          "and",
-          "android",
-          "hooks",
-          "never"
+          "#AndroidDev",
+          "#FFmpeg",
+          "#Media3"
         ],
         "snapped_to_words": true
       }

@@ -215,6 +215,9 @@ async function extractVideoAudioChunks(
   durationSec: number,
   videoHash: string
 ): Promise<Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }>> {
+  if (!fs.existsSync(localPath)) {
+    throw new Error(`Video file not found on disk (${path.basename(localPath)}). Re-upload the video or load sample footage.`);
+  }
   const safeDuration = Math.max(1, durationSec || 30);
   const chunkLenSec = 600; // 10-minute chunks (~3.6 MB per MP3 chunk at 48kbps)
   const chunkCount = Math.max(1, Math.ceil(safeDuration / chunkLenSec));
@@ -246,7 +249,16 @@ async function extractVideoAudioChunks(
         tmpPath
       );
 
-      await execFileAsync('ffmpeg', args);
+      try {
+        await execFileAsync('ffmpeg', args);
+      } catch (err: any) {
+        const stderrLines = String(err?.stderr || err?.message || '')
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+        const tailError = stderrLines[stderrLines.length - 1] || 'FFmpeg audio extraction failed.';
+        throw new Error(`Could not extract audio from video (${tailError}).`);
+      }
       if (fs.existsSync(tmpPath)) {
         const buffer = fs.readFileSync(tmpPath);
         if (buffer.length > 0) {
@@ -382,7 +394,22 @@ async function _generateSampleVideoFileImpl(): Promise<ProjectRecord> {
   const sampleFilename = 'cutline_architecture_briefing.mp4';
   const targetPath = path.join(VIDEOS_DIR, sampleFilename);
 
-  if (!fs.existsSync(targetPath)) {
+  let needsRegenerate = !fs.existsSync(targetPath);
+  if (!needsRegenerate) {
+    try {
+      await probeVideo(targetPath);
+    } catch {
+      needsRegenerate = true;
+      try {
+        fs.unlinkSync(targetPath);
+      } catch {
+        // ignore cleanup error
+      }
+    }
+  }
+
+  if (needsRegenerate) {
+    const tmpTargetPath = path.join(VIDEOS_DIR, `.tmp_${Date.now()}_${sampleFilename}`);
     // Synthesize a clean 30s 1280x720 30fps studio test video with chapter overlays & subtle audio tone
     const vf = [
       'scale=1280:720',
@@ -403,12 +430,20 @@ async function _generateSampleVideoFileImpl(): Promise<ProjectRecord> {
       '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
       '-c:a', 'aac', '-b:a', '128k',
       '-movflags', '+faststart',
-      targetPath,
+      tmpTargetPath,
     ]);
+    fs.renameSync(tmpTargetPath, targetPath);
   }
 
   const meta = await probeVideo(targetPath);
   const hash = await computeSha256(targetPath);
+  // Remove any stale project records pointing to the same sample filename under an old hash
+  const cleanedProjects = readProjects().filter(
+    (p) => p.filename !== sampleFilename || p.video_hash === hash
+  );
+  if (cleanedProjects.length !== readProjects().length) {
+    writeProjects(cleanedProjects);
+  }
   let transcript = readCachedTranscript(hash);
   if (!transcript) {
     transcript = buildSegmentedTranscriptFromLines(hash, targetPath, meta.duration_sec, SAMPLE_LINES);
@@ -784,6 +819,27 @@ print(res.model_dump_json())
     }
   );
 
+  app.post('/api/ai/analyze-transcript', async (req: Request, res: Response) => {
+    try {
+      const transcript = req.body?.transcript;
+      if (!transcript || !Array.isArray(transcript.segments) || transcript.segments.length === 0) {
+        res.status(400).json({ error: 'A non-empty transcript object is required for viral clip analysis.' });
+        return;
+      }
+      const clips = await analyzeTranscriptForViralClips({
+        transcript,
+        prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : undefined,
+        minClipSec: Number(req.body?.min_clip_sec || 6),
+        maxClipSec: Number(req.body?.max_clip_sec || 45),
+        maxClips: Number(req.body?.max_clips || 6),
+      });
+      res.json({ clips, analysis_model: VIRAL_ANALYSIS_MODEL });
+    } catch (err) {
+      const formatted = formatGeminiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
   app.post('/api/projects/:hash/ai-viral-clips', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
     const project = readProjects().find((p) => p.video_hash === hash);
@@ -1088,8 +1144,8 @@ print(res.model_dump_json())
   const isAllowedLoopbackCallback = (url: string): boolean =>
     /^http:\/\/(127\.0\.0\.1|localhost):\d+\//i.test(url.trim());
 
-  // Allow Tauri desktop WebView (http://tauri.localhost / tauri://localhost) to call auth, audio & social APIs
-  app.use(['/api/auth', '/api/social', '/api/audio'], (req: Request, res: Response, next) => {
+  // Allow Tauri desktop WebView (http://tauri.localhost / tauri://localhost) to call auth, audio, AI & social APIs
+  app.use(['/api/auth', '/api/social', '/api/audio', '/api/ai'], (req: Request, res: Response, next) => {
     const origin = String(req.headers.origin || '');
     if (
       origin === 'http://tauri.localhost' ||
@@ -1625,6 +1681,10 @@ print(res.model_dump_json())
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Failed to package bundle' });
     }
+  });
+
+  app.use('/api', (req: Request, res: Response) => {
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
   });
 
   // Seed default sample video cleanly on startup if projects list is empty

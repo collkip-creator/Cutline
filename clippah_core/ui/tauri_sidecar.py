@@ -625,6 +625,27 @@ def extract_highlights(video_hash: str, req: HighlightsRequest):
     return {"clips": proj["clips"]}
 
 
+@app.post("/api/projects/{video_hash}/ai-viral-clips")
+def ai_viral_clips(video_hash: str, req: HighlightsRequest):
+    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    tr = cache_store.get(video_hash)
+    cache_hit = tr is not None
+    if not tr:
+        tr_res = transcribe_project(video_hash, {"force": False})
+        tr = Transcript.model_validate(tr_res["transcript"])
+        cache_hit = bool(tr_res.get("cache_hit", False))
+    hl_res = extract_highlights(video_hash, req)
+    return {
+        "transcript": tr.model_dump(),
+        "clips": hl_res["clips"],
+        "cache_hit": cache_hit,
+        "transcript_model": tr.model_name,
+        "analysis_model": "local-sidecar",
+    }
+
+
 @app.put("/api/projects/{video_hash}/clips")
 def save_clips(video_hash: str, body: Dict[str, Any]):
     proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)

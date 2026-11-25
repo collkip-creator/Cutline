@@ -33,6 +33,7 @@ import {
   isTauriRuntime,
   readJsonResponse,
   restartTauriSidecar,
+  socialApiFetch,
   type SidecarDiagnostics,
 } from './lib/api';
 import { downloadUrlViaBlob } from './lib/localExports';
@@ -630,28 +631,59 @@ export default function App() {
       text: 'Transcribing entire video audio and analyzing transcript with Gemini AI for viral clips...',
     });
     try {
-      const res = await apiFetch(
-        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/ai-viral-clips`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt,
-            retranscribe,
-            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
-            max_clip_sec: 45,
-            max_clips: 6,
-          }),
-        }
-      );
-      const data = await readJsonResponse<{
+      let data: {
         transcript: Transcript;
         clips: ClipCandidate[];
         cache_hit: boolean;
         transcript_model: string;
         analysis_model: string;
         note?: string;
-      }>(res);
+      };
+
+      if (isTauriRuntime) {
+        let currentTranscript = retranscribe ? null : transcript;
+        if (!currentTranscript) {
+          currentTranscript = await handleTranscribe(activeProject.video_hash, retranscribe);
+        }
+        if (!currentTranscript || currentTranscript.segments.length === 0) {
+          throw new Error('Could not transcribe local video before running AI viral clip analysis.');
+        }
+        const aiRes = await socialApiFetch('/api/ai/analyze-transcript', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            transcript: currentTranscript,
+            prompt,
+            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+            max_clip_sec: 45,
+            max_clips: 6,
+          }),
+        });
+        const aiData = await readJsonResponse<{ clips: ClipCandidate[]; analysis_model: string }>(aiRes);
+        data = {
+          transcript: currentTranscript,
+          clips: aiData.clips,
+          cache_hit: true,
+          transcript_model: currentTranscript.model_name,
+          analysis_model: aiData.analysis_model,
+        };
+      } else {
+        const res = await apiFetch(
+          `/api/projects/${encodeURIComponent(activeProject.video_hash)}/ai-viral-clips`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt,
+              retranscribe,
+              min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+              max_clip_sec: 45,
+              max_clips: 6,
+            }),
+          }
+        );
+        data = await readJsonResponse(res);
+      }
 
       setTranscript(data.transcript);
       setCacheHit(true);

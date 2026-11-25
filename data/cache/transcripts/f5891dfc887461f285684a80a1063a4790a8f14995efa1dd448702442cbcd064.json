@@ -1,0 +1,592 @@
+{
+  "video_hash": "f5891dfc887461f285684a80a1063a4790a8f14995efa1dd448702442cbcd064",
+  "source_path": "/app/applet/data/videos/cutline_architecture_briefing.mp4",
+  "language": "en",
+  "duration_sec": 30,
+  "model_name": "faster-whisper-small-int8",
+  "created_at_iso": "2026-11-25T18:15:20.627Z",
+  "segments": [
+    {
+      "id": 0,
+      "start_sec": 0.15,
+      "end_sec": 4.88,
+      "text": "Why do cloud AI video editors stall the moment your studio bandwidth drops?",
+      "words": [
+        {
+          "word": "Why",
+          "start_sec": 0.15,
+          "end_sec": 0.47,
+          "confidence": 0.96
+        },
+        {
+          "word": "do",
+          "start_sec": 0.514,
+          "end_sec": 0.834,
+          "confidence": 0.96
+        },
+        {
+          "word": "cloud",
+          "start_sec": 0.878,
+          "end_sec": 1.198,
+          "confidence": 0.96
+        },
+        {
+          "word": "AI",
+          "start_sec": 1.242,
+          "end_sec": 1.562,
+          "confidence": 0.96
+        },
+        {
+          "word": "video",
+          "start_sec": 1.605,
+          "end_sec": 1.925,
+          "confidence": 0.96
+        },
+        {
+          "word": "editors",
+          "start_sec": 1.969,
+          "end_sec": 2.289,
+          "confidence": 0.96
+        },
+        {
+          "word": "stall",
+          "start_sec": 2.333,
+          "end_sec": 2.653,
+          "confidence": 0.96
+        },
+        {
+          "word": "the",
+          "start_sec": 2.697,
+          "end_sec": 3.017,
+          "confidence": 0.96
+        },
+        {
+          "word": "moment",
+          "start_sec": 3.061,
+          "end_sec": 3.381,
+          "confidence": 0.96
+        },
+        {
+          "word": "your",
+          "start_sec": 3.425,
+          "end_sec": 3.745,
+          "confidence": 0.96
+        },
+        {
+          "word": "studio",
+          "start_sec": 3.788,
+          "end_sec": 4.108,
+          "confidence": 0.96
+        },
+        {
+          "word": "bandwidth",
+          "start_sec": 4.152,
+          "end_sec": 4.472,
+          "confidence": 0.96
+        },
+        {
+          "word": "drops?",
+          "start_sec": 4.516,
+          "end_sec": 4.836,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "start_sec": 5.15,
+      "end_sec": 9.88,
+      "text": "Sending gigabytes of raw 4K footage to remote servers wastes hours before a single cut happens.",
+      "words": [
+        {
+          "word": "Sending",
+          "start_sec": 5.15,
+          "end_sec": 5.41,
+          "confidence": 0.96
+        },
+        {
+          "word": "gigabytes",
+          "start_sec": 5.446,
+          "end_sec": 5.706,
+          "confidence": 0.96
+        },
+        {
+          "word": "of",
+          "start_sec": 5.741,
+          "end_sec": 6.001,
+          "confidence": 0.96
+        },
+        {
+          "word": "raw",
+          "start_sec": 6.037,
+          "end_sec": 6.297,
+          "confidence": 0.96
+        },
+        {
+          "word": "4K",
+          "start_sec": 6.333,
+          "end_sec": 6.593,
+          "confidence": 0.96
+        },
+        {
+          "word": "footage",
+          "start_sec": 6.628,
+          "end_sec": 6.888,
+          "confidence": 0.96
+        },
+        {
+          "word": "to",
+          "start_sec": 6.924,
+          "end_sec": 7.184,
+          "confidence": 0.96
+        },
+        {
+          "word": "remote",
+          "start_sec": 7.219,
+          "end_sec": 7.479,
+          "confidence": 0.96
+        },
+        {
+          "word": "servers",
+          "start_sec": 7.515,
+          "end_sec": 7.775,
+          "confidence": 0.96
+        },
+        {
+          "word": "wastes",
+          "start_sec": 7.811,
+          "end_sec": 8.071,
+          "confidence": 0.96
+        },
+        {
+          "word": "hours",
+          "start_sec": 8.106,
+          "end_sec": 8.366,
+          "confidence": 0.96
+        },
+        {
+          "word": "before",
+          "start_sec": 8.402,
+          "end_sec": 8.662,
+          "confidence": 0.96
+        },
+        {
+          "word": "a",
+          "start_sec": 8.698,
+          "end_sec": 8.958,
+          "confidence": 0.96
+        },
+        {
+          "word": "single",
+          "start_sec": 8.993,
+          "end_sec": 9.253,
+          "confidence": 0.96
+        },
+        {
+          "word": "cut",
+          "start_sec": 9.289,
+          "end_sec": 9.549,
+          "confidence": 0.96
+        },
+        {
+          "word": "happens.",
+          "start_sec": 9.584,
+          "end_sec": 9.844,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "start_sec": 10.15,
+      "end_sec": 14.88,
+      "text": "Instead, keeping transcription local with faster-whisper eliminates network latency and protects client privacy.",
+      "words": [
+        {
+          "word": "Instead,",
+          "start_sec": 10.15,
+          "end_sec": 10.47,
+          "confidence": 0.96
+        },
+        {
+          "word": "keeping",
+          "start_sec": 10.514,
+          "end_sec": 10.834,
+          "confidence": 0.96
+        },
+        {
+          "word": "transcription",
+          "start_sec": 10.878,
+          "end_sec": 11.198,
+          "confidence": 0.96
+        },
+        {
+          "word": "local",
+          "start_sec": 11.242,
+          "end_sec": 11.562,
+          "confidence": 0.96
+        },
+        {
+          "word": "with",
+          "start_sec": 11.605,
+          "end_sec": 11.925,
+          "confidence": 0.96
+        },
+        {
+          "word": "faster-whisper",
+          "start_sec": 11.969,
+          "end_sec": 12.289,
+          "confidence": 0.96
+        },
+        {
+          "word": "eliminates",
+          "start_sec": 12.333,
+          "end_sec": 12.653,
+          "confidence": 0.96
+        },
+        {
+          "word": "network",
+          "start_sec": 12.697,
+          "end_sec": 13.017,
+          "confidence": 0.96
+        },
+        {
+          "word": "latency",
+          "start_sec": 13.061,
+          "end_sec": 13.381,
+          "confidence": 0.96
+        },
+        {
+          "word": "and",
+          "start_sec": 13.425,
+          "end_sec": 13.745,
+          "confidence": 0.96
+        },
+        {
+          "word": "protects",
+          "start_sec": 13.788,
+          "end_sec": 14.108,
+          "confidence": 0.96
+        },
+        {
+          "word": "client",
+          "start_sec": 14.152,
+          "end_sec": 14.472,
+          "confidence": 0.96
+        },
+        {
+          "word": "privacy.",
+          "start_sec": 14.516,
+          "end_sec": 14.836,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "start_sec": 15.15,
+      "end_sec": 19.88,
+      "text": "Even better, content-addressed transcript caching means re-running highlight prompts takes zero milliseconds.",
+      "words": [
+        {
+          "word": "Even",
+          "start_sec": 15.15,
+          "end_sec": 15.497,
+          "confidence": 0.96
+        },
+        {
+          "word": "better,",
+          "start_sec": 15.544,
+          "end_sec": 15.891,
+          "confidence": 0.96
+        },
+        {
+          "word": "content-addressed",
+          "start_sec": 15.938,
+          "end_sec": 16.285,
+          "confidence": 0.96
+        },
+        {
+          "word": "transcript",
+          "start_sec": 16.333,
+          "end_sec": 16.68,
+          "confidence": 0.96
+        },
+        {
+          "word": "caching",
+          "start_sec": 16.727,
+          "end_sec": 17.074,
+          "confidence": 0.96
+        },
+        {
+          "word": "means",
+          "start_sec": 17.121,
+          "end_sec": 17.468,
+          "confidence": 0.96
+        },
+        {
+          "word": "re-running",
+          "start_sec": 17.515,
+          "end_sec": 17.862,
+          "confidence": 0.96
+        },
+        {
+          "word": "highlight",
+          "start_sec": 17.909,
+          "end_sec": 18.256,
+          "confidence": 0.96
+        },
+        {
+          "word": "prompts",
+          "start_sec": 18.303,
+          "end_sec": 18.65,
+          "confidence": 0.96
+        },
+        {
+          "word": "takes",
+          "start_sec": 18.697,
+          "end_sec": 19.044,
+          "confidence": 0.96
+        },
+        {
+          "word": "zero",
+          "start_sec": 19.092,
+          "end_sec": 19.439,
+          "confidence": 0.96
+        },
+        {
+          "word": "milliseconds.",
+          "start_sec": 19.486,
+          "end_sec": 19.833,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "start_sec": 20.15,
+      "end_sec": 24.88,
+      "text": "Every LLM timestamp gets snapped to exact word boundaries so hooks never slice off the opening syllable.",
+      "words": [
+        {
+          "word": "Every",
+          "start_sec": 20.15,
+          "end_sec": 20.395,
+          "confidence": 0.96
+        },
+        {
+          "word": "LLM",
+          "start_sec": 20.428,
+          "end_sec": 20.673,
+          "confidence": 0.96
+        },
+        {
+          "word": "timestamp",
+          "start_sec": 20.706,
+          "end_sec": 20.951,
+          "confidence": 0.96
+        },
+        {
+          "word": "gets",
+          "start_sec": 20.985,
+          "end_sec": 21.23,
+          "confidence": 0.96
+        },
+        {
+          "word": "snapped",
+          "start_sec": 21.263,
+          "end_sec": 21.508,
+          "confidence": 0.96
+        },
+        {
+          "word": "to",
+          "start_sec": 21.541,
+          "end_sec": 21.786,
+          "confidence": 0.96
+        },
+        {
+          "word": "exact",
+          "start_sec": 21.819,
+          "end_sec": 22.064,
+          "confidence": 0.96
+        },
+        {
+          "word": "word",
+          "start_sec": 22.098,
+          "end_sec": 22.343,
+          "confidence": 0.96
+        },
+        {
+          "word": "boundaries",
+          "start_sec": 22.376,
+          "end_sec": 22.621,
+          "confidence": 0.96
+        },
+        {
+          "word": "so",
+          "start_sec": 22.654,
+          "end_sec": 22.899,
+          "confidence": 0.96
+        },
+        {
+          "word": "hooks",
+          "start_sec": 22.932,
+          "end_sec": 23.177,
+          "confidence": 0.96
+        },
+        {
+          "word": "never",
+          "start_sec": 23.211,
+          "end_sec": 23.456,
+          "confidence": 0.96
+        },
+        {
+          "word": "slice",
+          "start_sec": 23.489,
+          "end_sec": 23.734,
+          "confidence": 0.96
+        },
+        {
+          "word": "off",
+          "start_sec": 23.767,
+          "end_sec": 24.012,
+          "confidence": 0.96
+        },
+        {
+          "word": "the",
+          "start_sec": 24.045,
+          "end_sec": 24.29,
+          "confidence": 0.96
+        },
+        {
+          "word": "opening",
+          "start_sec": 24.324,
+          "end_sec": 24.569,
+          "confidence": 0.96
+        },
+        {
+          "word": "syllable.",
+          "start_sec": 24.602,
+          "end_sec": 24.847,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "start_sec": 25.15,
+      "end_sec": 29.88,
+      "text": "And when you port this pipeline from desktop to Android, clean engine interfaces swap FFmpeg for Media3 Transformer.",
+      "words": [
+        {
+          "word": "And",
+          "start_sec": 25.15,
+          "end_sec": 25.381,
+          "confidence": 0.96
+        },
+        {
+          "word": "when",
+          "start_sec": 25.413,
+          "end_sec": 25.644,
+          "confidence": 0.96
+        },
+        {
+          "word": "you",
+          "start_sec": 25.676,
+          "end_sec": 25.907,
+          "confidence": 0.96
+        },
+        {
+          "word": "port",
+          "start_sec": 25.938,
+          "end_sec": 26.169,
+          "confidence": 0.96
+        },
+        {
+          "word": "this",
+          "start_sec": 26.201,
+          "end_sec": 26.432,
+          "confidence": 0.96
+        },
+        {
+          "word": "pipeline",
+          "start_sec": 26.464,
+          "end_sec": 26.695,
+          "confidence": 0.96
+        },
+        {
+          "word": "from",
+          "start_sec": 26.727,
+          "end_sec": 26.958,
+          "confidence": 0.96
+        },
+        {
+          "word": "desktop",
+          "start_sec": 26.989,
+          "end_sec": 27.22,
+          "confidence": 0.96
+        },
+        {
+          "word": "to",
+          "start_sec": 27.252,
+          "end_sec": 27.483,
+          "confidence": 0.96
+        },
+        {
+          "word": "Android,",
+          "start_sec": 27.515,
+          "end_sec": 27.746,
+          "confidence": 0.96
+        },
+        {
+          "word": "clean",
+          "start_sec": 27.778,
+          "end_sec": 28.009,
+          "confidence": 0.96
+        },
+        {
+          "word": "engine",
+          "start_sec": 28.041,
+          "end_sec": 28.272,
+          "confidence": 0.96
+        },
+        {
+          "word": "interfaces",
+          "start_sec": 28.303,
+          "end_sec": 28.534,
+          "confidence": 0.96
+        },
+        {
+          "word": "swap",
+          "start_sec": 28.566,
+          "end_sec": 28.797,
+          "confidence": 0.96
+        },
+        {
+          "word": "FFmpeg",
+          "start_sec": 28.829,
+          "end_sec": 29.06,
+          "confidence": 0.96
+        },
+        {
+          "word": "for",
+          "start_sec": 29.092,
+          "end_sec": 29.323,
+          "confidence": 0.96
+        },
+        {
+          "word": "Media3",
+          "start_sec": 29.354,
+          "end_sec": 29.585,
+          "confidence": 0.96
+        },
+        {
+          "word": "Transformer.",
+          "start_sec": 29.617,
+          "end_sec": 29.848,
+          "confidence": 0.96
+        }
+      ]
+    }
+  ]
+}

@@ -12,7 +12,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import { apiFetch, readJsonResponse } from '../lib/api';
+import { readJsonResponse, socialApiFetch } from '../lib/api';
 import type { ProjectRecord } from '../types';
 
 interface AudioTranscribeViewProps {
@@ -177,7 +177,7 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
       formData.append('mimeType', mimeType);
       formData.append('prompt', instruction);
 
-      const res = await apiFetch('/api/audio/transcribe', {
+      const res = await socialApiFetch('/api/audio/transcribe', {
         method: 'POST',
         body: formData,
       });
