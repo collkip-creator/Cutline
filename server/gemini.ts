@@ -212,7 +212,48 @@ export async function transcribeAudioBuffer(params: {
   });
 }
 
-function buildWordsForSegment(text: string, startSec: number, endSec: number): WordTimestamp[] {
+export function formatBracketTimestamp(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const hrs = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hrs > 0) {
+    return `[${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}]`;
+  }
+  return `[${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}]`;
+}
+
+export function formatSrtTimestamp(seconds: number): string {
+  const msTotal = Math.max(0, Math.round(seconds * 1000));
+  const hrs = Math.floor(msTotal / 3_600_000);
+  const mins = Math.floor((msTotal % 3_600_000) / 60_000);
+  const secs = Math.floor((msTotal % 60_000) / 1000);
+  const ms = msTotal % 1000;
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+export function segmentsToSrt(segments: Array<{ start_sec: number; end_sec: number; text: string }>): string {
+  return segments
+    .filter((seg) => seg.text.trim().length > 0)
+    .map(
+      (seg, idx) =>
+        `${idx + 1}\n${formatSrtTimestamp(seg.start_sec)} --> ${formatSrtTimestamp(
+          Math.max(seg.start_sec + 0.3, seg.end_sec)
+        )}\n${seg.text.trim()}`
+    )
+    .join('\n\n');
+}
+
+export function segmentsToTimestampedText(
+  segments: Array<{ start_sec: number; text: string }>
+): string {
+  return segments
+    .filter((seg) => seg.text.trim().length > 0)
+    .map((seg) => `${formatBracketTimestamp(seg.start_sec)} ${seg.text.trim()}`)
+    .join('\n');
+}
+
+export function buildWordsForSegment(text: string, startSec: number, endSec: number): WordTimestamp[] {
   const tokens = text.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return [];
   const span = Math.max(0.2, endSec - startSec);
@@ -230,14 +271,19 @@ export function parseTimestampedChunkOutput(params: {
   chunkDurationSec: number;
   totalDurationSec: number;
 }): Array<{ start_sec: number; end_sec: number; text: string }> {
-  const rawLines = params.rawText
+  // Split inline timestamps onto separate lines if the model emitted multiple timestamps on one line
+  const normalizedRaw = params.rawText.replace(
+    /\s+(?=\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?\])/g,
+    '\n'
+  );
+  const rawLines = normalizedRaw
     .split(/\r?\n+/)
     .map((l) => l.trim())
     .filter(Boolean);
 
   if (rawLines.length === 0) return [];
 
-  const tsRegex = /^\[?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\]?\s*(?:[-–—>|:]\s*)?(.*)$/;
+  const tsRegex = /^[\[(\*]*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?[\])\*]*\s*(?:[-–—>|:]\s*)?(.*)$/;
   const parsed: Array<{ start_sec: number | null; text: string }> = [];
   let hasAnyTimestamp = false;
 
@@ -303,20 +349,107 @@ export function parseTimestampedChunkOutput(params: {
   return timed;
 }
 
+export async function transcribeAudioWithTimestamps(params: {
+  audioBuffer: Buffer;
+  mimeType: string;
+  prompt?: string;
+  durationSec?: number;
+  sourceLabel?: string;
+  videoHash?: string;
+}): Promise<{
+  text: string;
+  model: string;
+  mimeType: string;
+  timestamped: boolean;
+  duration_sec: number;
+  segments: TranscriptSegment[];
+  srt: string;
+  transcript: TranscriptData;
+}> {
+  const safeDuration = Math.max(4, Number(params.durationSec) || 600);
+  const guidance = params.prompt?.trim();
+  const timestampPrompt = [
+    'Transcribe all spoken words in this audio accurately into sentences or natural spoken phrases.',
+    'Put each sentence or spoken phrase on a new line prefixed with its exact start timestamp from the beginning of the audio in [MM:SS] format (or [HH:MM:SS] if over an hour), for example:',
+    '[00:03] First spoken sentence.',
+    '[00:09] Second spoken sentence.',
+    'Make sure the timestamps match the exact minute and second each sentence begins in the audio.',
+    guidance ? `Additional instructions: ${guidance}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const result = await transcribeAudioBuffer({
+    audioBuffer: params.audioBuffer,
+    mimeType: params.mimeType,
+    prompt: timestampPrompt,
+  });
+
+  const rawSegments = result.text.trim()
+    ? parseTimestampedChunkOutput({
+        rawText: result.text,
+        chunkStartSec: 0,
+        chunkDurationSec: safeDuration,
+        totalDurationSec: safeDuration,
+      })
+    : [];
+
+  const finalDuration = Math.max(
+    Number(params.durationSec) || 0,
+    rawSegments[rawSegments.length - 1]?.end_sec || 0,
+    1
+  );
+
+  const segments: TranscriptSegment[] = rawSegments.map((seg, idx) => ({
+    id: idx,
+    start_sec: seg.start_sec,
+    end_sec: seg.end_sec,
+    text: seg.text,
+    words: buildWordsForSegment(seg.text, seg.start_sec, seg.end_sec),
+  }));
+
+  const transcript: TranscriptData = {
+    video_hash: params.videoHash || `audio_${Date.now()}`,
+    source_path: params.sourceLabel || 'uploaded-audio',
+    language: 'en',
+    duration_sec: Math.round(finalDuration * 1000) / 1000,
+    model_name: TRANSCRIBE_MODEL,
+    created_at_iso: new Date().toISOString(),
+    segments,
+  };
+
+  return {
+    text: segments.length > 0 ? segmentsToTimestampedText(segments) : result.text,
+    model: TRANSCRIBE_MODEL,
+    mimeType: result.mimeType,
+    timestamped: true,
+    duration_sec: transcript.duration_sec,
+    segments,
+    srt: segmentsToSrt(segments),
+    transcript,
+  };
+}
+
 export async function transcribeVideoChunksWithGemini(params: {
   videoHash: string;
   sourcePath: string;
   totalDurationSec: number;
   chunks: Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }>;
+  prompt?: string;
 }): Promise<TranscriptData> {
   const allRawSegments: Array<{ start_sec: number; end_sec: number; text: string }> = [];
+  const extra = params.prompt?.trim();
 
   for (const chunk of params.chunks) {
     const result = await transcribeAudioBuffer({
       audioBuffer: chunk.buffer,
       mimeType: chunk.mimeType,
-      prompt:
-        'Transcribe all spoken words in this audio accurately. Format each sentence or natural spoken phrase on a new line prefixed with its start timestamp in [MM:SS] format (for example: [00:00] First sentence here.). If there is no speech, respond with an empty string.',
+      prompt: [
+        'Transcribe all spoken words in this audio accurately. Format each sentence or natural spoken phrase on a new line prefixed with its exact start timestamp from the start of this audio clip in [MM:SS] format (for example: [00:00] First sentence here.). If there is no speech, respond with an empty string.',
+        extra ? `Additional instructions: ${extra}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
     });
 
     if (result.text.trim()) {

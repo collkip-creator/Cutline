@@ -22,8 +22,9 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
+from ..core.focus import analyze_clip_focus, build_ffmpeg_crop_x_expr
 from ..core.interfaces import ProgressCallback, VideoProcessor
-from ..core.schemas import AspectRatio, EncodeMode, ExportResult, ExportSpec
+from ..core.schemas import AspectRatio, EncodeMode, ExportResult, ExportSpec, FocusMode
 
 
 def _subprocess_kwargs() -> dict:
@@ -184,7 +185,20 @@ class FFmpegVideoProcessor(VideoProcessor):
         else:
             vf_filters: List[str] = []
             if spec.aspect_ratio == AspectRatio.VERTICAL_9_16:
-                vf_filters.append("crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920")
+                focus_cfg = spec.focus_config or spec.clip.focus
+                if focus_cfg is None or (
+                    focus_cfg.mode == FocusMode.SMART_AUTO and not focus_cfg.keyframes
+                ):
+                    if on_progress:
+                        on_progress(0.18, "Tracking speaker & main action...")
+                    focus_cfg = analyze_clip_focus(
+                        source_video,
+                        start,
+                        start + duration,
+                        ffmpeg_bin=self.ffmpeg_bin,
+                    )
+                crop_x_expr = build_ffmpeg_crop_x_expr(focus_cfg, AspectRatio.VERTICAL_9_16)
+                vf_filters.append(f"crop='min(iw,ih*9/16)':ih:'{crop_x_expr}':0,scale=1080:1920")
             else:
                 vf_filters.append("scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2")
 

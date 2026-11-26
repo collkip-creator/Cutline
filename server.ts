@@ -31,7 +31,10 @@ import {
   analyzeTranscriptForViralClips,
   formatGeminiError,
   normalizeAudioMimeType,
+  segmentsToSrt,
+  segmentsToTimestampedText,
   transcribeAudioBuffer,
+  transcribeAudioWithTimestamps,
   transcribeVideoChunksWithGemini,
 } from './server/gemini.ts';
 
@@ -501,8 +504,15 @@ const socialExportUpload = multer({
 });
 
 const audioMemoryUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, CACHE_DIR),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase() || '.audio';
+      const safe = path.basename(file.originalname || 'audio', ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+      cb(null, `.tmp_audio_${Date.now()}_${safe}${ext}`);
+    },
+  }),
+  limits: { fileSize: 150 * 1024 * 1024 },
 });
 
 async function startServer() {
@@ -783,38 +793,109 @@ print(res.model_dump_json())
     '/api/audio/transcribe',
     audioMemoryUpload.single('audio'),
     async (req: Request, res: Response) => {
+      let tempAudioPath: string | null = req.file?.path || null;
       try {
-        let audioBuffer: Buffer | null = null;
         let mimeType = 'audio/webm';
         const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+        const timestampsEnabled = req.body?.timestamps !== 'false';
+        const clientDurationSec = Number(req.body?.durationSec) || 0;
+        const sourceLabel = req.file?.originalname || 'microphone-recording';
 
-        if (req.file?.buffer && req.file.buffer.length > 0) {
-          audioBuffer = req.file.buffer;
+        if (!tempAudioPath && typeof req.body?.audioBase64 === 'string' && req.body.audioBase64.trim()) {
+          const rawBase64 = req.body.audioBase64.trim().replace(/^data:[^;]+;base64,/, '');
+          const audioBuffer = Buffer.from(rawBase64, 'base64');
+          mimeType = normalizeAudioMimeType(req.body?.mimeType);
+          const ext = mimeType.includes('mp3') ? '.mp3' : mimeType.includes('wav') ? '.wav' : '.webm';
+          tempAudioPath = path.join(CACHE_DIR, `.tmp_audio_b64_${Date.now()}${ext}`);
+          fs.writeFileSync(tempAudioPath, audioBuffer);
+        } else if (req.file) {
           mimeType = normalizeAudioMimeType(
             (typeof req.body?.mimeType === 'string' && req.body.mimeType) || req.file.mimetype,
             req.file.originalname
           );
-        } else if (typeof req.body?.audioBase64 === 'string' && req.body.audioBase64.trim()) {
-          const rawBase64 = req.body.audioBase64.trim().replace(/^data:[^;]+;base64,/, '');
-          audioBuffer = Buffer.from(rawBase64, 'base64');
-          mimeType = normalizeAudioMimeType(req.body?.mimeType);
         }
 
-        if (!audioBuffer || audioBuffer.length === 0) {
-          res.status(400).json({ error: 'No audio recording was provided for transcription.' });
+        if (!tempAudioPath || !fs.existsSync(tempAudioPath) || fs.statSync(tempAudioPath).size === 0) {
+          res.status(400).json({ error: 'No audio recording or file was provided for transcription.' });
           return;
         }
 
-        const result = await transcribeAudioBuffer({
+        const fileSizeBytes = fs.statSync(tempAudioPath).size;
+        let probedDurationSec = clientDurationSec;
+        try {
+          const meta = await probeVideo(tempAudioPath);
+          if (meta.duration_sec > 0) {
+            probedDurationSec = meta.duration_sec;
+          }
+        } catch {
+          // Fall back to client-reported duration or model-derived duration
+        }
+
+        if (!timestampsEnabled) {
+          const audioBuffer = fs.readFileSync(tempAudioPath);
+          const result = await transcribeAudioBuffer({
+            audioBuffer,
+            mimeType,
+            prompt,
+          });
+          res.json({
+            ...result,
+            timestamped: false,
+            duration_sec: probedDurationSec,
+            segments: [],
+            srt: '',
+          });
+          return;
+        }
+
+        const needsChunking = fileSizeBytes > 8 * 1024 * 1024 || probedDurationSec > 540;
+        if (needsChunking) {
+          const effectiveDur = Math.max(10, probedDurationSec || 600);
+          const audioHash = `audio_${Date.now()}`;
+          const chunks = await extractVideoAudioChunks(tempAudioPath, effectiveDur, audioHash);
+          const transcript = await transcribeVideoChunksWithGemini({
+            videoHash: audioHash,
+            sourcePath: sourceLabel,
+            totalDurationSec: effectiveDur,
+            chunks,
+            prompt,
+          });
+          res.json({
+            text:
+              transcript.segments.length > 0
+                ? segmentsToTimestampedText(transcript.segments)
+                : '',
+            model: TRANSCRIBE_MODEL,
+            mimeType,
+            timestamped: true,
+            duration_sec: transcript.duration_sec,
+            segments: transcript.segments,
+            srt: segmentsToSrt(transcript.segments),
+            transcript,
+          });
+          return;
+        }
+
+        const audioBuffer = fs.readFileSync(tempAudioPath);
+        const result = await transcribeAudioWithTimestamps({
           audioBuffer,
           mimeType,
           prompt,
+          durationSec: probedDurationSec > 0 ? probedDurationSec : undefined,
+          sourceLabel,
         });
-
         res.json(result);
       } catch (err) {
         const formatted = formatGeminiError(err);
         res.status(formatted.status).json({ error: formatted.message });
+      } finally {
+        if (tempAudioPath && fs.existsSync(tempAudioPath)) {
+          try {
+            fs.unlinkSync(tempAudioPath);
+          } catch {
+            // ignore temp cleanup failure
+          }
+        }
       }
     }
   );

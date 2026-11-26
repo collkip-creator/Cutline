@@ -628,6 +628,66 @@ def extract_highlights(video_hash: str, req: HighlightsRequest):
     return {"clips": proj["clips"]}
 
 
+def _fmt_bracket_ts(sec: float) -> str:
+    safe = max(0, int(sec))
+    hrs, rem = divmod(safe, 3600)
+    mins, secs = divmod(rem, 60)
+    if hrs > 0:
+        return f"[{hrs:02d}:{mins:02d}:{secs:02d}]"
+    return f"[{mins:02d}:{secs:02d}]"
+
+
+def _fmt_srt_ts(sec: float) -> str:
+    ms_total = max(0, int(round(sec * 1000)))
+    hrs, rem = divmod(ms_total, 3_600_000)
+    mins, rem = divmod(rem, 60_000)
+    secs, ms = divmod(rem, 1000)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+
+
+def _parse_timestamped_text_to_segments(raw_text: str, total_dur: float) -> List[TranscriptSegment]:
+    normalized = re.sub(r"\s+(?=\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?\])", "\n", raw_text)
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    ts_re = re.compile(r"^[\[(\*]*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?[\])\*]*\s*(?:[-–—>|:]\s*)?(.*)$")
+    parsed: List[tuple[Optional[float], str]] = []
+    has_any = False
+    for ln in lines:
+        m = ts_re.match(ln)
+        if m and m.group(5).strip():
+            hrs = int(m.group(1) or 0)
+            mins = int(m.group(2))
+            secs = int(m.group(3))
+            ms = int((m.group(4) or "0").ljust(3, "0")) / 1000.0
+            parsed.append((hrs * 3600 + mins * 60 + secs + ms, m.group(5).strip()))
+            has_any = True
+        else:
+            parsed.append((None, re.sub(r"^[-*•]\s*", "", ln).strip()))
+    if not has_any:
+        joined = " ".join(t for _, t in parsed if t).strip()
+        if not joined:
+            return []
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", joined) if s.strip()] or [joined]
+        step = max(1.0, total_dur) / len(sentences)
+        out: List[TranscriptSegment] = []
+        for idx, txt in enumerate(sentences):
+            s0 = round(idx * step, 3)
+            s1 = round(max(s0 + 0.4, (idx + 1) * step - 0.05), 3)
+            out.append(TranscriptSegment(id=idx, start_sec=s0, end_sec=s1, text=txt, words=[]))
+        return out
+
+    items = [(s, t) for s, t in parsed if t]
+    segs: List[TranscriptSegment] = []
+    for idx, (raw_s, txt) in enumerate(items):
+        prev_s = segs[-1].start_sec + 0.35 if segs else 0.0
+        s0 = max(prev_s, raw_s if raw_s is not None else prev_s + 0.1)
+        next_s = items[idx + 1][0] if idx + 1 < len(items) and items[idx + 1][0] is not None else max(s0 + 3.0, total_dur)
+        s1 = max(s0 + 0.4, next_s - 0.04)
+        segs.append(TranscriptSegment(id=idx, start_sec=round(s0, 3), end_sec=round(s1, 3), text=txt, words=[]))
+    return segs
+
+
 @app.post("/api/audio/transcribe")
 async def transcribe_microphone_audio(request: Request):
     form = await request.form()
@@ -640,7 +700,14 @@ async def transcribe_microphone_audio(request: Request):
         raise HTTPException(status_code=400, detail="Empty audio recording provided.")
 
     mime_type = str(form.get("mimeType") or getattr(audio_file, "content_type", None) or "audio/webm").split(";")[0].strip()
+    timestamps_enabled = str(form.get("timestamps") or "true").lower() != "false"
+    duration_hint = float(form.get("durationSec") or 0.0)
     prompt_text = str(form.get("prompt") or "Transcribe this spoken audio accurately into clean text with proper punctuation.").strip()
+    if timestamps_enabled:
+        prompt_text = (
+            "Transcribe all spoken words accurately. Format each sentence or spoken phrase on a new line prefixed with its exact start timestamp in [MM:SS] format (for example: [00:04] Sentence here.).\n"
+            + prompt_text
+        )
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if gemini_key:
@@ -668,7 +735,21 @@ async def transcribe_microphone_audio(request: Request):
             body = json.loads(resp.read().decode("utf-8"))
         parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         text = "".join(p.get("text", "") for p in parts).strip()
-        return {"text": text, "model": "gemini-3.5-transcribe", "mimeType": mime_type}
+        segs = _parse_timestamped_text_to_segments(text, duration_hint or 600.0) if timestamps_enabled else []
+        srt = "\n\n".join(
+            f"{i + 1}\n{_fmt_srt_ts(s.start_sec)} --> {_fmt_srt_ts(s.end_sec)}\n{s.text}"
+            for i, s in enumerate(segs)
+        )
+        formatted_text = "\n".join(f"{_fmt_bracket_ts(s.start_sec)} {s.text}" for s in segs) if segs else text
+        return {
+            "text": formatted_text,
+            "model": "gemini-3.5-transcribe",
+            "mimeType": mime_type,
+            "timestamped": timestamps_enabled,
+            "duration_sec": max(duration_hint, segs[-1].end_sec if segs else 0.0),
+            "segments": [s.model_dump() for s in segs],
+            "srt": srt,
+        }
 
     import tempfile
 
@@ -684,8 +765,24 @@ async def transcribe_microphone_audio(request: Request):
             check=True,
         )
         tr = pipeline.transcriber.transcribe(wav_path, video_hash=f"mic_{int(time.time())}")
-        text = " ".join(s.text.strip() for s in tr.segments).strip()
-        return {"text": text, "model": pipeline.transcriber.model_identifier, "mimeType": mime_type}
+        srt = "\n\n".join(
+            f"{i + 1}\n{_fmt_srt_ts(s.start_sec)} --> {_fmt_srt_ts(s.end_sec)}\n{s.text.strip()}"
+            for i, s in enumerate(tr.segments)
+        )
+        text = (
+            "\n".join(f"{_fmt_bracket_ts(s.start_sec)} {s.text.strip()}" for s in tr.segments)
+            if timestamps_enabled
+            else " ".join(s.text.strip() for s in tr.segments).strip()
+        )
+        return {
+            "text": text,
+            "model": pipeline.transcriber.model_identifier,
+            "mimeType": mime_type,
+            "timestamped": timestamps_enabled,
+            "duration_sec": tr.duration_sec,
+            "segments": [s.model_dump() for s in tr.segments],
+            "srt": srt,
+        }
 
 
 @app.post("/api/projects/{video_hash}/ai-viral-clips")

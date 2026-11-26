@@ -6,11 +6,20 @@ from clippah_core.adapters.desktop_ollama import OllamaHighlightEngine
 from clippah_core.adapters.social_adapters import build_default_publishers
 from clippah_core.core.cache import TranscriptCache
 from clippah_core.core.captions import generate_ass, generate_srt
+from clippah_core.core.focus import (
+    build_ffmpeg_crop_x_expr,
+    find_best_focus_x,
+    score_rgb_frame_columns,
+    smooth_and_simplify_keyframes,
+)
 from clippah_core.core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
 from clippah_core.core.queue import PublishQueueStore
 from clippah_core.core.schemas import (
     AspectRatio,
     ClipCandidate,
+    FocusConfig,
+    FocusKeyframe,
+    FocusMode,
     PublishPlatform,
     PublishStatus,
     SubtitleConfig,
@@ -147,6 +156,41 @@ class CorePipelineTests(unittest.TestCase):
 
         disabled_cfg = SubtitleConfig(enabled=False)
         self.assertEqual(generate_srt(clip, None, subtitle_config=disabled_cfg), "")
+
+    def test_intelligent_focus_tracks_subject_not_empty_space(self) -> None:
+        w, h = 64, 36
+        # Flat dark empty frame except a warm skin-toned active subject on the right (~x=52)
+        prev_buf = bytearray([18, 22, 28] * (w * h))
+        curr_buf = bytearray([18, 22, 28] * (w * h))
+        for y in range(8, 24):
+            for x in range(48, 57):
+                idx = (y * w + x) * 3
+                curr_buf[idx : idx + 3] = bytes([210, 145, 110])
+
+        cols = score_rgb_frame_columns(bytes(curr_buf), bytes(prev_buf), w, h)
+        x_norm, conf = find_best_focus_x(cols, crop_width_ratio=0.3164)
+        self.assertGreater(x_norm, 0.68)
+        self.assertGreater(conf, 0.6)
+
+        kfs = smooth_and_simplify_keyframes([
+            (0.0, 0.22, 0.85, "Speaker left"),
+            (1.0, 0.23, 0.85, "Speaker left"),
+            (2.0, 0.78, 0.90, "Speaker right"),
+            (3.0, 0.79, 0.90, "Speaker right"),
+        ])
+        self.assertGreaterEqual(len(kfs), 2)
+        expr = build_ffmpeg_crop_x_expr(
+            FocusConfig(mode=FocusMode.SMART_AUTO, target_x=0.5, keyframes=kfs),
+            AspectRatio.VERTICAL_9_16,
+        )
+        self.assertIn("if(lt(t,", expr)
+        self.assertIn("clip(", expr)
+
+        center_expr = build_ffmpeg_crop_x_expr(
+            FocusConfig(mode=FocusMode.CENTER, target_x=0.5, keyframes=kfs),
+            AspectRatio.VERTICAL_9_16,
+        )
+        self.assertEqual(center_expr, "(iw-ow)/2")
 
     def test_transcript_cache_roundtrip(self) -> None:
         transcript = _sample_transcript()

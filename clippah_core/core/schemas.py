@@ -205,6 +205,42 @@ class SubtitleConfig(BaseModel):
         return self
 
 
+class FocusMode(str, Enum):
+    SMART_AUTO = "smart_auto"
+    CENTER = "center"
+    MANUAL = "manual"
+
+
+class FocusKeyframe(BaseModel):
+    time_sec: float = 0.0
+    x_norm: float = 0.5
+    y_norm: float = 0.45
+    confidence: float = 0.8
+    label: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_kf(self) -> "FocusKeyframe":
+        self.time_sec = max(0.0, round(float(self.time_sec), 3))
+        self.x_norm = max(0.0, min(1.0, round(float(self.x_norm), 4)))
+        self.y_norm = max(0.0, min(1.0, round(float(self.y_norm), 4)))
+        self.confidence = max(0.0, min(1.0, round(float(self.confidence), 3)))
+        return self
+
+
+class FocusConfig(BaseModel):
+    mode: FocusMode = FocusMode.SMART_AUTO
+    target_x: float = 0.5
+    smoothing: float = 0.75
+    keyframes: List[FocusKeyframe] = Field(default_factory=list)
+    source: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_focus(self) -> "FocusConfig":
+        self.target_x = max(0.0, min(1.0, round(float(self.target_x), 4)))
+        self.smoothing = max(0.0, min(1.0, round(float(self.smoothing), 3)))
+        return self
+
+
 class WordTimestamp(BaseModel):
     word: str
     start_sec: float
@@ -312,6 +348,7 @@ class ClipCandidate(BaseModel):
     tags: List[str] = Field(default_factory=list)
     snapped_to_words: bool = False
     subtitles: Optional[SubtitleConfig] = None
+    focus: Optional[FocusConfig] = None
 
     @model_validator(mode="after")
     def _validate_clip(self) -> "ClipCandidate":
@@ -350,6 +387,7 @@ class ExportSpec(BaseModel):
     burn_captions: bool = True
     caption_font_size: int = 44
     subtitle_config: Optional[SubtitleConfig] = None
+    focus_config: Optional[FocusConfig] = None
     output_dir: str = "exports"
 
 

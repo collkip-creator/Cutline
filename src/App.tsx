@@ -17,7 +17,10 @@ import {
   X,
 } from 'lucide-react';
 import { ArchitectureView } from './components/ArchitectureView';
-import { AudioTranscribeView } from './components/AudioTranscribeView';
+import {
+  AudioTranscribeView,
+  type SaveTranscriptPayload,
+} from './components/AudioTranscribeView';
 import { ClipInspectorTable } from './components/ClipInspectorTable';
 import { ClipPlayerAndTimeline } from './components/ClipPlayerAndTimeline';
 import { DesktopAuthBridgeScreen } from './components/DesktopAuthBridgeScreen';
@@ -888,16 +891,13 @@ export default function App() {
     setQueueModalClip(clip);
   };
 
-  const handleSaveVoiceTranscriptToProject = async (rawText: string) => {
-    if (!activeProject || !rawText.trim()) return;
-    const sentences = rawText
-      .trim()
-      .split(/(?<=[.!?])\s+|\r?\n+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const lines = sentences.length > 0 ? sentences : [rawText.trim()];
-    const totalDur = Math.max(4, activeProject.duration_sec || lines.length * 4);
-    const step = totalDur / lines.length;
+  const handleSaveVoiceTranscriptToProject = async (payload: SaveTranscriptPayload | string) => {
+    const normalizedPayload: SaveTranscriptPayload =
+      typeof payload === 'string' ? { text: payload } : payload;
+    const rawText = normalizedPayload.text || '';
+    if (!activeProject || (!rawText.trim() && !normalizedPayload.segments?.length)) return;
+
+    const totalDur = Math.max(4, activeProject.duration_sec || 30);
     const formatSrtTs = (sec: number) => {
       const clamped = Math.max(0, sec);
       const hrs = Math.floor(clamped / 3600);
@@ -906,13 +906,72 @@ export default function App() {
       const ms = Math.round((clamped - Math.floor(clamped)) * 1000);
       return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
     };
-    const srt = lines
-      .map((line, idx) => {
-        const start = idx * step;
-        const end = Math.max(start + 0.6, (idx + 1) * step - 0.1);
-        return `${idx + 1}\n${formatSrtTs(start)} --> ${formatSrtTs(end)}\n${line}`;
-      })
-      .join('\n\n');
+
+    let srt = '';
+    if (normalizedPayload.segments && normalizedPayload.segments.length > 0) {
+      const validSegs = normalizedPayload.segments.filter((s) => s.text.trim().length > 0);
+      srt = validSegs
+        .map((seg, idx) => {
+          const start = Math.max(0, Math.min(totalDur - 0.3, seg.start_sec));
+          const end = Math.max(start + 0.3, Math.min(totalDur, seg.end_sec));
+          return `${idx + 1}\n${formatSrtTs(start)} --> ${formatSrtTs(end)}\n${seg.text.trim()}`;
+        })
+        .join('\n\n');
+    } else if (rawText.includes('-->')) {
+      srt = rawText.trim();
+    } else {
+      // Parse [MM:SS] / [HH:MM:SS] timestamped lines if present
+      const lines = rawText
+        .trim()
+        .split(/\r?\n+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const tsRe = /^[\[(\*]*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?[\])\*]*\s*(?:[-–—>|:]\s*)?(.*)$/;
+      const parsedLines: Array<{ startSec: number; text: string }> = [];
+      let foundTs = false;
+      for (const ln of lines) {
+        const m = ln.match(tsRe);
+        if (m && m[5]?.trim()) {
+          const hrs = m[1] ? Number(m[1]) : 0;
+          const mins = Number(m[2]);
+          const secs = Number(m[3]);
+          const ms = m[4] ? Number(m[4].padEnd(3, '0')) / 1000 : 0;
+          parsedLines.push({
+            startSec: Math.min(Math.max(0, hrs * 3600 + mins * 60 + secs + ms), totalDur - 0.3),
+            text: m[5].trim(),
+          });
+          foundTs = true;
+        }
+      }
+
+      if (foundTs && parsedLines.length > 0) {
+        srt = parsedLines
+          .map((item, idx) => {
+            const nextStart =
+              idx < parsedLines.length - 1
+                ? parsedLines[idx + 1].startSec
+                : Math.min(totalDur, item.startSec + 4);
+            const end = Math.max(item.startSec + 0.35, Math.min(totalDur, nextStart - 0.04));
+            return `${idx + 1}\n${formatSrtTs(item.startSec)} --> ${formatSrtTs(end)}\n${item.text}`;
+          })
+          .join('\n\n');
+      } else {
+        const sentences = rawText
+          .trim()
+          .split(/(?<=[.!?])\s+|\r?\n+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const fallbackLines = sentences.length > 0 ? sentences : [rawText.trim()];
+        const step = totalDur / fallbackLines.length;
+        srt = fallbackLines
+          .map((line, idx) => {
+            const start = idx * step;
+            const end = Math.max(start + 0.6, (idx + 1) * step - 0.1);
+            return `${idx + 1}\n${formatSrtTs(start)} --> ${formatSrtTs(end)}\n${line}`;
+          })
+          .join('\n\n');
+      }
+    }
 
     const res = await apiFetch(
       `/api/projects/${encodeURIComponent(activeProject.video_hash)}/transcript`,
@@ -925,12 +984,86 @@ export default function App() {
     const data = await readJsonResponse<{ transcript: Transcript }>(res);
     setTranscript(data.transcript);
     setCacheHit(true);
-    setNotice({
-      kind: 'info',
-      text: `Saved voice transcription to "${activeProject.title}" transcript cache (${data.transcript.segments.length} segments).`,
-    });
     setActiveTab('studio');
     setShowTranscriptDrawer(true);
+
+    if (normalizedPayload.runViralAnalysis) {
+      setIsGeneratingViralClips(true);
+      setNotice({
+        kind: 'info',
+        text: `Synced ${data.transcript.segments.length} timestamped segments to "${activeProject.title}". Generating AI viral clips...`,
+      });
+      try {
+        let analyzedClips: ClipCandidate[] = [];
+        const aiRes = await apiFetch('/api/ai/analyze-transcript', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            transcript: data.transcript,
+            prompt,
+            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+            max_clip_sec: 45,
+            max_clips: 6,
+          }),
+        });
+        if (isTauriRuntime && aiRes.status === 404) {
+          const hlRes = await apiFetch(
+            `/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                prompt,
+                ollama_url: ollamaUrl,
+                ollama_model: ollamaModel,
+                min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+                max_clip_sec: 45,
+                max_clips: 6,
+              }),
+            }
+          );
+          const hlData = await readJsonResponse<{ clips: ClipCandidate[] }>(hlRes);
+          analyzedClips = hlData.clips || [];
+        } else {
+          const aiData = await readJsonResponse<{ clips: ClipCandidate[] }>(aiRes);
+          analyzedClips = aiData.clips || [];
+        }
+
+        const enrichedClips = analyzedClips.map((clip) => {
+          const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
+          const tags =
+            existingTags.length >= 3
+              ? existingTags
+              : [...existingTags, ...generateTranscriptHashtags(clip, data.transcript, 3 - existingTags.length)];
+          const sentiment = clip.sentiment || analyzeTranscriptSentiment(clip, data.transcript);
+          return { ...clip, sentiment, tags };
+        });
+
+        setClips(enrichedClips);
+        setActiveClipId(enrichedClips[0]?.id || null);
+        if (enrichedClips.length > 0) {
+          await persistClips(activeProject.video_hash, enrichedClips);
+        }
+        await loadProjects(false);
+        setNotice({
+          kind: 'info',
+          text: `Synced audio timestamps (${data.transcript.segments.length} segments) and generated ${enrichedClips.length} AI viral clips matching the video.`,
+        });
+      } catch (err: any) {
+        setNotice({
+          kind: 'error',
+          text: err?.message || 'Synced transcript, but AI viral clip generation failed.',
+        });
+      } finally {
+        setIsGeneratingViralClips(false);
+      }
+      return;
+    }
+
+    setNotice({
+      kind: 'info',
+      text: `Synced timestamped audio transcript to "${activeProject.title}" (${data.transcript.segments.length} timed segments).`,
+    });
   };
 
   const navItems: Array<{ id: WorkspaceTab; label: string; icon: React.ReactNode }> = [

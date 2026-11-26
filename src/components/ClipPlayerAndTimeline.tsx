@@ -7,6 +7,7 @@ import {
   Download,
   Eye,
   Film,
+  Focus,
   HardDrive,
   Pause,
   Play,
@@ -14,6 +15,7 @@ import {
   Scissors,
   Send,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   Volume2,
   VolumeX,
@@ -24,10 +26,12 @@ import type {
   ClipCandidate,
   EncodeMode,
   ExportResult,
+  FocusConfig,
+  FocusMode,
   ProjectRecord,
   Transcript,
 } from '../types';
-import { apiUrl } from '../lib/api';
+import { apiFetch, apiUrl } from '../lib/api';
 import {
   buildExportFilename,
   cacheExportInLocalStorage,
@@ -102,6 +106,11 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   const [currentTime, setCurrentTime] = useState(0);
   const [markInSec, setMarkInSec] = useState<number | null>(null);
   const [rightPanelTab, setRightPanelTab] = useState<'export' | 'subtitles'>('export');
+  const [isTrackingFocus, setIsTrackingFocus] = useState(false);
+  const [focusError, setFocusError] = useState<string | null>(null);
+  const autoFocusedKeysRef = useRef<Set<string>>(new Set());
+  const activeClipRef = useRef<ClipCandidate | null>(activeClip);
+  activeClipRef.current = activeClip;
   const [savedExports, setSavedExports] = useState<LocalExportEntry[]>([]);
   const [isCachingExport, setIsCachingExport] = useState(false);
   const [downloadingAction, setDownloadingAction] = useState<string | null>(null);
@@ -465,6 +474,136 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
     currentTime >= (activeClip?.start_sec ?? 0) &&
     currentTime <= (activeClip?.start_sec ?? 0) + 3.5;
 
+  const activeFocusConfig: FocusConfig = useMemo(
+    () =>
+      activeClip?.focus || {
+        mode: 'smart_auto',
+        target_x: 0.5,
+        smoothing: 0.75,
+        keyframes: [],
+      },
+    [activeClip?.focus]
+  );
+
+  const liveFocusState = useMemo(() => {
+    if (aspectRatio !== '9:16') {
+      return { xNorm: 0.5, label: 'Full 16:9 frame' };
+    }
+    if (activeFocusConfig.mode === 'center') {
+      return { xNorm: 0.5, label: 'Center lock' };
+    }
+    if (activeFocusConfig.mode === 'manual') {
+      return {
+        xNorm: activeFocusConfig.target_x,
+        label: `Manual ${Math.round(activeFocusConfig.target_x * 100)}%`,
+      };
+    }
+    const kfs = [...(activeFocusConfig.keyframes || [])].sort(
+      (a, b) => a.time_sec - b.time_sec
+    );
+    if (kfs.length === 0) {
+      return { xNorm: activeFocusConfig.target_x ?? 0.5, label: 'Auto-tracking' };
+    }
+    if (kfs.length === 1 || clipRelativeTime <= kfs[0].time_sec) {
+      return {
+        xNorm: kfs[0].x_norm,
+        label: kfs[0].label || 'Tracked subject',
+      };
+    }
+    if (clipRelativeTime >= kfs[kfs.length - 1].time_sec) {
+      const last = kfs[kfs.length - 1];
+      return { xNorm: last.x_norm, label: last.label || 'Tracked subject' };
+    }
+    for (let i = 0; i < kfs.length - 1; i++) {
+      const a = kfs[i];
+      const b = kfs[i + 1];
+      if (clipRelativeTime >= a.time_sec && clipRelativeTime <= b.time_sec) {
+        const dt = Math.max(0.05, b.time_sec - a.time_sec);
+        const dx = b.x_norm - a.x_norm;
+        // Snap cleanly across fast speaker switches, smoothly pan otherwise
+        if (Math.abs(dx) >= 0.28 && dt <= 0.6) {
+          return { xNorm: a.x_norm, label: a.label || 'Tracked subject' };
+        }
+        const frac = (clipRelativeTime - a.time_sec) / dt;
+        return {
+          xNorm: a.x_norm + dx * frac,
+          label: (frac < 0.5 ? a.label : b.label) || 'Tracked subject',
+        };
+      }
+    }
+    return { xNorm: activeFocusConfig.target_x ?? 0.5, label: 'Tracked subject' };
+  }, [aspectRatio, activeFocusConfig, clipRelativeTime]);
+
+  const focusObjectPosPct = useMemo(() => {
+    if (aspectRatio !== '9:16') return 50;
+    const srcAspect =
+      project.width && project.height ? project.width / project.height : 16 / 9;
+    const cropWidthNorm = Math.min(1, 9 / 16 / Math.max(0.2, srcAspect));
+    if (cropWidthNorm >= 0.99) return 50;
+    const maxOffset = Math.max(0.0001, 1 - cropWidthNorm);
+    const clampedLeft = Math.max(
+      0,
+      Math.min(maxOffset, liveFocusState.xNorm - cropWidthNorm / 2)
+    );
+    return Math.round((clampedLeft / maxOffset) * 1000) / 10;
+  }, [aspectRatio, project.width, project.height, liveFocusState.xNorm]);
+
+  const runFocusAnalysis = async (clipToTrack: ClipCandidate) => {
+    setIsTrackingFocus(true);
+    setFocusError(null);
+    try {
+      const res = await apiFetch(`/api/projects/${project.video_hash}/focus`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clip: clipToTrack, use_ai: true }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody?.error || errBody?.detail || 'Focus tracking failed');
+      }
+      const nextFocus: FocusConfig = await res.json();
+      const latestClip =
+        activeClipRef.current?.id === clipToTrack.id ? activeClipRef.current : clipToTrack;
+      onChangeClip({
+        ...latestClip,
+        focus: {
+          ...nextFocus,
+          mode: 'smart_auto',
+        },
+      });
+    } catch (err: any) {
+      setFocusError(err?.message || 'Unable to analyze subject focus');
+    } finally {
+      setIsTrackingFocus(false);
+    }
+  };
+
+  useEffect(() => {
+    if (aspectRatio !== '9:16' || !activeClip) return;
+    if (activeClip.focus?.mode && activeClip.focus.mode !== 'smart_auto') return;
+    if (activeClip.focus?.keyframes && activeClip.focus.keyframes.length > 0) return;
+
+    const cacheKey = `${project.video_hash}:${activeClip.id}:${activeClip.start_sec.toFixed(2)}-${activeClip.end_sec.toFixed(2)}`;
+    if (autoFocusedKeysRef.current.has(cacheKey)) return;
+    autoFocusedKeysRef.current.add(cacheKey);
+
+    void runFocusAnalysis(activeClip);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aspectRatio, project.video_hash, activeClip?.id, activeClip?.start_sec, activeClip?.end_sec]);
+
+  const handleFocusModeChange = (mode: FocusMode) => {
+    if (!activeClip) return;
+    const nextFocus: FocusConfig = {
+      ...activeFocusConfig,
+      mode,
+      target_x: mode === 'center' ? 0.5 : activeFocusConfig.target_x,
+    };
+    onChangeClip({
+      ...activeClip,
+      focus: nextFocus,
+    });
+  };
+
   const subtitleFontClass =
     activeSubtitleConfig.font_size >= 54
       ? 'text-sm sm:text-base'
@@ -550,8 +689,20 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
                 playsInline
-                className="w-full h-full object-cover"
+                style={
+                  aspectRatio === '9:16'
+                    ? { objectPosition: `${focusObjectPosPct}% 50%` }
+                    : undefined
+                }
+                className="w-full h-full object-cover transition-[object-position] duration-200 ease-out"
               />
+
+              {aspectRatio === '9:16' && activeClip && (
+                <div className="pointer-events-none absolute top-2 left-2 z-10 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-black/65 border border-slate-700/70 text-[10px] font-medium text-slate-200 backdrop-blur-sm">
+                  <Focus className="w-3 h-3 text-emerald-400" />
+                  <span>{isTrackingFocus ? 'Tracking...' : liveFocusState.label}</span>
+                </div>
+              )}
 
               {/* Measured Scrim & Live Caption Preview */}
               {subtitlesPreviewVisible && (
@@ -824,6 +975,104 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                 </button>
               )}
             </div>
+
+            {/* Intelligent Subject Focus (9:16 Auto-Framing) */}
+            {activeClip && (
+              <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-300">
+                    <Focus className="w-3.5 h-3.5 text-emerald-400" />
+                    Intelligent Subject Focus
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isTrackingFocus}
+                    onClick={() => runFocusAnalysis(activeClip)}
+                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium bg-emerald-600/20 hover:bg-emerald-600/30 disabled:opacity-50 border border-emerald-500/40 text-emerald-200 rounded transition-colors"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    {isTrackingFocus ? 'Tracking...' : 'Track Speaker / Action'}
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-3 gap-1 bg-[#0B0F17] border border-slate-800 rounded p-1 text-[11px]">
+                  {(
+                    [
+                      { id: 'smart_auto', label: 'Smart Auto' },
+                      { id: 'manual', label: 'Manual X' },
+                      { id: 'center', label: 'Center Lock' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => handleFocusModeChange(opt.id)}
+                      className={`py-1 font-medium rounded transition-colors ${
+                        activeFocusConfig.mode === opt.id
+                          ? 'bg-blue-600 text-white'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                {activeFocusConfig.mode === 'manual' && (
+                  <div className="bg-[#0B0F17] border border-slate-800 rounded px-2.5 py-2 space-y-1">
+                    <div className="flex items-center justify-between text-[11px] text-slate-400">
+                      <span>Horizontal Subject Anchor</span>
+                      <span className="font-mono tabular-nums text-slate-200">
+                        {Math.round(activeFocusConfig.target_x * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={12}
+                      max={88}
+                      step={1}
+                      value={Math.round(activeFocusConfig.target_x * 100)}
+                      onChange={(e) =>
+                        onChangeClip({
+                          ...activeClip,
+                          focus: {
+                            ...activeFocusConfig,
+                            mode: 'manual',
+                            target_x: Number(e.target.value) / 100,
+                            source: 'manual',
+                          },
+                        })
+                      }
+                      aria-label="Horizontal subject focus position"
+                      className="w-full accent-emerald-500 cursor-pointer"
+                    />
+                  </div>
+                )}
+
+                {activeFocusConfig.mode === 'smart_auto' &&
+                  activeFocusConfig.keyframes &&
+                  activeFocusConfig.keyframes.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {activeFocusConfig.keyframes.slice(0, 6).map((kf, idx) => (
+                        <button
+                          key={`${kf.time_sec}-${idx}`}
+                          type="button"
+                          onClick={() => seekTo(activeClip.start_sec + kf.time_sec)}
+                          title={`Jump to ${kf.time_sec.toFixed(1)}s (${Math.round(kf.x_norm * 100)}% horizontal)`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono bg-[#0B0F17] hover:bg-slate-800 border border-slate-800 text-slate-300 rounded transition-colors"
+                        >
+                          <span className="text-emerald-400">{kf.time_sec.toFixed(1)}s</span>
+                          <span>{kf.label || `${Math.round(kf.x_norm * 100)}%`}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                {focusError && (
+                  <p className="text-[11px] text-rose-400">{focusError}</p>
+                )}
+              </div>
+            )}
 
             {/* Fine Trim Nudgers */}
             {activeClip && (

@@ -49,6 +49,24 @@ export interface SubtitleConfig {
   custom_cues?: SubtitleCue[];
 }
 
+export type FocusMode = 'smart_auto' | 'center' | 'manual';
+
+export interface FocusKeyframe {
+  time_sec: number;
+  x_norm: number;
+  y_norm: number;
+  confidence: number;
+  label?: string;
+}
+
+export interface FocusConfig {
+  mode: FocusMode;
+  target_x: number;
+  smoothing: number;
+  keyframes: FocusKeyframe[];
+  source?: string;
+}
+
 export interface ClipCandidate {
   id: string;
   title: string;
@@ -64,6 +82,7 @@ export interface ClipCandidate {
   tags: string[];
   snapped_to_words?: boolean;
   subtitles?: SubtitleConfig;
+  focus?: FocusConfig;
 }
 
 export interface ProjectRecord {

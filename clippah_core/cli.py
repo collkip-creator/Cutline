@@ -20,6 +20,7 @@ from .adapters.social_adapters import (
     test_webhook_endpoint,
 )
 from .core.captions import generate_ass, generate_srt
+from .core.focus import analyze_clip_focus
 from .core.grounding import ground_and_deduplicate_clips, snap_clip_to_words
 from .core.queue import PublishQueueStore
 from .core.schemas import (
@@ -27,6 +28,7 @@ from .core.schemas import (
     ClipCandidate,
     EncodeMode,
     ExportSpec,
+    FocusConfig,
     PublishPlatform,
     PublishStatus,
     SubtitleConfig,
@@ -46,6 +48,7 @@ def main() -> None:
     sub.add_parser("snap", help="Snap a clip JSON payload to word boundaries")
     sub.add_parser("highlights", help="Run Ollama/offline highlight extraction + grounding")
     sub.add_parser("captions", help="Generate SRT & ASS captions for a clip")
+    sub.add_parser("focus", help="Analyze clip video frames to track active speaker or main action")
     sub.add_parser("export", help="Render clip with FFmpegVideoProcessor")
 
     q_parser = sub.add_parser("queue", help="Manage SQLite PublishQueueStore")
@@ -115,6 +118,19 @@ def main() -> None:
         print(json.dumps({"srt": srt, "ass": ass}))
         return
 
+    if args.cmd == "focus":
+        payload = _read_stdin_json()
+        clip_raw = payload.get("clip") or {}
+        start_sec = float(payload.get("start_sec", clip_raw.get("start_sec", 0.0)))
+        end_sec = float(payload.get("end_sec", clip_raw.get("end_sec", start_sec + 5.0)))
+        focus = analyze_clip_focus(
+            Path(payload["source_path"]),
+            start_sec=start_sec,
+            end_sec=end_sec,
+        )
+        print(focus.model_dump_json())
+        return
+
     if args.cmd == "export":
         payload = _read_stdin_json()
         clip = ClipCandidate.model_validate(payload["clip"])
@@ -123,6 +139,11 @@ def main() -> None:
             SubtitleConfig.model_validate(payload["subtitle_config"])
             if payload.get("subtitle_config")
             else clip.subtitles
+        )
+        focus_config = (
+            FocusConfig.model_validate(payload["focus_config"])
+            if payload.get("focus_config")
+            else clip.focus
         )
         aspect = AspectRatio(payload.get("aspect_ratio", "9:16"))
         encode_mode = EncodeMode(payload.get("encode_mode", "reencode"))
@@ -138,6 +159,7 @@ def main() -> None:
             include_srt=include_srt,
             burn_captions=burn_captions,
             subtitle_config=subtitle_config,
+            focus_config=focus_config,
             output_dir=payload["output_dir"],
         )
         srt_text = generate_srt(clip, transcript, subtitle_config=subtitle_config) if include_srt else None
