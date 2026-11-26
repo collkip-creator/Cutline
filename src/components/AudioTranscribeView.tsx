@@ -12,7 +12,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import { readJsonResponse, socialApiFetch } from '../lib/api';
+import { apiFetch, isTauriRuntime, readJsonResponse } from '../lib/api';
 import type { ProjectRecord } from '../types';
 
 interface AudioTranscribeViewProps {
@@ -177,10 +177,15 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
       formData.append('mimeType', mimeType);
       formData.append('prompt', instruction);
 
-      const res = await socialApiFetch('/api/audio/transcribe', {
+      const res = await apiFetch('/api/audio/transcribe', {
         method: 'POST',
         body: formData,
       });
+      if (isTauriRuntime && res.status === 404) {
+        throw new Error(
+          'Your local desktop sidecar binary does not include /api/audio/transcribe yet. Rebuild the desktop bundle or use the web app for microphone transcription.'
+        );
+      }
       const data = await readJsonResponse<{ text: string; model: string; mimeType: string }>(res);
       const cleanText = (data.text || '').trim();
       setTranscriptText(cleanText);

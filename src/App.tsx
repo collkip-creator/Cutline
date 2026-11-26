@@ -33,7 +33,6 @@ import {
   isTauriRuntime,
   readJsonResponse,
   restartTauriSidecar,
-  socialApiFetch,
   type SidecarDiagnostics,
 } from './lib/api';
 import { downloadUrlViaBlob } from './lib/localExports';
@@ -640,48 +639,56 @@ export default function App() {
         note?: string;
       };
 
-      if (isTauriRuntime) {
+      const res = await apiFetch(
+        `/api/projects/${encodeURIComponent(activeProject.video_hash)}/ai-viral-clips`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            retranscribe,
+            ollama_url: ollamaUrl,
+            ollama_model: ollamaModel,
+            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
+            max_clip_sec: 45,
+            max_clips: 6,
+          }),
+        }
+      );
+
+      if (isTauriRuntime && res.status === 404) {
+        // Older local sidecar binary fallback: compose /transcribe + /highlights locally
         let currentTranscript = retranscribe ? null : transcript;
         if (!currentTranscript) {
           currentTranscript = await handleTranscribe(activeProject.video_hash, retranscribe);
         }
         if (!currentTranscript || currentTranscript.segments.length === 0) {
-          throw new Error('Could not transcribe local video before running AI viral clip analysis.');
+          throw new Error('Could not transcribe local video before generating viral clips.');
         }
-        const aiRes = await socialApiFetch('/api/ai/analyze-transcript', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            transcript: currentTranscript,
-            prompt,
-            min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
-            max_clip_sec: 45,
-            max_clips: 6,
-          }),
-        });
-        const aiData = await readJsonResponse<{ clips: ClipCandidate[]; analysis_model: string }>(aiRes);
-        data = {
-          transcript: currentTranscript,
-          clips: aiData.clips,
-          cache_hit: true,
-          transcript_model: currentTranscript.model_name,
-          analysis_model: aiData.analysis_model,
-        };
-      } else {
-        const res = await apiFetch(
-          `/api/projects/${encodeURIComponent(activeProject.video_hash)}/ai-viral-clips`,
+        const hlRes = await apiFetch(
+          `/api/projects/${encodeURIComponent(activeProject.video_hash)}/highlights`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               prompt,
-              retranscribe,
+              ollama_url: ollamaUrl,
+              ollama_model: ollamaModel,
               min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
               max_clip_sec: 45,
               max_clips: 6,
             }),
           }
         );
+        const hlData = await readJsonResponse<{ clips: ClipCandidate[] }>(hlRes);
+        data = {
+          transcript: currentTranscript,
+          clips: hlData.clips || [],
+          cache_hit: true,
+          transcript_model: currentTranscript.model_name,
+          analysis_model: 'local-sidecar',
+        };
+      } else {
         data = await readJsonResponse(res);
       }
 

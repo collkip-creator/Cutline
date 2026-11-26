@@ -625,18 +625,87 @@ def extract_highlights(video_hash: str, req: HighlightsRequest):
     return {"clips": proj["clips"]}
 
 
+@app.post("/api/audio/transcribe")
+async def transcribe_microphone_audio(request: Request):
+    form = await request.form()
+    audio_file = form.get("audio")
+    if not audio_file or not hasattr(audio_file, "read"):
+        raise HTTPException(status_code=400, detail="No audio recording was provided for transcription.")
+
+    raw_bytes = await audio_file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio recording provided.")
+
+    mime_type = str(form.get("mimeType") or getattr(audio_file, "content_type", None) or "audio/webm").split(";")[0].strip()
+    prompt_text = str(form.get("prompt") or "Transcribe this spoken audio accurately into clean text with proper punctuation.").strip()
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        import base64
+        import urllib.request
+
+        payload = json.dumps({
+            "contents": [{
+                "parts": [
+                    {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(raw_bytes).decode("ascii")}},
+                    {"text": prompt_text},
+                ]
+            }]
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-transcribe:generateContent",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": gemini_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return {"text": text, "model": "gemini-3.5-transcribe", "mimeType": mime_type}
+
+    import tempfile
+
+    ext = ".wav" if "wav" in mime_type else ".mp3" if "mp3" in mime_type or "mpeg" in mime_type else ".m4a" if "mp4" in mime_type else ".webm"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_path = Path(tmpdir) / f"mic{ext}"
+        wav_path = Path(tmpdir) / "mic_16k.wav"
+        src_path.write_bytes(raw_bytes)
+        ffmpeg_bin = resolve_media_binary("ffmpeg")
+        subprocess.run(
+            [ffmpeg_bin, "-y", "-i", str(src_path), "-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", str(wav_path)],
+            capture_output=True,
+            check=True,
+        )
+        tr = pipeline.transcriber.transcribe(wav_path, video_hash=f"mic_{int(time.time())}")
+        text = " ".join(s.text.strip() for s in tr.segments).strip()
+        return {"text": text, "model": pipeline.transcriber.model_identifier, "mimeType": mime_type}
+
+
 @app.post("/api/projects/{video_hash}/ai-viral-clips")
-def ai_viral_clips(video_hash: str, req: HighlightsRequest):
+def ai_viral_clips(video_hash: str, req: Dict[str, Any]):
     proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
-    tr = cache_store.get(video_hash)
+    retranscribe = bool(req.get("retranscribe", False))
+    tr = None if retranscribe else cache_store.get(video_hash)
     cache_hit = tr is not None
     if not tr:
-        tr_res = transcribe_project(video_hash, {"force": False})
+        tr_res = transcribe_project(video_hash, {"force": retranscribe})
         tr = Transcript.model_validate(tr_res["transcript"])
         cache_hit = bool(tr_res.get("cache_hit", False))
-    hl_res = extract_highlights(video_hash, req)
+    hl_req = HighlightsRequest(
+        prompt=str(req.get("prompt") or "Strongest viral hooks, insights, and stories"),
+        ollama_url=str(req.get("ollama_url") or "http://localhost:11434"),
+        ollama_model=str(req.get("ollama_model") or "qwen2.5:14b"),
+        min_clip_sec=float(req.get("min_clip_sec") or 6.0),
+        max_clip_sec=float(req.get("max_clip_sec") or 45.0),
+        max_clips=int(req.get("max_clips") or 6),
+    )
+    hl_res = extract_highlights(video_hash, hl_req)
     return {
         "transcript": tr.model_dump(),
         "clips": hl_res["clips"],
