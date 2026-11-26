@@ -159,6 +159,52 @@ class ClipCategory(str, Enum):
     HOOK = "hook"
 
 
+class SubtitlePreset(str, Enum):
+    CLASSIC = "classic"
+    BOLD_BOX = "bold_box"
+    YELLOW_POP = "yellow_pop"
+    MINIMAL = "minimal"
+
+
+class SubtitlePosition(str, Enum):
+    BOTTOM = "bottom"
+    MIDDLE = "middle"
+    TOP = "top"
+
+
+class SubtitleCue(BaseModel):
+    id: str = "cue_1"
+    start_sec: float = 0.0
+    end_sec: float = 2.0
+    text: str = ""
+
+    @model_validator(mode="after")
+    def _validate_cue(self) -> "SubtitleCue":
+        if self.start_sec < 0:
+            self.start_sec = 0.0
+        if self.end_sec <= self.start_sec:
+            self.end_sec = round(self.start_sec + 0.5, 3)
+        return self
+
+
+class SubtitleConfig(BaseModel):
+    enabled: bool = True
+    preset: SubtitlePreset = SubtitlePreset.CLASSIC
+    position: SubtitlePosition = SubtitlePosition.BOTTOM
+    font_size: int = 44
+    show_hook_banner: bool = True
+    custom_cues: List[SubtitleCue] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "SubtitleConfig":
+        try:
+            fs = int(self.font_size)
+        except (TypeError, ValueError):
+            fs = 44
+        self.font_size = max(24, min(72, fs))
+        return self
+
+
 class WordTimestamp(BaseModel):
     word: str
     start_sec: float
@@ -255,6 +301,7 @@ class ClipCandidate(BaseModel):
     id: str
     title: str
     category: ClipCategory = ClipCategory.INSIGHT
+    sentiment: Optional[str] = None
     start_sec: float
     end_sec: float
     hook_score: float
@@ -264,6 +311,7 @@ class ClipCandidate(BaseModel):
     caption_hook: str
     tags: List[str] = Field(default_factory=list)
     snapped_to_words: bool = False
+    subtitles: Optional[SubtitleConfig] = None
 
     @model_validator(mode="after")
     def _validate_clip(self) -> "ClipCandidate":
@@ -301,6 +349,7 @@ class ExportSpec(BaseModel):
     include_srt: bool = True
     burn_captions: bool = True
     caption_font_size: int = 44
+    subtitle_config: Optional[SubtitleConfig] = None
     output_dir: str = "exports"
 
 

@@ -29,6 +29,7 @@ from .core.schemas import (
     ExportSpec,
     PublishPlatform,
     PublishStatus,
+    SubtitleConfig,
     Transcript,
 )
 
@@ -102,31 +103,49 @@ def main() -> None:
     if args.cmd == "captions":
         payload = _read_stdin_json()
         clip = ClipCandidate.model_validate(payload["clip"])
-        transcript = Transcript.model_validate(payload["transcript"])
+        transcript = Transcript.model_validate(payload["transcript"]) if payload.get("transcript") else None
+        subtitle_config = (
+            SubtitleConfig.model_validate(payload["subtitle_config"])
+            if payload.get("subtitle_config")
+            else clip.subtitles
+        )
         aspect = AspectRatio(payload.get("aspect_ratio", "9:16"))
-        srt = generate_srt(clip, transcript)
-        ass = generate_ass(clip, transcript, aspect_ratio=aspect)
+        srt = generate_srt(clip, transcript, subtitle_config=subtitle_config)
+        ass = generate_ass(clip, transcript, aspect_ratio=aspect, subtitle_config=subtitle_config)
         print(json.dumps({"srt": srt, "ass": ass}))
         return
 
     if args.cmd == "export":
         payload = _read_stdin_json()
         clip = ClipCandidate.model_validate(payload["clip"])
-        transcript = Transcript.model_validate(payload["transcript"])
+        transcript = Transcript.model_validate(payload["transcript"]) if payload.get("transcript") else None
+        subtitle_config = (
+            SubtitleConfig.model_validate(payload["subtitle_config"])
+            if payload.get("subtitle_config")
+            else clip.subtitles
+        )
         aspect = AspectRatio(payload.get("aspect_ratio", "9:16"))
         encode_mode = EncodeMode(payload.get("encode_mode", "reencode"))
         include_srt = bool(payload.get("include_srt", True))
         burn_captions = bool(payload.get("burn_captions", True))
+        if subtitle_config is not None and not subtitle_config.enabled:
+            include_srt = False
+            burn_captions = False
         spec = ExportSpec(
             clip=clip,
             aspect_ratio=aspect,
             encode_mode=encode_mode,
             include_srt=include_srt,
             burn_captions=burn_captions,
+            subtitle_config=subtitle_config,
             output_dir=payload["output_dir"],
         )
-        srt_text = generate_srt(clip, transcript) if include_srt else None
-        ass_text = generate_ass(clip, transcript, aspect_ratio=aspect) if burn_captions else None
+        srt_text = generate_srt(clip, transcript, subtitle_config=subtitle_config) if include_srt else None
+        ass_text = (
+            generate_ass(clip, transcript, aspect_ratio=aspect, subtitle_config=subtitle_config)
+            if burn_captions
+            else None
+        )
         processor = FFmpegVideoProcessor()
         result = processor.render_clip(
             Path(payload["source_path"]),

@@ -854,16 +854,21 @@ export default function App() {
     setIsExporting(true);
     setNotice(null);
     try {
+      const effectiveIncludeSrt =
+        activeClip.subtitles?.enabled === false ? false : includeSrt;
+      const effectiveBurnCaptions =
+        activeClip.subtitles?.enabled === false ? false : burnCaptions;
       const res = await apiFetch('/api/clips/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           video_hash: activeProject.video_hash,
           clip: activeClip,
+          subtitle_config: activeClip.subtitles || null,
           aspect_ratio: aspectRatio,
           encode_mode: encodeMode,
-          include_srt: includeSrt,
-          burn_captions: burnCaptions,
+          include_srt: effectiveIncludeSrt,
+          burn_captions: effectiveBurnCaptions,
         }),
       });
       const data = await readJsonResponse<ExportResult>(res);
@@ -1426,6 +1431,7 @@ export default function App() {
                     burnCaptions={burnCaptions}
                     onBurnCaptionsChange={setBurnCaptions}
                     onSelectClip={(c) => setActiveClipId(c.id)}
+                    onChangeClip={handleChangeClip}
                     onUpdateClipBounds={handleUpdateClipBounds}
                     onAddClipRange={(s, e) => handleAddManualClip(s, e)}
                     onExportClip={handleExportActiveClip}

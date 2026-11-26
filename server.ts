@@ -982,7 +982,8 @@ print(res.model_dump_json())
     try {
       const stdout = await runPythonCli(['captions'], {
         clip: req.body.clip,
-        transcript: req.body.transcript,
+        transcript: req.body.transcript || null,
+        subtitle_config: req.body.subtitle_config || req.body.clip?.subtitles || null,
         aspect_ratio: req.body.aspect_ratio || '9:16',
       });
       res.json(JSON.parse(stdout));
@@ -999,16 +1000,21 @@ print(res.model_dump_json())
         res.status(404).json({ error: 'Project not found' });
         return;
       }
-      const transcript = readCachedTranscript(hash);
-      if (!transcript) {
-        res.status(400).json({ error: 'Transcript missing for export' });
-        return;
-      }
+      const transcript = readCachedTranscript(hash) || {
+        video_hash: hash,
+        source_path: project.local_path,
+        language: 'en',
+        duration_sec: project.duration_sec || 10,
+        model_name: 'manual',
+        created_at_iso: new Date().toISOString(),
+        segments: [],
+      };
 
       const stdout = await runPythonCli(['export'], {
         source_path: project.local_path,
         clip: req.body.clip,
         transcript,
+        subtitle_config: req.body.subtitle_config || req.body.clip?.subtitles || null,
         aspect_ratio: req.body.aspect_ratio || '9:16',
         encode_mode: req.body.encode_mode || 'reencode',
         include_srt: req.body.include_srt !== false,

@@ -30,6 +30,24 @@ export interface Transcript {
 
 export type ClipCategory = 'lesson' | 'entertainment' | 'insight' | 'hook';
 export type ClipSentiment = 'Positive' | 'Negative' | 'Neutral';
+export type SubtitlePreset = 'classic' | 'bold_box' | 'yellow_pop' | 'minimal';
+export type SubtitlePosition = 'bottom' | 'middle' | 'top';
+
+export interface SubtitleCue {
+  id: string;
+  start_sec: number;
+  end_sec: number;
+  text: string;
+}
+
+export interface SubtitleConfig {
+  enabled: boolean;
+  preset: SubtitlePreset;
+  position: SubtitlePosition;
+  font_size: number;
+  show_hook_banner: boolean;
+  custom_cues?: SubtitleCue[];
+}
 
 export interface ClipCandidate {
   id: string;
@@ -45,6 +63,7 @@ export interface ClipCandidate {
   caption_hook: string;
   tags: string[];
   snapped_to_words?: boolean;
+  subtitles?: SubtitleConfig;
 }
 
 export interface ProjectRecord {

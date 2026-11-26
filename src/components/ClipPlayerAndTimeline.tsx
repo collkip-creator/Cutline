@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Captions,
   Check,
   Copy,
   Download,
@@ -12,6 +13,7 @@ import {
   RotateCcw,
   Scissors,
   Send,
+  SlidersHorizontal,
   Trash2,
   Volume2,
   VolumeX,
@@ -36,6 +38,10 @@ import {
   triggerBlobDownload,
   type LocalExportEntry,
 } from '../lib/localExports';
+import {
+  ClipSubtitleEditor,
+  DEFAULT_SUBTITLE_CONFIG,
+} from './ClipSubtitleEditor';
 
 interface ClipPlayerAndTimelineProps {
   project: ProjectRecord;
@@ -51,6 +57,7 @@ interface ClipPlayerAndTimelineProps {
   burnCaptions: boolean;
   onBurnCaptionsChange: (val: boolean) => void;
   onSelectClip: (clip: ClipCandidate) => void;
+  onChangeClip: (updated: ClipCandidate) => void;
   onUpdateClipBounds: (clipId: string, startSec: number, endSec: number) => void;
   onAddClipRange: (startSec: number, endSec: number) => void;
   onExportClip: () => Promise<void>;
@@ -80,6 +87,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   burnCaptions,
   onBurnCaptionsChange,
   onSelectClip,
+  onChangeClip,
   onUpdateClipBounds,
   onAddClipRange,
   onExportClip,
@@ -93,6 +101,7 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
   const [loopClip, setLoopClip] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [markInSec, setMarkInSec] = useState<number | null>(null);
+  const [rightPanelTab, setRightPanelTab] = useState<'export' | 'subtitles'>('export');
   const [savedExports, setSavedExports] = useState<LocalExportEntry[]>([]);
   const [isCachingExport, setIsCachingExport] = useState(false);
   const [downloadingAction, setDownloadingAction] = useState<string | null>(null);
@@ -402,8 +411,34 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
     setCurrentTime(clamped);
   };
 
+  const activeSubtitleConfig = useMemo(
+    () => ({
+      ...DEFAULT_SUBTITLE_CONFIG,
+      ...(activeClip?.subtitles || {}),
+    }),
+    [activeClip?.subtitles]
+  );
+
+  const subtitlesPreviewVisible = activeClip?.subtitles
+    ? activeClip.subtitles.enabled
+    : burnCaptions || includeSrt;
+
+  const clipRelativeTime = activeClip
+    ? Math.max(0, currentTime - activeClip.start_sec)
+    : 0;
+
   // Determine live caption text at current playhead
   const activeCaptionLine = useMemo(() => {
+    if (!subtitlesPreviewVisible) return '';
+
+    const customCues = activeClip?.subtitles?.custom_cues;
+    if (Array.isArray(customCues)) {
+      if (!activeClip) return '';
+      const rel = currentTime - activeClip.start_sec;
+      const hit = customCues.find((c) => rel >= c.start_sec - 0.05 && rel <= c.end_sec + 0.05);
+      return hit?.text.trim() || '';
+    }
+
     if (!transcript) return '';
     const allWords = transcript.segments.flatMap((s) =>
       s.words.length > 0
@@ -420,13 +455,33 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
       (s) => currentTime >= s.start_sec && currentTime <= s.end_sec
     );
     return seg?.text || '';
-  }, [transcript, currentTime]);
+  }, [subtitlesPreviewVisible, activeClip, transcript, currentTime]);
 
   const showHookOverlay =
+    subtitlesPreviewVisible &&
+    activeSubtitleConfig.show_hook_banner &&
     Boolean(activeClip?.caption_hook) &&
     Boolean(activeClip) &&
     currentTime >= (activeClip?.start_sec ?? 0) &&
     currentTime <= (activeClip?.start_sec ?? 0) + 3.5;
+
+  const subtitleFontClass =
+    activeSubtitleConfig.font_size >= 54
+      ? 'text-sm sm:text-base'
+      : activeSubtitleConfig.font_size >= 46
+        ? 'text-xs sm:text-sm'
+        : activeSubtitleConfig.font_size >= 38
+          ? 'text-[11px] sm:text-xs'
+          : 'text-[10px] sm:text-[11px]';
+
+  const subtitlePresetClass =
+    activeSubtitleConfig.preset === 'bold_box'
+      ? 'text-white font-bold bg-[#0B0F17]/95 border border-slate-700/80 px-3 py-1.5 rounded shadow-lg'
+      : activeSubtitleConfig.preset === 'yellow_pop'
+        ? 'text-amber-300 font-extrabold uppercase tracking-tight bg-black/50 px-2.5 py-1 rounded drop-shadow-[0_2px_4px_rgba(0,0,0,0.98)]'
+        : activeSubtitleConfig.preset === 'minimal'
+          ? 'text-slate-100 font-medium px-2 py-0.5 drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)]'
+          : 'text-white font-semibold bg-black/55 px-2.5 py-1 rounded drop-shadow-[0_2px_4px_rgba(0,0,0,0.95)]';
 
   return (
     <div className="flex flex-col gap-4">
@@ -499,18 +554,32 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
               />
 
               {/* Measured Scrim & Live Caption Preview */}
-              {(burnCaptions || includeSrt) && (
+              {subtitlesPreviewVisible && (
                 <div className="pointer-events-none absolute inset-0 flex flex-col justify-between p-3 bg-gradient-to-t from-black/75 via-transparent to-black/35">
-                  <div className="flex justify-center pt-2">
+                  <div className="flex flex-col items-center gap-2 pt-2">
                     {showHookOverlay && activeClip?.caption_hook && (
                       <div className="bg-slate-50 text-slate-950 font-display font-bold text-center text-[11px] sm:text-xs px-2.5 py-1 rounded shadow-md tracking-tight max-w-[92%]">
                         {activeClip.caption_hook}
                       </div>
                     )}
+                    {activeSubtitleConfig.position === 'top' && activeCaptionLine && (
+                      <p className={`text-center leading-snug max-w-[94%] ${subtitleFontClass} ${subtitlePresetClass}`}>
+                        {activeCaptionLine}
+                      </p>
+                    )}
                   </div>
+
+                  <div className="flex justify-center">
+                    {activeSubtitleConfig.position === 'middle' && activeCaptionLine && (
+                      <p className={`text-center leading-snug max-w-[94%] ${subtitleFontClass} ${subtitlePresetClass}`}>
+                        {activeCaptionLine}
+                      </p>
+                    )}
+                  </div>
+
                   <div className="flex justify-center pb-3">
-                    {activeCaptionLine && (
-                      <p className="text-center text-white font-semibold text-xs sm:text-sm leading-snug drop-shadow-[0_2px_4px_rgba(0,0,0,0.95)] bg-black/55 px-2.5 py-1 rounded max-w-[94%]">
+                    {activeSubtitleConfig.position === 'bottom' && activeCaptionLine && (
+                      <p className={`text-center leading-snug max-w-[94%] ${subtitleFontClass} ${subtitlePresetClass}`}>
                         {activeCaptionLine}
                       </p>
                     )}
@@ -598,16 +667,78 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
           </div>
         </div>
 
-        {/* Right: Export & Render Options */}
+        {/* Right: Export, Trim & Clip Subtitles */}
         <div className="xl:col-span-5 bg-[#111724] border border-slate-800/90 rounded-lg p-4 flex flex-col justify-between gap-4">
           <div className="space-y-4">
-            <div className="pb-3 border-b border-slate-800/80">
-              <h3 className="text-sm font-semibold text-slate-100">Clip Export & Render Options</h3>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Processed locally via FFmpegVideoProcessor with zero cloud upload.
-              </p>
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-100">
+                  {rightPanelTab === 'subtitles' ? 'Clip Subtitles & Styling' : 'Clip Export & Render Options'}
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {rightPanelTab === 'subtitles'
+                    ? 'Customize on-clip subtitle lines, preset style, placement & size.'
+                    : 'Processed locally via FFmpegVideoProcessor with zero cloud upload.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-1 p-1 bg-[#0B0F17] border border-slate-800 rounded-md shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setRightPanelTab('export')}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+                    rightPanelTab === 'export'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <SlidersHorizontal className="w-3 h-3" />
+                  Export
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRightPanelTab('subtitles')}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+                    rightPanelTab === 'subtitles'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Captions className="w-3 h-3" />
+                  Subtitles
+                  {activeClip?.subtitles?.custom_cues?.length ? (
+                    <span className="px-1 py-0.2 text-[10px] rounded bg-black/30 text-blue-200 font-mono">
+                      {activeClip.subtitles.custom_cues.length}
+                    </span>
+                  ) : null}
+                </button>
+              </div>
             </div>
 
+            {rightPanelTab === 'subtitles' ? (
+              activeClip ? (
+                <ClipSubtitleEditor
+                  clip={activeClip}
+                  transcript={transcript}
+                  aspectRatio={aspectRatio}
+                  clipRelativeTime={clipRelativeTime}
+                  onSeekRelative={(relSec) => seekTo(activeClip.start_sec + relSec)}
+                  onChangeClip={onChangeClip}
+                  onEnableSubtitlesSideEffects={() => {
+                    if (encodeMode === 'stream_copy') {
+                      onEncodeModeChange('reencode');
+                    }
+                    if (!burnCaptions) {
+                      onBurnCaptionsChange(true);
+                    }
+                  }}
+                />
+              ) : (
+                <div className="bg-[#0B0F17] border border-slate-800 rounded p-4 text-center text-xs text-slate-400">
+                  Select or mark a clip on the timeline to edit subtitles.
+                </div>
+              )
+            ) : (
+              <>
             {/* Encode Mode */}
             <div className="space-y-1.5">
               <span className="block text-xs font-medium text-slate-300">Encoding Pipeline</span>
@@ -681,6 +812,17 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                   </span>
                 </span>
               </label>
+
+              {activeClip && (
+                <button
+                  type="button"
+                  onClick={() => setRightPanelTab('subtitles')}
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium text-blue-400 hover:text-blue-300 pt-0.5"
+                >
+                  <Captions className="w-3.5 h-3.5" />
+                  Edit clip subtitle lines &amp; styling ({activeSubtitleConfig.preset.replace('_', ' ')}) →
+                </button>
+              )}
             </div>
 
             {/* Fine Trim Nudgers */}
@@ -785,6 +927,8 @@ export const ClipPlayerAndTimeline: React.FC<ClipPlayerAndTimelineProps> = ({
                   </div>
                 </div>
               </div>
+            )}
+              </>
             )}
           </div>
 

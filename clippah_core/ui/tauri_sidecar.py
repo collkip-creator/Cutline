@@ -48,6 +48,7 @@ from ..core.schemas import (
     ExportSpec,
     PublishPlatform,
     PublishStatus,
+    SubtitleConfig,
     Transcript,
     TranscriptSegment,
     WordTimestamp,
@@ -224,7 +225,8 @@ class SnapRequest(BaseModel):
 
 class CaptionsRequest(BaseModel):
     clip: ClipCandidate
-    transcript: Transcript
+    transcript: Optional[Transcript] = None
+    subtitle_config: Optional[SubtitleConfig] = None
     aspect_ratio: AspectRatio = AspectRatio.VERTICAL_9_16
 
 
@@ -235,6 +237,7 @@ class ExportRequest(BaseModel):
     encode_mode: EncodeMode = EncodeMode.REENCODE
     include_srt: bool = True
     burn_captions: bool = True
+    subtitle_config: Optional[SubtitleConfig] = None
 
 
 class QueueRequest(BaseModel):
@@ -732,9 +735,10 @@ def snap_clip(req: SnapRequest):
 
 @app.post("/api/clips/captions")
 def preview_captions(req: CaptionsRequest):
+    cfg = req.subtitle_config or req.clip.subtitles
     return {
-        "srt": generate_srt(req.clip, req.transcript),
-        "ass": generate_ass(req.clip, req.transcript, aspect_ratio=req.aspect_ratio),
+        "srt": generate_srt(req.clip, req.transcript, subtitle_config=cfg),
+        "ass": generate_ass(req.clip, req.transcript, aspect_ratio=req.aspect_ratio, subtitle_config=cfg),
     }
 
 
@@ -743,19 +747,30 @@ def export_clip(req: ExportRequest):
     proj = next((p for p in _read_projects() if p["video_hash"] == req.video_hash), None)
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
-    tr = cache_store.get(req.video_hash)
-    if not tr:
-        raise HTTPException(status_code=400, detail="Transcript missing")
+    tr = cache_store.get(req.video_hash) or Transcript(
+        video_hash=req.video_hash,
+        source_path=str(proj["local_path"]),
+        duration_sec=float(proj.get("duration_sec") or 10.0),
+        model_name="manual",
+        segments=[],
+    )
+    cfg = req.subtitle_config or req.clip.subtitles
+    include_srt = req.include_srt
+    burn_captions = req.burn_captions
+    if cfg is not None and not cfg.enabled:
+        include_srt = False
+        burn_captions = False
     spec = ExportSpec(
         clip=req.clip,
         aspect_ratio=req.aspect_ratio,
         encode_mode=req.encode_mode,
-        include_srt=req.include_srt,
-        burn_captions=req.burn_captions,
+        include_srt=include_srt,
+        burn_captions=burn_captions,
+        subtitle_config=cfg,
         output_dir=str(EXPORTS_DIR),
     )
-    srt_text = generate_srt(req.clip, tr) if req.include_srt else None
-    ass_text = generate_ass(req.clip, tr, aspect_ratio=req.aspect_ratio) if req.burn_captions else None
+    srt_text = generate_srt(req.clip, tr, subtitle_config=cfg) if include_srt else None
+    ass_text = generate_ass(req.clip, tr, aspect_ratio=req.aspect_ratio, subtitle_config=cfg) if burn_captions else None
     result = video_processor.render_clip(Path(proj["local_path"]), spec, srt_content=srt_text, ass_content=ass_text)
     payload = result.model_dump()
     payload["video_url"] = f"/media/exports/{Path(result.video_path).name}"

@@ -13,6 +13,10 @@ from clippah_core.core.schemas import (
     ClipCandidate,
     PublishPlatform,
     PublishStatus,
+    SubtitleConfig,
+    SubtitleCue,
+    SubtitlePosition,
+    SubtitlePreset,
     Transcript,
     TranscriptSegment,
     WordTimestamp,
@@ -108,6 +112,41 @@ class CorePipelineTests(unittest.TestCase):
         ass = generate_ass(clip, transcript, aspect_ratio=AspectRatio.VERTICAL_9_16)
         self.assertIn("PlayResX: 1080", ass)
         self.assertIn("LOCAL WHISPER", ass)
+
+    def test_custom_clip_subtitles_and_styles(self) -> None:
+        clip = ClipCandidate(
+            id="c_sub",
+            title="Custom Subtitled Clip",
+            start_sec=2.0,
+            end_sec=10.0,
+            hook_score=9.0,
+            reason="Custom subtitles",
+            caption_hook="CUSTOM HOOK",
+            tags=[],
+            subtitles=SubtitleConfig(
+                enabled=True,
+                preset=SubtitlePreset.YELLOW_POP,
+                position=SubtitlePosition.TOP,
+                font_size=52,
+                show_hook_banner=False,
+                custom_cues=[
+                    SubtitleCue(id="q1", start_sec=0.5, end_sec=3.0, text="First custom line"),
+                    SubtitleCue(id="q2", start_sec=3.5, end_sec=7.5, text="Second custom line"),
+                ],
+            ),
+        )
+        srt = generate_srt(clip, None)
+        self.assertIn("First custom line", srt)
+        self.assertIn("Second custom line", srt)
+
+        ass = generate_ass(clip, None, aspect_ratio=AspectRatio.VERTICAL_9_16)
+        self.assertIn(",52,&H0015CCFA,", ass)
+        self.assertIn(",8,48,48,280,1", ass)
+        self.assertIn("FIRST CUSTOM LINE", ass)
+        self.assertNotIn("HookBanner,,0,0,0,,CUSTOM HOOK", ass)
+
+        disabled_cfg = SubtitleConfig(enabled=False)
+        self.assertEqual(generate_srt(clip, None, subtitle_config=disabled_cfg), "")
 
     def test_transcript_cache_roundtrip(self) -> None:
         transcript = _sample_transcript()

@@ -38,11 +38,16 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
   const activeClip = clips.find((c) => c.id === activeClipId) || clips[0] || null;
 
   const handleLoadCaptions = async (clip: ClipCandidate) => {
-    if (!transcript) return;
+    if (!transcript && !clip.subtitles?.custom_cues?.length) return;
     const res = await fetch(apiUrl('/api/clips/captions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clip, transcript, aspect_ratio: aspectRatio }),
+      body: JSON.stringify({
+        clip,
+        transcript: transcript || null,
+        subtitle_config: clip.subtitles || null,
+        aspect_ratio: aspectRatio,
+      }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -60,7 +65,7 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {activeClip && transcript && (
+          {activeClip && (transcript || activeClip.subtitles?.custom_cues?.length) && (
             <button
               type="button"
               onClick={() => handleLoadCaptions(activeClip)}
