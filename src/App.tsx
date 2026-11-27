@@ -55,7 +55,22 @@ import type {
   PublishJob,
   PublishPlatform,
   Transcript,
+  VideoCategory,
+  VideoCategoryOption,
 } from './types';
+
+const VIDEO_CATEGORY_LABELS: Record<VideoCategory, string> = {
+  business: 'Business',
+  comedy: 'Comedy',
+  motivation: 'Motivation',
+  politics: 'Politics',
+  sports: 'Sports',
+  relationships: 'Relationships',
+  technology: 'Technology',
+  education: 'Education',
+  gaming: 'Gaming',
+  general: 'General',
+};
 
 type WorkspaceTab = 'studio' | 'transcribe' | 'queue' | 'architecture' | 'hardware';
 
@@ -295,6 +310,8 @@ export default function App() {
   const [prompt, setPrompt] = useState(
     'Strongest standalone moments across actionable lessons, entertaining banter/stories, and high-retention hooks'
   );
+  const [selectedVideoCategory, setSelectedVideoCategory] = useState<VideoCategoryOption>('auto');
+  const [detectedVideoCategory, setDetectedVideoCategory] = useState<VideoCategory | null>(null);
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
   const [ollamaModel, setOllamaModel] = useState('qwen2.5:14b');
   const [whisperModel, setWhisperModel] = useState('faster-whisper-small-int8');
@@ -369,6 +386,9 @@ export default function App() {
       setCacheHit(Boolean(data.cache_hit));
       const projectClips: ClipCandidate[] = data.project.clips || [];
       setClips(projectClips);
+      setDetectedVideoCategory(
+        data.project.video_category || projectClips[0]?.video_category || null
+      );
       setActiveClipId(projectClips[0]?.id || null);
       setLastExport(null);
       setTranscriptSearch('');
@@ -481,6 +501,9 @@ export default function App() {
     setCacheHit(Boolean(data.cache_hit || resolvedTranscript));
 
     const rawClips: ClipCandidate[] = data.clips || data.project?.clips || [];
+    const resolvedCategory: VideoCategory | null =
+      data.video_category || data.project?.video_category || rawClips[0]?.video_category || null;
+    setDetectedVideoCategory(resolvedCategory);
     const enrichedClips = rawClips.map((clip) => {
       const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
       const tags =
@@ -506,9 +529,10 @@ export default function App() {
     if (autoPipeline && resolvedTranscript) {
       const segs = resolvedTranscript.segments?.length || 0;
       const mp3Text = data.audio_url || data.project?.audio_url ? 'MP3 + ' : '';
+      const catLabel = resolvedCategory ? ` [${VIDEO_CATEGORY_LABELS[resolvedCategory]}]` : '';
       setNotice({
         kind: 'info',
-        text: `Imported "${label}": ${mp3Text}${segs} timed transcript segments and ${enrichedClips.length} viral clips ready.`,
+        text: `Imported "${label}"${catLabel}: ${mp3Text}${segs} timed transcript segments and ${enrichedClips.length} viral clips ready.`,
       });
     } else if (!resolvedTranscript) {
       await handleTranscribe(data.project.video_hash, false);
@@ -536,6 +560,7 @@ export default function App() {
       form.append('video', file);
       form.append('auto_pipeline', autoPipeline ? 'true' : 'false');
       form.append('prompt', prompt);
+      form.append('video_category', selectedVideoCategory);
       const endpoint = isTauriRuntime
         ? '/api/projects/upload'
         : '/api/projects/upload?stream=1';
@@ -582,6 +607,7 @@ export default function App() {
           quality: urlQuality,
           auto_pipeline: autoPipeline,
           prompt,
+          video_category: selectedVideoCategory,
           stream: true,
         }),
       });
@@ -671,6 +697,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             prompt,
+            video_category: selectedVideoCategory,
             ollama_url: ollamaUrl,
             ollama_model: ollamaModel,
             min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
@@ -679,7 +706,14 @@ export default function App() {
           }),
         }
       );
-      const data = await readJsonResponse<{ clips: ClipCandidate[] }>(res);
+      const data = await readJsonResponse<{
+        clips: ClipCandidate[];
+        video_category?: VideoCategory;
+        category_reason?: string;
+      }>(res);
+      const resolvedCat =
+        data.video_category || data.clips?.[0]?.video_category || null;
+      setDetectedVideoCategory(resolvedCat);
       const enrichedClips = (data.clips || []).map((clip) => {
         const autoHashtags = generateTranscriptHashtags(clip, currentTranscript, 3);
         const sentiment = analyzeTranscriptSentiment(clip, currentTranscript);
@@ -694,9 +728,10 @@ export default function App() {
       if (enrichedClips.length > 0) {
         await persistClips(activeProject.video_hash, enrichedClips);
       }
+      const catTag = resolvedCat ? ` (${VIDEO_CATEGORY_LABELS[resolvedCat]})` : '';
       setNotice({
         kind: 'info',
-        text: `Extracted ${enrichedClips.length} word-grounded clips with 3 transcript-based hashtags each.`,
+        text: `Extracted ${enrichedClips.length} word-grounded clips${catTag}${data.category_reason ? ` · ${data.category_reason}` : ''}.`,
       });
     } catch (err: any) {
       setNotice({ kind: 'error', text: err.message });
@@ -710,12 +745,14 @@ export default function App() {
     setIsGeneratingViralClips(true);
     setNotice({
       kind: 'info',
-      text: 'Transcribing entire video audio and analyzing transcript with Gemini AI for viral clips...',
+      text: 'Transcribing audio, identifying video category, and analyzing viral clips with Gemini AI...',
     });
     try {
       let data: {
         transcript: Transcript;
         clips: ClipCandidate[];
+        video_category?: VideoCategory;
+        category_reason?: string;
         cache_hit: boolean;
         transcript_model: string;
         analysis_model: string;
@@ -729,6 +766,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             prompt,
+            video_category: selectedVideoCategory,
             retranscribe,
             ollama_url: ollamaUrl,
             ollama_model: ollamaModel,
@@ -740,7 +778,6 @@ export default function App() {
       );
 
       if (isTauriRuntime && res.status === 404) {
-        // Older local sidecar binary fallback: compose /transcribe + /highlights locally
         let currentTranscript = retranscribe ? null : transcript;
         if (!currentTranscript) {
           currentTranscript = await handleTranscribe(activeProject.video_hash, retranscribe);
@@ -755,6 +792,7 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               prompt,
+              video_category: selectedVideoCategory,
               ollama_url: ollamaUrl,
               ollama_model: ollamaModel,
               min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
@@ -763,10 +801,16 @@ export default function App() {
             }),
           }
         );
-        const hlData = await readJsonResponse<{ clips: ClipCandidate[] }>(hlRes);
+        const hlData = await readJsonResponse<{
+          clips: ClipCandidate[];
+          video_category?: VideoCategory;
+          category_reason?: string;
+        }>(hlRes);
         data = {
           transcript: currentTranscript,
           clips: hlData.clips || [],
+          video_category: hlData.video_category,
+          category_reason: hlData.category_reason,
           cache_hit: true,
           transcript_model: currentTranscript.model_name,
           analysis_model: 'local-sidecar',
@@ -777,6 +821,9 @@ export default function App() {
 
       setTranscript(data.transcript);
       setCacheHit(true);
+      const resolvedCat =
+        data.video_category || data.clips?.[0]?.video_category || null;
+      setDetectedVideoCategory(resolvedCat);
 
       const enrichedClips = (data.clips || []).map((clip) => {
         const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
@@ -799,10 +846,15 @@ export default function App() {
       }
       await loadProjects(false);
 
-      const baseMsg = `AI transcribed ${data.transcript.segments.length} segments and generated ${enrichedClips.length} viral clips.`;
+      const catTag = resolvedCat ? ` [${VIDEO_CATEGORY_LABELS[resolvedCat]}]` : '';
+      const baseMsg = `AI analyzed ${data.transcript.segments.length} segments${catTag} and generated ${enrichedClips.length} viral clips.`;
       setNotice({
         kind: 'info',
-        text: data.note ? `${baseMsg} (${data.note})` : baseMsg,
+        text: data.note
+          ? `${baseMsg} (${data.note})`
+          : data.category_reason
+            ? `${baseMsg} ${data.category_reason}`
+            : baseMsg,
       });
     } catch (err: any) {
       setNotice({ kind: 'error', text: err?.message || 'AI viral clip generation failed.' });
@@ -1069,12 +1121,15 @@ export default function App() {
       });
       try {
         let analyzedClips: ClipCandidate[] = [];
+        let resolvedVoiceCat: VideoCategory | null = null;
         const aiRes = await apiFetch('/api/ai/analyze-transcript', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             transcript: data.transcript,
             prompt,
+            title: activeProject.title,
+            video_category: selectedVideoCategory,
             min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
             max_clip_sec: 45,
             max_clips: 6,
@@ -1088,6 +1143,7 @@ export default function App() {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 prompt,
+                video_category: selectedVideoCategory,
                 ollama_url: ollamaUrl,
                 ollama_model: ollamaModel,
                 min_clip_sec: Math.min(8, Math.max(3, activeProject.duration_sec * 0.15)),
@@ -1096,12 +1152,21 @@ export default function App() {
               }),
             }
           );
-          const hlData = await readJsonResponse<{ clips: ClipCandidate[] }>(hlRes);
+          const hlData = await readJsonResponse<{
+            clips: ClipCandidate[];
+            video_category?: VideoCategory;
+          }>(hlRes);
           analyzedClips = hlData.clips || [];
+          resolvedVoiceCat = hlData.video_category || analyzedClips[0]?.video_category || null;
         } else {
-          const aiData = await readJsonResponse<{ clips: ClipCandidate[] }>(aiRes);
+          const aiData = await readJsonResponse<{
+            clips: ClipCandidate[];
+            video_category?: VideoCategory;
+          }>(aiRes);
           analyzedClips = aiData.clips || [];
+          resolvedVoiceCat = aiData.video_category || analyzedClips[0]?.video_category || null;
         }
+        setDetectedVideoCategory(resolvedVoiceCat);
 
         const enrichedClips = analyzedClips.map((clip) => {
           const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
@@ -1119,9 +1184,10 @@ export default function App() {
           await persistClips(activeProject.video_hash, enrichedClips);
         }
         await loadProjects(false);
+        const catTag = resolvedVoiceCat ? ` [${VIDEO_CATEGORY_LABELS[resolvedVoiceCat]}]` : '';
         setNotice({
           kind: 'info',
-          text: `Synced audio timestamps (${data.transcript.segments.length} segments) and generated ${enrichedClips.length} AI viral clips matching the video.`,
+          text: `Synced audio timestamps (${data.transcript.segments.length} segments)${catTag} and generated ${enrichedClips.length} AI viral clips matching the video.`,
         });
       } catch (err: any) {
         setNotice({
@@ -1527,12 +1593,31 @@ export default function App() {
                 {/* Highlight Extraction & Transcript Cache Row */}
                 {activeProject && (
                   <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center gap-2.5">
+                    <select
+                      aria-label="Viral Intelligence video category"
+                      value={selectedVideoCategory}
+                      onChange={(e) => setSelectedVideoCategory(e.target.value as VideoCategoryOption)}
+                      title="Category-specific viral detection rules (auto-detected or manually locked)"
+                      className="bg-[#0B0F17] border border-slate-700 focus:border-blue-500 rounded px-2.5 py-2 text-xs text-slate-100 outline-none shrink-0"
+                    >
+                      <option value="auto">Auto-Detect Category</option>
+                      <option value="business">Business</option>
+                      <option value="comedy">Comedy</option>
+                      <option value="motivation">Motivation</option>
+                      <option value="politics">Politics</option>
+                      <option value="sports">Sports</option>
+                      <option value="relationships">Relationships</option>
+                      <option value="technology">Technology</option>
+                      <option value="education">Education</option>
+                      <option value="gaming">Gaming (Gameplay + Commentary)</option>
+                      <option value="general">General</option>
+                    </select>
                     <input
                       type="text"
                       value={prompt}
                       onChange={(e) => setPrompt(e.target.value)}
                       placeholder="Describe the moments or hooks to extract..."
-                      className="flex-1 min-w-[260px] bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-xs text-slate-100 outline-none"
+                      className="flex-1 min-w-[220px] bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded px-3 py-2 text-xs text-slate-100 outline-none"
                     />
                     <button
                       type="button"
@@ -1576,7 +1661,7 @@ export default function App() {
                       type="button"
                       disabled={isGeneratingViralClips || isExtracting || isTranscribing}
                       onClick={() => handleGenerateAiViralClips(false)}
-                      title="Transcribe the full video audio and analyze the transcript with Gemini AI to generate viral clips"
+                      title="Transcribe the full video audio and analyze the transcript with Gemini AI for category-specific viral clips"
                       className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded transition-colors whitespace-nowrap shrink-0"
                     >
                       {isGeneratingViralClips ? (
@@ -1592,6 +1677,11 @@ export default function App() {
                       )}
                     </button>
                     <div className="flex items-center gap-2.5 ml-auto text-[11px] font-mono tabular-nums text-slate-400">
+                      {detectedVideoCategory && (
+                        <span className="px-2 py-0.5 rounded border border-indigo-500/40 bg-indigo-950/40 text-indigo-200 font-sans font-medium">
+                          Category: {VIDEO_CATEGORY_LABELS[detectedVideoCategory]}
+                        </span>
+                      )}
                       {activeProject.audio_url && (
                         <a
                           href={apiUrl(activeProject.audio_url)}

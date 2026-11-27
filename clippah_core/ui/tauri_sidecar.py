@@ -355,6 +355,7 @@ class UrlRequest(BaseModel):
     quality: str = "fast"
     auto_pipeline: bool = True
     prompt: str = "High-retention hooks, bold insights, concise takeaways"
+    video_category: Optional[str] = "auto"
     stream: bool = False
 
 
@@ -365,6 +366,7 @@ class HighlightsRequest(BaseModel):
     min_clip_sec: float = 8.0
     max_clip_sec: float = 45.0
     max_clips: int = 6
+    video_category: Optional[str] = "auto"
 
 
 class SnapRequest(BaseModel):
@@ -653,19 +655,19 @@ def _transcribe_mp3_to_timed_transcript(
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if gemini_key:
         import base64
+        from concurrent.futures import ThreadPoolExecutor
         import math
         import tempfile
         import urllib.request
 
         try:
             ffmpeg_bin = resolve_media_binary("ffmpeg")
-            chunk_len = 600.0
+            chunk_len = 180.0
             file_bytes = mp3_path.stat().st_size
-            chunk_count = 1 if (safe_dur <= 540.0 and file_bytes <= 8 * 1024 * 1024) else max(1, math.ceil(safe_dur / chunk_len))
-            all_segments: List[TranscriptSegment] = []
+            chunk_count = 1 if (safe_dur <= 150.0 and file_bytes <= 1.5 * 1024 * 1024) else max(1, math.ceil(safe_dur / chunk_len))
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                for idx in range(chunk_count):
+                def _process_chunk(idx: int) -> List[TranscriptSegment]:
                     chunk_start = idx * chunk_len
                     chunk_dur = min(chunk_len, max(1.0, safe_dur - chunk_start))
                     if chunk_count == 1:
@@ -691,7 +693,7 @@ def _transcribe_mp3_to_timed_transcript(
                                 "-c:a",
                                 "libmp3lame",
                                 "-b:a",
-                                "48k",
+                                "32k",
                                 str(chunk_file),
                             ],
                             capture_output=True,
@@ -727,6 +729,7 @@ def _transcribe_mp3_to_timed_transcript(
                         body = json.loads(resp.read().decode("utf-8"))
                     parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                     raw_text = "".join(p.get("text", "") for p in parts).strip()
+                    out_segs: List[TranscriptSegment] = []
                     if raw_text:
                         chunk_segs = _parse_timestamped_text_to_segments(raw_text, chunk_dur)
                         for s in chunk_segs:
@@ -734,15 +737,32 @@ def _transcribe_mp3_to_timed_transcript(
                             abs_e = round(min(safe_dur, chunk_start + s.end_sec), 3)
                             if abs_e <= abs_s:
                                 abs_e = round(abs_s + 0.4, 3)
-                            all_segments.append(
+                            out_segs.append(
                                 TranscriptSegment(
-                                    id=len(all_segments),
+                                    id=0,
                                     start_sec=abs_s,
                                     end_sec=abs_e,
                                     text=s.text,
                                     words=_build_word_timestamps(s.text, abs_s, abs_e),
                                 )
                             )
+                    return out_segs
+
+                with ThreadPoolExecutor(max_workers=min(chunk_count, 4)) as pool:
+                    chunk_lists = list(pool.map(_process_chunk, range(chunk_count)))
+
+            all_segments: List[TranscriptSegment] = []
+            for seg_list in chunk_lists:
+                for seg in seg_list:
+                    all_segments.append(
+                        TranscriptSegment(
+                            id=len(all_segments),
+                            start_sec=seg.start_sec,
+                            end_sec=seg.end_sec,
+                            text=seg.text,
+                            words=seg.words,
+                        )
+                    )
             if all_segments:
                 return Transcript(
                     video_hash=video_hash,
@@ -795,31 +815,30 @@ def _auto_search_viral_clips(
     prompt: str,
     duration_sec: float,
     max_clips: int = 6,
-) -> List[Dict[str, Any]]:
+    title: str = "",
+    video_category: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
     if not transcript.segments:
-        return []
+        return [], None, None
     min_clip = min(8.0, max(3.0, duration_sec * 0.15))
     max_clip = min(45.0, max(min_clip + 2.0, duration_sec))
     engine = OllamaHighlightEngine(timeout_sec=4.0, allow_heuristic_fallback=True)
     pipeline.highlight_engine = engine
-    try:
-        clips = pipeline.find_clips(
-            transcript,
-            prompt,
-            min_clip_sec=min_clip,
-            max_clip_sec=max_clip,
-            max_clips=max_clips,
-        )
-    except Exception:  # noqa: BLE001
-        raw = engine._heuristic_extract(
-            transcript,
-            prompt,
-            min_clip_sec=min_clip,
-            max_clip_sec=max_clip,
-            max_clips=max_clips,
-        )
-        clips = ground_and_deduplicate_clips(raw.clips, transcript)
-    return [c.model_dump() for c in clips]
+    batch = engine.extract_highlights(
+        transcript,
+        user_prompt=prompt,
+        min_clip_sec=min_clip,
+        max_clip_sec=max_clip,
+        max_clips=max_clips,
+        title=title,
+        video_category=video_category,
+    )
+    clips = ground_and_deduplicate_clips(batch.clips, transcript)
+    return (
+        [c.model_dump() for c in clips],
+        batch.detected_video_category,
+        batch.category_reason,
+    )
 
 
 @app.post("/api/projects/upload")
@@ -827,6 +846,7 @@ async def upload_video(
     video: UploadFile = File(...),
     auto_pipeline: bool = Form(True),
     prompt: str = Form("High-retention hooks, bold insights, concise takeaways"),
+    video_category: str = Form("auto"),
 ):
     safe_name = f"{int(datetime.now().timestamp())}_{Path(video.filename or 'clip.mp4').name}"
     dest = VIDEOS_DIR / safe_name
@@ -847,6 +867,8 @@ async def upload_video(
             audio_url = f"/media/audio/{mp3_path.name}"
 
     clips_list: List[Dict[str, Any]] = []
+    detected_cat: Optional[str] = None
+    cat_reason: Optional[str] = None
     if auto_pipeline and tr is None and mp3_path.is_file():
         tr = _transcribe_mp3_to_timed_transcript(
             mp3_path,
@@ -857,10 +879,12 @@ async def upload_video(
         )
         cache_store.put(tr)
     if auto_pipeline and tr is not None and tr.segments:
-        clips_list = _auto_search_viral_clips(
+        clips_list, detected_cat, cat_reason = _auto_search_viral_clips(
             tr,
             prompt,
             float(meta.get("duration_sec") or 10.0),
+            title=dest.stem,
+            video_category=video_category,
         )
 
     record = {
@@ -872,6 +896,7 @@ async def upload_video(
         "audio_url": audio_url,
         "video_url": f"/media/videos/{safe_name}",
         "source_url": None,
+        "video_category": detected_cat,
         **meta,
         "created_at_iso": datetime.now(timezone.utc).isoformat(),
         "clips": clips_list,
@@ -881,6 +906,8 @@ async def upload_video(
         "project": record,
         "transcript": tr.model_dump() if tr else None,
         "clips": clips_list,
+        "video_category": detected_cat,
+        "category_reason": cat_reason,
         "audio_url": audio_url,
         "cache_hit": tr is not None,
     }
@@ -958,16 +985,20 @@ def ingest_url(req: UrlRequest):
             cache_store.put(effective_tr)
 
         clips_list: List[Dict[str, Any]] = []
+        detected_cat: Optional[str] = None
+        cat_reason: Optional[str] = None
         if req.auto_pipeline and effective_tr and effective_tr.segments:
             emit(
                 "analyzing_clips",
                 f"Searching viral clips across {len(effective_tr.segments)} timed transcript segments...",
                 {},
             )
-            clips_list = _auto_search_viral_clips(
+            clips_list, detected_cat, cat_reason = _auto_search_viral_clips(
                 effective_tr,
                 req.prompt,
                 asset.duration_sec,
+                title=asset.title,
+                video_category=req.video_category,
             )
 
         fname = Path(asset.local_path).name
@@ -981,6 +1012,7 @@ def ingest_url(req: UrlRequest):
             "audio_url": audio_url,
             "video_url": f"/media/videos/{fname}",
             "source_url": asset.source_url,
+            "video_category": detected_cat,
             "duration_sec": asset.duration_sec,
             "width": asset.width,
             "height": asset.height,
@@ -994,6 +1026,8 @@ def ingest_url(req: UrlRequest):
             "project": record,
             "transcript": effective_tr.model_dump() if effective_tr else None,
             "clips": clips_list,
+            "video_category": detected_cat,
+            "category_reason": cat_reason,
             "audio_url": audio_url,
             "cache_hit": cache_hit,
         }
@@ -1141,18 +1175,25 @@ def extract_highlights(video_hash: str, req: HighlightsRequest):
         allow_heuristic_fallback=True,
     )
     pipeline.highlight_engine = engine
-    try:
-        clips = pipeline.find_clips(
-            tr, req.prompt, min_clip_sec=req.min_clip_sec, max_clip_sec=req.max_clip_sec, max_clips=req.max_clips
-        )
-    except Exception:  # noqa: BLE001
-        raw = engine._heuristic_extract(
-            tr, req.prompt, min_clip_sec=req.min_clip_sec, max_clip_sec=req.max_clip_sec, max_clips=req.max_clips
-        )
-        clips = ground_and_deduplicate_clips(raw.clips, tr)
+    batch = engine.extract_highlights(
+        tr,
+        user_prompt=req.prompt,
+        min_clip_sec=req.min_clip_sec,
+        max_clip_sec=req.max_clip_sec,
+        max_clips=req.max_clips,
+        title=str(proj.get("title") or ""),
+        video_category=req.video_category,
+    )
+    clips = ground_and_deduplicate_clips(batch.clips, tr)
     proj["clips"] = [c.model_dump() for c in clips]
+    if batch.detected_video_category:
+        proj["video_category"] = batch.detected_video_category
     _upsert_project(proj)
-    return {"clips": proj["clips"]}
+    return {
+        "clips": proj["clips"],
+        "video_category": batch.detected_video_category,
+        "category_reason": batch.category_reason,
+    }
 
 
 def _fmt_bracket_ts(sec: float) -> str:
@@ -1239,7 +1280,40 @@ async def transcribe_microphone_audio(request: Request):
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if gemini_key:
         import base64
+        import tempfile
         import urllib.request
+
+        if timestamps_enabled and (len(raw_bytes) > 1.5 * 1024 * 1024 or duration_hint > 150.0):
+            ext = ".wav" if "wav" in mime_type else ".mp3" if "mp3" in mime_type or "mpeg" in mime_type else ".m4a" if "mp4" in mime_type else ".webm"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_aud = Path(tmpdir) / f"upload{ext}"
+                tmp_aud.write_bytes(raw_bytes)
+                eff_dur = duration_hint
+                if eff_dur <= 0:
+                    try:
+                        eff_dur = float(video_processor.probe_media(tmp_aud).get("duration_sec") or 180.0)
+                    except Exception:  # noqa: BLE001
+                        eff_dur = 180.0
+                tr_parallel = _transcribe_mp3_to_timed_transcript(
+                    tmp_aud,
+                    f"audio_{int(time.time())}",
+                    str(getattr(audio_file, "filename", "uploaded-audio")),
+                    eff_dur,
+                )
+                srt = "\n\n".join(
+                    f"{i + 1}\n{_fmt_srt_ts(s.start_sec)} --> {_fmt_srt_ts(s.end_sec)}\n{s.text}"
+                    for i, s in enumerate(tr_parallel.segments)
+                )
+                formatted_text = "\n".join(f"{_fmt_bracket_ts(s.start_sec)} {s.text}" for s in tr_parallel.segments)
+                return {
+                    "text": formatted_text,
+                    "model": "gemini-3.5-transcribe",
+                    "mimeType": "audio/mp3",
+                    "timestamped": True,
+                    "duration_sec": tr_parallel.duration_sec,
+                    "segments": [s.model_dump() for s in tr_parallel.segments],
+                    "srt": srt,
+                }
 
         payload = json.dumps({
             "contents": [{
@@ -1337,11 +1411,14 @@ def ai_viral_clips(video_hash: str, req: Dict[str, Any]):
         min_clip_sec=float(req.get("min_clip_sec") or 6.0),
         max_clip_sec=float(req.get("max_clip_sec") or 45.0),
         max_clips=int(req.get("max_clips") or 6),
+        video_category=str(req.get("video_category") or "auto"),
     )
     hl_res = extract_highlights(effective_hash, hl_req)
     return {
         "transcript": tr.model_dump(),
         "clips": hl_res["clips"],
+        "video_category": hl_res.get("video_category"),
+        "category_reason": hl_res.get("category_reason"),
         "cache_hit": cache_hit,
         "transcript_model": tr.model_name,
         "analysis_model": "local-sidecar",

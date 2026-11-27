@@ -15,7 +15,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import { apiFetch, isTauriRuntime, readJsonResponse } from '../lib/api';
+import { apiUrl, isTauriRuntime } from '../lib/api';
 import type { ProjectRecord, TranscriptSegment } from '../types';
 
 export interface SaveTranscriptPayload {
@@ -104,14 +104,102 @@ function probeBrowserAudioDuration(url: string): Promise<number> {
   return new Promise((resolve) => {
     const audio = new Audio();
     audio.preload = 'metadata';
-    const done = (val: number) => {
+    let settled = false;
+    const finish = (val: number) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
       audio.src = '';
       resolve(Number.isFinite(val) && val > 0 ? val : 0);
     };
-    audio.onloadedmetadata = () => done(audio.duration);
-    audio.onerror = () => done(0);
+    const timer = window.setTimeout(() => finish(0), 1500);
+    audio.onloadedmetadata = () => finish(audio.duration);
+    audio.onerror = () => finish(0);
     audio.src = url;
   });
+}
+
+function encodeMono16kWav(samples: Float32Array, sampleRate: number): Blob {
+  const byteLength = 44 + samples.length * 2;
+  const buffer = new ArrayBuffer(byteLength);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+async function optimizeLargeAudioForUpload(
+  file: Blob,
+  mimeType: string,
+  filename: string
+): Promise<{ blob: Blob; mimeType: string; filename: string; compacted: boolean }> {
+  const isUncompressedWav =
+    mimeType.includes('wav') || filename.toLowerCase().endsWith('.wav');
+  // Downsample large uncompressed WAV files (>3.5 MB) to 16kHz mono PCM for 5-10x faster upload
+  if (!isUncompressedWav || file.size <= 3.5 * 1024 * 1024 || typeof AudioContext === 'undefined') {
+    return { blob: file, mimeType, filename, compacted: false };
+  }
+  try {
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx || typeof OfflineAudioContext === 'undefined') {
+      return { blob: file, mimeType, filename, compacted: false };
+    }
+    const ctx = new AudioCtx();
+    const rawBuf = await file.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(rawBuf);
+    await ctx.close().catch(() => {});
+
+    const targetRate = 16000;
+    const frameCount = Math.max(1, Math.ceil(decoded.duration * targetRate));
+    const offline = new OfflineAudioContext(1, frameCount, targetRate);
+    const src = offline.createBufferSource();
+    src.buffer = decoded;
+    src.connect(offline.destination);
+    src.start(0);
+    const rendered = await offline.startRendering();
+    const monoBlob = encodeMono16kWav(rendered.getChannelData(0), targetRate);
+    if (monoBlob.size > 0 && monoBlob.size < file.size * 0.85) {
+      return {
+        blob: monoBlob,
+        mimeType: 'audio/wav',
+        filename: filename.replace(/\.[^.]+$/, '') + '_16k.wav',
+        compacted: true,
+      };
+    }
+  } catch {
+    // Fall back to original file seamlessly
+  }
+  return { blob: file, mimeType, filename, compacted: false };
+}
+
+interface TranscribeResponsePayload {
+  text: string;
+  model: string;
+  mimeType: string;
+  timestamped?: boolean;
+  duration_sec?: number;
+  segments?: TranscriptSegment[];
+  srt?: string;
+  cache_hit?: boolean;
 }
 
 export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
@@ -133,6 +221,9 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
   const [audioDurationSec, setAudioDurationSec] = useState<number>(0);
 
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcribeStatusMsg, setTranscribeStatusMsg] = useState<string | null>(null);
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
+  const [chunkProgress, setChunkProgress] = useState<{ completed: number; total: number } | null>(null);
   const [isSavingToProject, setIsSavingToProject] = useState(false);
   const [isSyncingAndAnalyzing, setIsSyncingAndAnalyzing] = useState(false);
   const [transcriptText, setTranscriptText] = useState('');
@@ -214,6 +305,178 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
     setSrtOutput(nextSrt);
   };
 
+  const sendTranscribeRequestWithProgress = (
+    formData: FormData
+  ): Promise<TranscribeResponsePayload> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', apiUrl('/api/audio/transcribe?stream=1'), true);
+
+      let processedOffset = 0;
+      let partialAccumulator: TranscriptSegment[] = [];
+      let streamResult: TranscribeResponsePayload | null = null;
+      let streamError: string | null = null;
+
+      const parseAvailableNdjson = () => {
+        const text = xhr.responseText || '';
+        const slice = text.slice(processedOffset);
+        const lastNl = slice.lastIndexOf('\n');
+        if (lastNl < 0) return;
+        const readyChunk = slice.slice(0, lastNl + 1);
+        processedOffset += lastNl + 1;
+
+        for (const line of readyChunk.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const evt = JSON.parse(trimmed);
+            if (evt.type === 'progress') {
+              if (evt.message) setTranscribeStatusMsg(String(evt.message));
+              if (typeof evt.completed === 'number' && typeof evt.total === 'number') {
+                setChunkProgress({ completed: evt.completed, total: evt.total });
+              }
+              if (Array.isArray(evt.partial_segments) && evt.partial_segments.length > 0) {
+                const next = [...partialAccumulator, ...evt.partial_segments]
+                  .sort((a, b) => a.start_sec - b.start_sec)
+                  .map((seg, idx) => ({
+                    ...seg,
+                    id: idx,
+                    words: Array.isArray(seg.words) ? seg.words : [],
+                  }));
+                partialAccumulator = next;
+                setTimedSegments(next);
+                rebuildFormattedFromSegments(next);
+                setResultViewMode('timed');
+              }
+            } else if (evt.type === 'error') {
+              streamError = String(evt.error || 'Audio transcription failed.');
+            } else if (evt.type === 'result' && evt.data) {
+              streamResult = evt.data as TranscribeResponsePayload;
+            }
+          } catch {
+            // Ignore incomplete line
+          }
+        }
+      };
+
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && ev.total > 0) {
+          const pct = Math.min(100, Math.round((ev.loaded / ev.total) * 100));
+          setUploadPercent(pct);
+          setTranscribeStatusMsg(
+            pct < 100
+              ? `Uploading audio (${pct}%)...`
+              : 'Uploaded. Preparing parallel speech chunks...'
+          );
+        }
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState === 3) {
+          const ctype = (xhr.getResponseHeader('content-type') || '').toLowerCase();
+          if (ctype.includes('application/x-ndjson')) {
+            parseAvailableNdjson();
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        const ctype = (xhr.getResponseHeader('content-type') || '').toLowerCase();
+        if (ctype.includes('application/x-ndjson')) {
+          // Process any trailing line without trailing newline
+          const text = xhr.responseText || '';
+          const remainder = text.slice(processedOffset).trim();
+          if (remainder) {
+            for (const line of remainder.split('\n')) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                const evt = JSON.parse(trimmed);
+                if (evt.type === 'error') {
+                  streamError = String(evt.error || 'Audio transcription failed.');
+                } else if (evt.type === 'result' && evt.data) {
+                  streamResult = evt.data as TranscribeResponsePayload;
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+          if (streamError) {
+            reject(new Error(streamError));
+            return;
+          }
+          if (streamResult) {
+            resolve(streamResult);
+            return;
+          }
+        }
+
+        if (isTauriRuntime && xhr.status === 404) {
+          reject(
+            new Error(
+              'Your local desktop sidecar binary does not include /api/audio/transcribe yet. Rebuild the desktop bundle or use the web app for audio transcription.'
+            )
+          );
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(xhr.responseText || '{}');
+          if (xhr.status < 200 || xhr.status >= 300) {
+            reject(new Error(parsed?.error || parsed?.detail || `HTTP ${xhr.status} error`));
+            return;
+          }
+          resolve(parsed as TranscribeResponsePayload);
+        } catch {
+          reject(new Error(`Unexpected response (HTTP ${xhr.status})`));
+        }
+      };
+
+      xhr.onerror = () => {
+        reject(new Error('Network error while uploading audio for transcription.'));
+      };
+
+      xhr.send(formData);
+    });
+  };
+
+  const applyTranscriptionResult = (
+    data: TranscribeResponsePayload,
+    sourceLabel: string,
+    durationSec: number,
+    mimeType: string,
+    previewUrl: string
+  ) => {
+    const cleanText = (data.text || '').trim();
+    const returnedSegs = Array.isArray(data.segments) ? data.segments : [];
+    const finalDur = Number(data.duration_sec) || durationSec;
+    if (finalDur > 0 && durationSec === 0) {
+      setAudioDurationSec(finalDur);
+    }
+    setTranscriptText(cleanText);
+    setTimedSegments(returnedSegs);
+    setSrtOutput((data.srt || '').trim());
+    setResultViewMode(returnedSegs.length > 0 ? 'timed' : 'raw');
+
+    if (cleanText) {
+      const take: TranscriptionTake = {
+        id: `take_${Date.now()}`,
+        createdAtIso: new Date().toISOString(),
+        sourceLabel: data.cache_hit ? `${sourceLabel} (cached)` : sourceLabel,
+        durationSec: finalDur,
+        mimeType: data.mimeType || mimeType,
+        audioUrl: previewUrl,
+        text: cleanText,
+        segments: returnedSegs,
+        srt: (data.srt || '').trim(),
+      };
+      setTakes((prev) => [take, ...prev].slice(0, 12));
+    } else {
+      setErrorMsg('No speech was detected in the audio. Try another recording or audio file.');
+    }
+  };
+
   const runTranscription = async (
     targetBlob: Blob,
     mimeType: string,
@@ -223,80 +486,83 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
   ) => {
     setIsTranscribing(true);
     setErrorMsg(null);
+    setUploadPercent(0);
+    setChunkProgress(null);
+    setTranscribeStatusMsg('Optimizing audio payload...');
     try {
+      const optimized = await optimizeLargeAudioForUpload(targetBlob, mimeType, sourceLabel);
+      if (optimized.compacted) {
+        setTranscribeStatusMsg(
+          `Compressed WAV (${Math.round(targetBlob.size / 1024 / 1024)}MB → ${Math.max(1, Math.round(optimized.blob.size / 1024 / 1024))}MB) for faster upload...`
+        );
+      }
+
       const formData = new FormData();
-      const ext = mimeType.includes('mp4')
+      const ext = optimized.mimeType.includes('mp4')
         ? 'm4a'
-        : mimeType.includes('ogg')
+        : optimized.mimeType.includes('ogg')
           ? 'ogg'
-          : mimeType.includes('wav')
+          : optimized.mimeType.includes('wav')
             ? 'wav'
-            : mimeType.includes('mp3') || mimeType.includes('mpeg')
+            : optimized.mimeType.includes('mp3') || optimized.mimeType.includes('mpeg')
               ? 'mp3'
               : 'webm';
-      const safeFilename = sourceLabel.includes('.') ? sourceLabel : `recording.${ext}`;
-      formData.append('audio', targetBlob, safeFilename);
-      formData.append('mimeType', mimeType);
+      const safeFilename = optimized.filename.includes('.')
+        ? optimized.filename
+        : `recording.${ext}`;
+      formData.append('audio', optimized.blob, safeFilename);
+      formData.append('mimeType', optimized.mimeType);
       formData.append('prompt', instruction);
       formData.append('timestamps', String(includeTimestamps));
       if (durationSec > 0) {
         formData.append('durationSec', String(durationSec));
       }
 
-      const res = await apiFetch('/api/audio/transcribe', {
-        method: 'POST',
-        body: formData,
-      });
-      if (isTauriRuntime && res.status === 404) {
-        throw new Error(
-          'Your local desktop sidecar binary does not include /api/audio/transcribe yet. Rebuild the desktop bundle or use the web app for audio transcription.'
-        );
-      }
-      const data = await readJsonResponse<{
-        text: string;
-        model: string;
-        mimeType: string;
-        timestamped?: boolean;
-        duration_sec?: number;
-        segments?: TranscriptSegment[];
-        srt?: string;
-      }>(res);
-
-      const cleanText = (data.text || '').trim();
-      const returnedSegs = Array.isArray(data.segments) ? data.segments : [];
-      const finalDur = Number(data.duration_sec) || durationSec;
-      if (finalDur > 0 && durationSec === 0) {
-        setAudioDurationSec(finalDur);
-      }
-      setTranscriptText(cleanText);
-      setTimedSegments(returnedSegs);
-      setSrtOutput((data.srt || '').trim());
-      if (returnedSegs.length > 0) {
-        setResultViewMode('timed');
-      } else {
-        setResultViewMode('raw');
-      }
-
-      if (cleanText) {
-        const take: TranscriptionTake = {
-          id: `take_${Date.now()}`,
-          createdAtIso: new Date().toISOString(),
-          sourceLabel,
-          durationSec: finalDur,
-          mimeType: data.mimeType || mimeType,
-          audioUrl: previewUrl,
-          text: cleanText,
-          segments: returnedSegs,
-          srt: (data.srt || '').trim(),
-        };
-        setTakes((prev) => [take, ...prev].slice(0, 12));
-      } else {
-        setErrorMsg('No speech was detected in the audio. Try another recording or audio file.');
-      }
+      const data = await sendTranscribeRequestWithProgress(formData);
+      applyTranscriptionResult(data, sourceLabel, durationSec, optimized.mimeType, previewUrl);
     } catch (err: any) {
       setErrorMsg(err?.message || 'Audio transcription failed.');
     } finally {
       setIsTranscribing(false);
+      setUploadPercent(null);
+      setChunkProgress(null);
+      setTranscribeStatusMsg(null);
+    }
+  };
+
+  const handleTranscribeActiveProject = async () => {
+    if (!activeProject) return;
+    setIsTranscribing(true);
+    setErrorMsg(null);
+    setUploadPercent(100);
+    setChunkProgress(null);
+    setTranscribeStatusMsg('Reading active project track directly from server...');
+    try {
+      const formData = new FormData();
+      formData.append('project_hash', activeProject.video_hash);
+      formData.append('prompt', instruction);
+      formData.append('timestamps', String(includeTimestamps));
+      formData.append('durationSec', String(activeProject.duration_sec || 0));
+
+      const data = await sendTranscribeRequestWithProgress(formData);
+      const previewSource = activeProject.audio_url || activeProject.video_url;
+      setAudioUrl(previewSource);
+      setAudioLabel(`${activeProject.title}.mp3`);
+      setAudioDurationSec(activeProject.duration_sec);
+      applyTranscriptionResult(
+        data,
+        activeProject.title,
+        activeProject.duration_sec,
+        'audio/mp3',
+        previewSource
+      );
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Failed to transcribe active video track.');
+    } finally {
+      setIsTranscribing(false);
+      setUploadPercent(null);
+      setChunkProgress(null);
+      setTranscribeStatusMsg(null);
     }
   };
 
@@ -563,6 +829,19 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
                 Upload Audio / MP3
               </button>
 
+              {activeProject && (
+                <button
+                  type="button"
+                  disabled={isRecording || isTranscribing}
+                  onClick={handleTranscribeActiveProject}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-emerald-600/20 hover:bg-emerald-600/30 disabled:opacity-40 text-emerald-300 border border-emerald-500/40 rounded transition-colors whitespace-nowrap"
+                  title="Transcribe the active video's extracted MP3 track on server with zero browser upload"
+                >
+                  <Film className="w-3.5 h-3.5" />
+                  Use Active Video Track (0 Upload)
+                </button>
+              )}
+
               {audioBlob && !isRecording && (
                 <button
                   type="button"
@@ -688,6 +967,35 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
           )}
         </div>
 
+        {isTranscribing && (
+          <div className="px-4 py-2.5 rounded-md border bg-blue-950/30 border-blue-500/35 space-y-1.5">
+            <div className="flex items-center justify-between text-xs text-blue-200 font-mono tabular-nums">
+              <span className="inline-flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                {transcribeStatusMsg || 'Transcribing with parallel timestamps...'}
+              </span>
+              <span>
+                {chunkProgress && chunkProgress.total > 0
+                  ? `${chunkProgress.completed}/${chunkProgress.total} chunks`
+                  : uploadPercent !== null
+                    ? `${uploadPercent}% uploaded`
+                    : ''}
+              </span>
+            </div>
+            <progress
+              max={100}
+              value={
+                chunkProgress && chunkProgress.total > 0
+                  ? Math.max(8, Math.round((chunkProgress.completed / chunkProgress.total) * 100))
+                  : uploadPercent !== null
+                    ? Math.max(5, uploadPercent)
+                    : 25
+              }
+              className="w-full h-1.5 rounded overflow-hidden bg-slate-900 accent-blue-500 [&::-webkit-progress-bar]:bg-slate-900 [&::-webkit-progress-value]:bg-blue-500 [&::-webkit-progress-value]:transition-all [&::-webkit-progress-value]:duration-300 [&::-moz-progress-bar]:bg-blue-500"
+            />
+          </div>
+        )}
+
         {errorMsg && (
           <div className="px-4 py-2.5 rounded-md border bg-rose-950/35 border-rose-500/40 text-xs text-rose-200 flex items-center justify-between gap-3">
             <span>{errorMsg}</span>
@@ -736,9 +1044,16 @@ export const AudioTranscribeView: React.FC<AudioTranscribeViewProps> = ({
                 </div>
               )}
               {isTranscribing && (
-                <span className="inline-flex items-center gap-1.5 text-xs text-blue-300">
+                <span className="inline-flex items-center gap-2 text-xs text-blue-300 font-mono tabular-nums">
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  Aligning audio timestamps...
+                  <span>
+                    {transcribeStatusMsg ||
+                      (chunkProgress
+                        ? `Transcribing chunk ${chunkProgress.completed}/${chunkProgress.total}...`
+                        : uploadPercent !== null && uploadPercent < 100
+                          ? `Uploading audio (${uploadPercent}%)...`
+                          : 'Aligning parallel audio timestamps...')}
+                  </span>
                 </span>
               )}
             </div>

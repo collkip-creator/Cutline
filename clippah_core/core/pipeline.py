@@ -84,14 +84,27 @@ class ClippahPipeline:
         min_clip_sec: float = 12.0,
         max_clip_sec: float = 60.0,
         max_clips: int = 8,
+        title: str = "",
+        video_category: Optional[str] = None,
     ) -> List[ClipCandidate]:
-        raw_batch = self.highlight_engine.extract_highlights(
-            transcript,
-            user_prompt=user_prompt,
-            min_clip_sec=min_clip_sec,
-            max_clip_sec=max_clip_sec,
-            max_clips=max_clips,
-        )
+        try:
+            raw_batch = self.highlight_engine.extract_highlights(  # type: ignore[call-arg]
+                transcript,
+                user_prompt=user_prompt,
+                min_clip_sec=min_clip_sec,
+                max_clip_sec=max_clip_sec,
+                max_clips=max_clips,
+                title=title,
+                video_category=video_category,
+            )
+        except TypeError:
+            raw_batch = self.highlight_engine.extract_highlights(
+                transcript,
+                user_prompt=user_prompt,
+                min_clip_sec=min_clip_sec,
+                max_clip_sec=max_clip_sec,
+                max_clips=max_clips,
+            )
         return ground_and_deduplicate_clips(raw_batch.clips, transcript)
 
     def export_clip(

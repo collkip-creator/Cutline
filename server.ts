@@ -88,6 +88,7 @@ interface ProjectRecord {
   audio_url?: string | null;
   video_url: string;
   source_url: string | null;
+  video_category?: string | null;
   duration_sec: number;
   width: number;
   height: number;
@@ -379,65 +380,79 @@ function runPythonCli(args: string[], stdinPayload?: unknown): Promise<string> {
 async function extractVideoAudioChunks(
   localPath: string,
   durationSec: number,
-  videoHash: string
+  videoHash: string,
+  chunkLenSec = 180
 ): Promise<Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }>> {
   if (!fs.existsSync(localPath)) {
     throw new Error(`Video file not found on disk (${path.basename(localPath)}). Re-upload the video or load sample footage.`);
   }
   const safeDuration = Math.max(1, durationSec || 30);
-  const chunkLenSec = 600; // 10-minute chunks (~3.6 MB per MP3 chunk at 48kbps)
   const chunkCount = Math.max(1, Math.ceil(safeDuration / chunkLenSec));
-  const chunks: Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }> = [];
+  const chunkSlots: Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number } | null> =
+    new Array(chunkCount).fill(null);
   const tempPaths: string[] = [];
 
   try {
-    for (let i = 0; i < chunkCount; i++) {
-      const startSec = i * chunkLenSec;
-      const chunkDur = Math.min(chunkLenSec, Math.max(1, safeDuration - startSec));
-      const tmpPath = path.join(
-        DATA_DIR,
-        'cache',
-        `${videoHash.slice(0, 12)}_chunk_${i}_${Date.now()}.mp3`
-      );
-      tempPaths.push(tmpPath);
+    let nextIdx = 0;
+    const workerCount = Math.min(chunkCount, 4);
+    const stamp = Date.now();
 
-      const args = ['-y'];
-      if (chunkCount > 1) {
-        args.push('-ss', String(startSec), '-t', String(chunkDur));
-      }
-      args.push(
-        '-i', localPath,
-        '-vn',
-        '-ac', '1',
-        '-ar', '16000',
-        '-c:a', 'libmp3lame',
-        '-b:a', '48k',
-        tmpPath
-      );
+    const extractWorker = async () => {
+      while (true) {
+        const i = nextIdx++;
+        if (i >= chunkCount) return;
+        const startSec = i * chunkLenSec;
+        const chunkDur = Math.min(chunkLenSec, Math.max(1, safeDuration - startSec));
+        const tmpPath = path.join(
+          DATA_DIR,
+          'cache',
+          `${videoHash.slice(0, 12)}_chunk_${i}_${stamp}.mp3`
+        );
+        tempPaths.push(tmpPath);
 
-      try {
-        await execFileAsync('ffmpeg', args);
-      } catch (err: any) {
-        const stderrLines = String(err?.stderr || err?.message || '')
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter(Boolean);
-        const tailError = stderrLines[stderrLines.length - 1] || 'FFmpeg audio extraction failed.';
-        throw new Error(`Could not extract audio from video (${tailError}).`);
-      }
-      if (fs.existsSync(tmpPath)) {
-        const buffer = fs.readFileSync(tmpPath);
-        if (buffer.length > 0) {
-          chunks.push({
-            buffer,
-            mimeType: 'audio/mp3',
-            startSec,
-            durationSec: chunkDur,
-          });
+        const args = ['-y'];
+        if (chunkCount > 1) {
+          args.push('-ss', String(startSec), '-t', String(chunkDur));
+        }
+        args.push(
+          '-i', localPath,
+          '-vn',
+          '-ac', '1',
+          '-ar', '16000',
+          '-c:a', 'libmp3lame',
+          '-b:a', '32k',
+          tmpPath
+        );
+
+        try {
+          await execFileAsync('ffmpeg', args);
+        } catch (err: any) {
+          const stderrLines = String(err?.stderr || err?.message || '')
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean);
+          const tailError = stderrLines[stderrLines.length - 1] || 'FFmpeg audio extraction failed.';
+          throw new Error(`Could not extract audio from video (${tailError}).`);
+        }
+
+        if (fs.existsSync(tmpPath)) {
+          const buffer = fs.readFileSync(tmpPath);
+          if (buffer.length > 0) {
+            chunkSlots[i] = {
+              buffer,
+              mimeType: 'audio/mp3',
+              startSec,
+              durationSec: chunkDur,
+            };
+          }
         }
       }
-    }
-    return chunks;
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => extractWorker()));
+    return chunkSlots.filter(
+      (c): c is { buffer: Buffer; mimeType: string; startSec: number; durationSec: number } => c !== null
+    );
   } finally {
     for (const p of tempPaths) {
       try {
@@ -482,7 +497,7 @@ async function extractSingleMp3(sourcePath: string, outputMp3Path: string): Prom
     '-ac', '1',
     '-ar', '16000',
     '-c:a', 'libmp3lame',
-    '-b:a', '48k',
+    '-b:a', '32k',
     outputMp3Path,
   ]);
   return outputMp3Path;
@@ -509,7 +524,7 @@ async function transcribeMp3ToTimedTranscript(params: {
   if (process.env.GEMINI_API_KEY?.trim()) {
     try {
       const stats = fs.statSync(params.mp3Path);
-      if (stats.size <= 8 * 1024 * 1024 && effectiveDuration <= 540) {
+      if (stats.size <= 1.5 * 1024 * 1024 && effectiveDuration <= 150) {
         const buf = fs.readFileSync(params.mp3Path);
         const res = await transcribeAudioWithTimestamps({
           audioBuffer: buf,
@@ -525,13 +540,15 @@ async function transcribeMp3ToTimedTranscript(params: {
         const chunks = await extractVideoAudioChunks(
           params.mp3Path,
           effectiveDuration,
-          params.videoHash
+          params.videoHash,
+          180
         );
         const aiTranscript = await transcribeVideoChunksWithGemini({
           videoHash: params.videoHash,
           sourcePath: params.sourcePath,
           totalDurationSec: effectiveDuration,
           chunks,
+          concurrency: 4,
         });
         if (aiTranscript.segments.length > 0) {
           return aiTranscript;
@@ -594,11 +611,13 @@ print(res.model_dump_json())
 async function searchViralClipsFromTranscript(params: {
   transcript: Transcript;
   prompt?: string;
+  title?: string;
+  videoCategory?: string;
   durationSec: number;
   maxClips?: number;
-}): Promise<any[]> {
+}): Promise<{ clips: any[]; video_category?: string; category_reason?: string }> {
   if (!params.transcript.segments || params.transcript.segments.length === 0) {
-    return [];
+    return { clips: [] };
   }
   const minClipSec = Math.min(8, Math.max(3, params.durationSec * 0.15));
   const maxClipSec = Math.min(45, Math.max(minClipSec + 2, params.durationSec));
@@ -606,14 +625,18 @@ async function searchViralClipsFromTranscript(params: {
 
   if (process.env.GEMINI_API_KEY?.trim()) {
     try {
-      const clips = await analyzeTranscriptForViralClips({
+      const result = await analyzeTranscriptForViralClips({
         transcript: params.transcript,
         prompt: params.prompt,
+        title: params.title,
+        videoCategory: params.videoCategory,
         minClipSec,
         maxClipSec,
         maxClips,
       });
-      if (clips.length > 0) return clips;
+      if (result.clips.length > 0) {
+        return result;
+      }
     } catch {
       // Fall back to local highlight engine
     }
@@ -623,14 +646,25 @@ async function searchViralClipsFromTranscript(params: {
     const stdout = await runPythonCli(['highlights'], {
       transcript: params.transcript,
       prompt: params.prompt || 'High-retention hooks, bold insights, concise takeaways',
+      title: params.title || '',
+      video_category: params.videoCategory || 'auto',
+      include_meta: true,
       min_clip_sec: minClipSec,
       max_clip_sec: maxClipSec,
       max_clips: maxClips,
       timeout_sec: 1.5,
     });
-    return JSON.parse(stdout);
+    const parsed = JSON.parse(stdout);
+    if (Array.isArray(parsed)) {
+      return { clips: parsed, video_category: parsed[0]?.video_category };
+    }
+    return {
+      clips: Array.isArray(parsed?.clips) ? parsed.clips : [],
+      video_category: parsed?.video_category,
+      category_reason: parsed?.category_reason,
+    };
   } catch {
-    return [];
+    return { clips: [] };
   }
 }
 
@@ -942,6 +976,8 @@ async function startServer() {
       const filePath = req.file.path;
       const autoPipeline = req.body?.auto_pipeline !== 'false';
       const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+      const videoCategory =
+        typeof req.body?.video_category === 'string' ? req.body.video_category : 'auto';
       const tmpMp3Path = path.join(AUDIO_DIR, `.tmp_up_${Date.now()}.mp3`);
 
       // Compute hash, probe video, AND extract MP3 simultaneously!
@@ -1008,19 +1044,26 @@ async function startServer() {
       }
 
       let clips = existing?.clips || [];
+      let detectedVideoCategory: string | undefined = existing?.video_category || undefined;
+      let categoryReason: string | undefined;
       if (autoPipeline && clips.length === 0 && transcript && transcript.segments.length > 0) {
         emit({
           type: 'progress',
           stage: 'analyzing_clips',
           mp3_ready: Boolean(audioUrl),
           segment_count: transcript.segments.length,
-          message: 'Searching viral clips from timed transcript...',
+          message: 'Detecting video category & searching viral clips from timed transcript...',
         });
-        clips = await searchViralClipsFromTranscript({
+        const viralRes = await searchViralClipsFromTranscript({
           transcript,
           prompt,
+          title,
+          videoCategory,
           durationSec: meta.duration_sec,
         });
+        clips = viralRes.clips;
+        detectedVideoCategory = viralRes.video_category;
+        categoryReason = viralRes.category_reason;
       }
 
       const record: ProjectRecord = {
@@ -1032,6 +1075,7 @@ async function startServer() {
         audio_url: audioUrl,
         video_url: `/media/videos/${req.file.filename}`,
         source_url: null,
+        video_category: detectedVideoCategory || null,
         ...meta,
         created_at_iso: existing?.created_at_iso || new Date().toISOString(),
         clips,
@@ -1042,6 +1086,8 @@ async function startServer() {
         project: record,
         transcript,
         clips,
+        video_category: detectedVideoCategory,
+        category_reason: categoryReason,
         audio_url: audioUrl,
         cache_hit: cacheHit,
       };
@@ -1081,6 +1127,8 @@ async function startServer() {
     const quality = req.body?.quality === 'hd' ? 'hd' : 'fast';
     const autoPipeline = req.body?.auto_pipeline !== false;
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+    const videoCategory =
+      typeof req.body?.video_category === 'string' ? req.body.video_category : 'auto';
 
     const emit = (payload: Record<string, unknown>) => {
       if (wantsStream && !res.writableEnded) {
@@ -1240,19 +1288,26 @@ async function startServer() {
       }
 
       let clips: any[] = [];
+      let detectedVideoCategory: string | undefined;
+      let categoryReason: string | undefined;
       if (autoPipeline && transcript && transcript.segments.length > 0) {
         emit({
           type: 'progress',
           stage: 'analyzing_clips',
           mp3_ready: Boolean(audioUrl),
           segment_count: transcript.segments.length,
-          message: `Searching viral clips across ${transcript.segments.length} timed segments...`,
+          message: `Detecting video category & searching viral clips across ${transcript.segments.length} timed segments...`,
         });
-        clips = await searchViralClipsFromTranscript({
+        const viralRes = await searchViralClipsFromTranscript({
           transcript,
           prompt,
+          title,
+          videoCategory,
           durationSec: meta.duration_sec,
         });
+        clips = viralRes.clips;
+        detectedVideoCategory = viralRes.video_category;
+        categoryReason = viralRes.category_reason;
       }
 
       const record: ProjectRecord = {
@@ -1264,6 +1319,7 @@ async function startServer() {
         audio_url: audioUrl,
         video_url: `/media/videos/${filename}`,
         source_url: sourceUrl,
+        video_category: detectedVideoCategory || null,
         ...meta,
         created_at_iso: new Date().toISOString(),
         clips,
@@ -1274,6 +1330,8 @@ async function startServer() {
         project: record,
         transcript,
         clips,
+        video_category: detectedVideoCategory,
+        category_reason: categoryReason,
         audio_url: audioUrl,
         cache_hit: cacheHit,
       };
@@ -1333,7 +1391,11 @@ async function startServer() {
 
     if (req.body?.provider === 'gemini') {
       try {
-        const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
+        const audioSourcePath =
+          project.audio_path && fs.existsSync(project.audio_path)
+            ? project.audio_path
+            : project.local_path;
+        const chunks = await extractVideoAudioChunks(audioSourcePath, project.duration_sec, effectiveHash);
         const aiTranscript = await transcribeVideoChunksWithGemini({
           videoHash: effectiveHash,
           sourcePath: project.local_path,
@@ -1378,7 +1440,11 @@ print(res.model_dump_json())
     } catch {
       if (process.env.GEMINI_API_KEY?.trim()) {
         try {
-          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
+          const audioSourcePath =
+            project.audio_path && fs.existsSync(project.audio_path)
+              ? project.audio_path
+              : project.local_path;
+          const chunks = await extractVideoAudioChunks(audioSourcePath, project.duration_sec, effectiveHash);
           const aiTranscript = await transcribeVideoChunksWithGemini({
             videoHash: effectiveHash,
             sourcePath: project.local_path,
@@ -1446,13 +1512,46 @@ print(res.model_dump_json())
     '/api/audio/transcribe',
     audioMemoryUpload.single('audio'),
     async (req: Request, res: Response) => {
+      const wantsStream = req.query.stream === '1' || req.body?.stream === 'true' || req.body?.stream === true;
+      const emit = (payload: Record<string, unknown>) => {
+        if (wantsStream && !res.writableEnded) {
+          res.write(`${JSON.stringify(payload)}\n`);
+        }
+      };
+
+      let shouldUnlinkTempAudio = Boolean(req.file?.path);
       let tempAudioPath: string | null = req.file?.path || null;
+
       try {
+        if (wantsStream) {
+          res.setHeader('Content-Type', 'application/x-ndjson');
+          res.setHeader('Cache-Control', 'no-cache');
+        }
+
         let mimeType = 'audio/webm';
         const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
         const timestampsEnabled = req.body?.timestamps !== 'false';
         const clientDurationSec = Number(req.body?.durationSec) || 0;
-        const sourceLabel = req.file?.originalname || 'microphone-recording';
+        const projectHash = typeof req.body?.project_hash === 'string' ? req.body.project_hash.trim() : '';
+        let sourceLabel = req.file?.originalname || 'microphone-recording';
+
+        // Zero-upload fast path: transcribe directly from active project's server-side MP3/video
+        if (!tempAudioPath && projectHash) {
+          const project = await resolveProject(projectHash);
+          if (project) {
+            if (project.audio_path && fs.existsSync(project.audio_path)) {
+              tempAudioPath = project.audio_path;
+              mimeType = 'audio/mp3';
+              sourceLabel = path.basename(project.audio_path);
+              shouldUnlinkTempAudio = false;
+            } else if (project.local_path && fs.existsSync(project.local_path)) {
+              tempAudioPath = project.local_path;
+              mimeType = 'audio/mp3';
+              sourceLabel = project.filename;
+              shouldUnlinkTempAudio = false;
+            }
+          }
+        }
 
         if (!tempAudioPath && typeof req.body?.audioBase64 === 'string' && req.body.audioBase64.trim()) {
           const rawBase64 = req.body.audioBase64.trim().replace(/^data:[^;]+;base64,/, '');
@@ -1461,6 +1560,7 @@ print(res.model_dump_json())
           const ext = mimeType.includes('mp3') ? '.mp3' : mimeType.includes('wav') ? '.wav' : '.webm';
           tempAudioPath = path.join(CACHE_DIR, `.tmp_audio_b64_${Date.now()}${ext}`);
           fs.writeFileSync(tempAudioPath, audioBuffer);
+          shouldUnlinkTempAudio = true;
         } else if (req.file) {
           mimeType = normalizeAudioMimeType(
             (typeof req.body?.mimeType === 'string' && req.body.mimeType) || req.file.mimetype,
@@ -1469,11 +1569,54 @@ print(res.model_dump_json())
         }
 
         if (!tempAudioPath || !fs.existsSync(tempAudioPath) || fs.statSync(tempAudioPath).size === 0) {
-          res.status(400).json({ error: 'No audio recording or file was provided for transcription.' });
+          const errPayload = { error: 'No audio recording or file was provided for transcription.' };
+          if (wantsStream) {
+            emit({ type: 'error', ...errPayload });
+            res.end();
+          } else {
+            res.status(400).json(errPayload);
+          }
           return;
         }
 
-        const fileSizeBytes = fs.statSync(tempAudioPath).size;
+        const [audioSha, fileSizeBytes] = await Promise.all([
+          computeSha256(tempAudioPath),
+          Promise.resolve(fs.statSync(tempAudioPath).size),
+        ]);
+        const promptSig = crypto
+          .createHash('sha1')
+          .update(`${timestampsEnabled ? 'ts' : 'raw'}:${(prompt || '').trim()}`)
+          .digest('hex')
+          .slice(0, 10);
+        const audioCacheFile = path.join(CACHE_DIR, `audio_${audioSha}_${promptSig}.json`);
+
+        if (fs.existsSync(audioCacheFile)) {
+          try {
+            const cachedPayload = JSON.parse(fs.readFileSync(audioCacheFile, 'utf-8'));
+            emit({
+              type: 'progress',
+              stage: 'cache_hit',
+              message: 'Instant SHA-256 transcript cache hit!',
+            });
+            const finalCached = { ...cachedPayload, cache_hit: true };
+            if (wantsStream) {
+              emit({ type: 'result', data: finalCached });
+              res.end();
+            } else {
+              res.json(finalCached);
+            }
+            return;
+          } catch {
+            // Re-transcribe if cached JSON is unreadable
+          }
+        }
+
+        emit({
+          type: 'progress',
+          stage: 'probing',
+          message: 'Inspecting audio duration & preparing fast speech chunks...',
+        });
+
         let probedDurationSec = clientDurationSec;
         try {
           const meta = await probeVideo(tempAudioPath);
@@ -1484,51 +1627,111 @@ print(res.model_dump_json())
           // Fall back to client-reported duration or model-derived duration
         }
 
+        const writeAudioCache = (payload: Record<string, unknown>) => {
+          try {
+            fs.writeFileSync(audioCacheFile, JSON.stringify(payload), 'utf-8');
+          } catch {
+            // Ignore non-fatal cache write failure
+          }
+        };
+
         if (!timestampsEnabled) {
+          emit({
+            type: 'progress',
+            stage: 'transcribing',
+            message: 'Transcribing audio with Gemini...',
+          });
           const audioBuffer = fs.readFileSync(tempAudioPath);
           const result = await transcribeAudioBuffer({
             audioBuffer,
             mimeType,
             prompt,
           });
-          res.json({
+          const payload = {
             ...result,
             timestamped: false,
             duration_sec: probedDurationSec,
             segments: [],
             srt: '',
-          });
+            cache_hit: false,
+          };
+          if (payload.text) writeAudioCache(payload);
+          if (wantsStream) {
+            emit({ type: 'result', data: payload });
+            res.end();
+          } else {
+            res.json(payload);
+          }
           return;
         }
 
-        const needsChunking = fileSizeBytes > 8 * 1024 * 1024 || probedDurationSec > 540;
-        if (needsChunking) {
-          const effectiveDur = Math.max(10, probedDurationSec || 600);
-          const audioHash = `audio_${Date.now()}`;
-          const chunks = await extractVideoAudioChunks(tempAudioPath, effectiveDur, audioHash);
+        // Parallelize any audio > 150s or > 1.5 MB via 180s speech-grade 32kbps MP3 chunks (4 concurrent workers)
+        const shouldParallelChunk = fileSizeBytes > 1.5 * 1024 * 1024 || probedDurationSec > 150;
+        if (shouldParallelChunk) {
+          const effectiveDur = Math.max(10, probedDurationSec || 180);
+          const audioHash = `audio_${audioSha.slice(0, 12)}`;
+          emit({
+            type: 'progress',
+            stage: 'chunking',
+            message: 'Compressing & splitting audio into parallel 32kbps speech chunks...',
+          });
+          const chunks = await extractVideoAudioChunks(tempAudioPath, effectiveDur, audioHash, 180);
+          emit({
+            type: 'progress',
+            stage: 'transcribing',
+            completed: 0,
+            total: chunks.length,
+            message: `Transcribing ${chunks.length} audio chunk${chunks.length === 1 ? '' : 's'} in parallel...`,
+          });
           const transcript = await transcribeVideoChunksWithGemini({
             videoHash: audioHash,
             sourcePath: sourceLabel,
             totalDurationSec: effectiveDur,
             chunks,
             prompt,
+            concurrency: 4,
+            onChunkComplete: ({ completed, total, segments: partialSegs }) => {
+              emit({
+                type: 'progress',
+                stage: 'transcribing',
+                completed,
+                total,
+                partial_segments: partialSegs,
+                message: `Transcribed ${completed}/${total} chunks with timestamps...`,
+              });
+            },
           });
-          res.json({
+          const payload = {
             text:
               transcript.segments.length > 0
                 ? segmentsToTimestampedText(transcript.segments)
                 : '',
             model: TRANSCRIBE_MODEL,
-            mimeType,
+            mimeType: 'audio/mp3',
             timestamped: true,
             duration_sec: transcript.duration_sec,
             segments: transcript.segments,
             srt: segmentsToSrt(transcript.segments),
             transcript,
-          });
+            cache_hit: false,
+          };
+          if (payload.segments.length > 0) writeAudioCache(payload);
+          if (wantsStream) {
+            emit({ type: 'result', data: payload });
+            res.end();
+          } else {
+            res.json(payload);
+          }
           return;
         }
 
+        emit({
+          type: 'progress',
+          stage: 'transcribing',
+          completed: 0,
+          total: 1,
+          message: 'Transcribing short audio clip with timestamps...',
+        });
         const audioBuffer = fs.readFileSync(tempAudioPath);
         const result = await transcribeAudioWithTimestamps({
           audioBuffer,
@@ -1537,12 +1740,24 @@ print(res.model_dump_json())
           durationSec: probedDurationSec > 0 ? probedDurationSec : undefined,
           sourceLabel,
         });
-        res.json(result);
+        const payload = { ...result, cache_hit: false };
+        if (payload.segments.length > 0) writeAudioCache(payload);
+        if (wantsStream) {
+          emit({ type: 'result', data: payload });
+          res.end();
+        } else {
+          res.json(payload);
+        }
       } catch (err) {
         const formatted = formatGeminiError(err);
-        res.status(formatted.status).json({ error: formatted.message });
+        if (wantsStream) {
+          emit({ type: 'error', error: formatted.message });
+          res.end();
+        } else {
+          res.status(formatted.status).json({ error: formatted.message });
+        }
       } finally {
-        if (tempAudioPath && fs.existsSync(tempAudioPath)) {
+        if (shouldUnlinkTempAudio && tempAudioPath && fs.existsSync(tempAudioPath)) {
           try {
             fs.unlinkSync(tempAudioPath);
           } catch {
@@ -1560,14 +1775,21 @@ print(res.model_dump_json())
         res.status(400).json({ error: 'A non-empty transcript object is required for viral clip analysis.' });
         return;
       }
-      const clips = await analyzeTranscriptForViralClips({
+      const analysis = await analyzeTranscriptForViralClips({
         transcript,
         prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : undefined,
+        title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+        videoCategory: typeof req.body?.video_category === 'string' ? req.body.video_category : 'auto',
         minClipSec: Number(req.body?.min_clip_sec || 6),
         maxClipSec: Number(req.body?.max_clip_sec || 45),
         maxClips: Number(req.body?.max_clips || 6),
       });
-      res.json({ clips, analysis_model: VIRAL_ANALYSIS_MODEL });
+      res.json({
+        clips: analysis.clips,
+        video_category: analysis.video_category,
+        category_reason: analysis.category_reason,
+        analysis_model: VIRAL_ANALYSIS_MODEL,
+      });
     } catch (err) {
       const formatted = formatGeminiError(err);
       res.status(formatted.status).json({ error: formatted.message });
@@ -1589,6 +1811,8 @@ print(res.model_dump_json())
 
     const retranscribe = Boolean(req.body?.retranscribe);
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+    const videoCategory =
+      typeof req.body?.video_category === 'string' ? req.body.video_category : 'auto';
     const minClipSec = Number(req.body?.min_clip_sec || 6);
     const maxClipSec = Number(req.body?.max_clip_sec || 45);
     const maxClips = Number(req.body?.max_clips || 6);
@@ -1612,7 +1836,11 @@ print(res.model_dump_json())
           }
           note = 'No audio track detected; analyzed the cached transcript instead.';
         } else {
-          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
+          const audioSourcePath =
+            project.audio_path && fs.existsSync(project.audio_path)
+              ? project.audio_path
+              : project.local_path;
+          const chunks = await extractVideoAudioChunks(audioSourcePath, project.duration_sec, effectiveHash);
           const aiTranscript = await transcribeVideoChunksWithGemini({
             videoHash: effectiveHash,
             sourcePath: project.local_path,
@@ -1635,20 +1863,25 @@ print(res.model_dump_json())
         }
       }
 
-      const clips = await analyzeTranscriptForViralClips({
+      const analysis = await analyzeTranscriptForViralClips({
         transcript,
         prompt,
+        title: project.title,
+        videoCategory,
         minClipSec,
         maxClipSec,
         maxClips,
       });
 
-      project.clips = clips;
+      project.clips = analysis.clips;
+      project.video_category = analysis.video_category;
       upsertProject(project);
 
       res.json({
         transcript,
-        clips,
+        clips: analysis.clips,
+        video_category: analysis.video_category,
+        category_reason: analysis.category_reason,
         cache_hit: cacheHit,
         transcript_model: transcript.model_name || TRANSCRIBE_MODEL,
         analysis_model: VIRAL_ANALYSIS_MODEL,
@@ -1681,6 +1914,9 @@ print(res.model_dump_json())
       const stdout = await runPythonCli(['highlights'], {
         transcript,
         prompt: req.body?.prompt || 'High-retention hooks, bold insights, concise takeaways',
+        title: project.title || '',
+        video_category: req.body?.video_category || 'auto',
+        include_meta: true,
         ollama_url: req.body?.ollama_url || 'http://localhost:11434',
         ollama_model: req.body?.ollama_model || 'qwen2.5:14b',
         min_clip_sec: Number(req.body?.min_clip_sec || 6),
@@ -1688,10 +1924,18 @@ print(res.model_dump_json())
         max_clips: Number(req.body?.max_clips || 6),
         timeout_sec: 1.5,
       });
-      const clips = JSON.parse(stdout);
+      const parsed = JSON.parse(stdout);
+      const clips = Array.isArray(parsed) ? parsed : parsed?.clips || [];
+      const detectedCat = Array.isArray(parsed)
+        ? parsed[0]?.video_category
+        : parsed?.video_category;
+      const categoryReason = Array.isArray(parsed) ? undefined : parsed?.category_reason;
       project.clips = clips;
+      if (detectedCat) {
+        project.video_category = detectedCat;
+      }
       upsertProject(project);
-      res.json({ clips });
+      res.json({ clips, video_category: detectedCat, category_reason: categoryReason });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Highlight extraction failed' });
     }

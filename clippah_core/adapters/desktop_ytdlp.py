@@ -90,7 +90,7 @@ def extract_mp3_audio(
             "-c:a",
             "libmp3lame",
             "-b:a",
-            "48k",
+            "32k",
             str(output_mp3_path),
         ],
         capture_output=True,

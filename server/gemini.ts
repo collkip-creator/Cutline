@@ -28,6 +28,16 @@ export interface TranscriptData {
   segments: TranscriptSegment[];
 }
 
+import {
+  buildCategoryPromptInstructions,
+  detectVideoCategory,
+  inferClipTriggersAndGamingType,
+  normalizeVideoCategory,
+  type GamingClipType,
+  type VideoCategory,
+  type VideoCategoryOption,
+} from './viralIntelligence.ts';
+
 export type ClipCategory = 'lesson' | 'entertainment' | 'insight' | 'hook';
 export type ClipSentiment = 'Positive' | 'Negative' | 'Neutral';
 
@@ -35,6 +45,9 @@ export interface ViralClipCandidate {
   id: string;
   title: string;
   category: ClipCategory;
+  video_category?: VideoCategory;
+  viral_triggers?: string[];
+  gaming_clip_type?: GamingClipType;
   sentiment: ClipSentiment;
   start_sec: number;
   end_sec: number;
@@ -45,6 +58,12 @@ export interface ViralClipCandidate {
   caption_hook: string;
   tags: string[];
   snapped_to_words: boolean;
+}
+
+export interface ViralAnalysisResult {
+  video_category: VideoCategory;
+  category_reason: string;
+  clips: ViralClipCandidate[];
 }
 
 export function getGeminiClient(): GoogleGenAI {
@@ -436,40 +455,89 @@ export async function transcribeVideoChunksWithGemini(params: {
   totalDurationSec: number;
   chunks: Array<{ buffer: Buffer; mimeType: string; startSec: number; durationSec: number }>;
   prompt?: string;
+  concurrency?: number;
+  onChunkComplete?: (info: {
+    completed: number;
+    total: number;
+    chunkIndex: number;
+    segments: Array<{ start_sec: number; end_sec: number; text: string }>;
+  }) => void;
 }): Promise<TranscriptData> {
-  const allRawSegments: Array<{ start_sec: number; end_sec: number; text: string }> = [];
   const extra = params.prompt?.trim();
-
-  for (const chunk of params.chunks) {
-    const result = await transcribeAudioBuffer({
-      audioBuffer: chunk.buffer,
-      mimeType: chunk.mimeType,
-      prompt: [
-        'Transcribe all spoken words in this audio accurately. Format each sentence or natural spoken phrase on a new line prefixed with its exact start timestamp from the start of this audio clip in [MM:SS] format (for example: [00:00] First sentence here.). If there is no speech, respond with an empty string.',
-        extra ? `Additional instructions: ${extra}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n'),
-    });
-
-    if (result.text.trim()) {
-      const segs = parseTimestampedChunkOutput({
-        rawText: result.text,
-        chunkStartSec: chunk.startSec,
-        chunkDurationSec: chunk.durationSec,
-        totalDurationSec: params.totalDurationSec,
-      });
-      allRawSegments.push(...segs);
-    }
+  const total = params.chunks.length;
+  if (total === 0) {
+    return {
+      video_hash: params.videoHash,
+      source_path: params.sourcePath,
+      language: 'en',
+      duration_sec: params.totalDurationSec,
+      model_name: TRANSCRIBE_MODEL,
+      created_at_iso: new Date().toISOString(),
+      segments: [],
+    };
   }
 
-  const segments: TranscriptSegment[] = allRawSegments.map((seg, idx) => ({
-    id: idx,
-    start_sec: seg.start_sec,
-    end_sec: seg.end_sec,
-    text: seg.text,
-    words: buildWordsForSegment(seg.text, seg.start_sec, seg.end_sec),
-  }));
+  const chunkResults: Array<Array<{ start_sec: number; end_sec: number; text: string }>> = new Array(
+    total
+  ).fill(null).map(() => []);
+  const workerCount = Math.min(total, Math.max(1, params.concurrency ?? 4));
+  let nextIdx = 0;
+  let completedCount = 0;
+
+  const promptText = [
+    'Transcribe all spoken words in this audio accurately. Format each sentence or natural spoken phrase on a new line prefixed with its exact start timestamp from the start of this audio clip in [MM:SS] format (for example: [00:00] First sentence here.). If there is no speech, respond with an empty string.',
+    extra ? `Additional instructions: ${extra}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const runWorker = async () => {
+    while (true) {
+      const idx = nextIdx++;
+      if (idx >= total) return;
+      const chunk = params.chunks[idx];
+      const result = await transcribeAudioBuffer({
+        audioBuffer: chunk.buffer,
+        mimeType: chunk.mimeType,
+        prompt: promptText,
+      });
+
+      const segs = result.text.trim()
+        ? parseTimestampedChunkOutput({
+            rawText: result.text,
+            chunkStartSec: chunk.startSec,
+            chunkDurationSec: chunk.durationSec,
+            totalDurationSec: params.totalDurationSec,
+          })
+        : [];
+      chunkResults[idx] = segs;
+      completedCount += 1;
+      params.onChunkComplete?.({
+        completed: completedCount,
+        total,
+        chunkIndex: idx,
+        segments: segs,
+      });
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+  const allRawSegments = chunkResults.flat();
+  const segments: TranscriptSegment[] = [];
+  for (let i = 0; i < allRawSegments.length; i++) {
+    const raw = allRawSegments[i];
+    const prevStart = segments.length > 0 ? segments[segments.length - 1].start_sec + 0.3 : 0;
+    const startSec = Math.round(Math.max(prevStart, raw.start_sec) * 1000) / 1000;
+    const endSec = Math.round(Math.max(startSec + 0.35, raw.end_sec) * 1000) / 1000;
+    segments.push({
+      id: i,
+      start_sec: startSec,
+      end_sec: endSec,
+      text: raw.text,
+      words: buildWordsForSegment(raw.text, startSec, endSec),
+    });
+  }
 
   return {
     video_hash: params.videoHash,
@@ -504,17 +572,22 @@ function snapTimestampToWords(
 export async function analyzeTranscriptForViralClips(params: {
   transcript: TranscriptData;
   prompt?: string;
+  title?: string;
+  videoCategory?: VideoCategoryOption | string;
   minClipSec?: number;
   maxClipSec?: number;
   maxClips?: number;
-}): Promise<ViralClipCandidate[]> {
+}): Promise<ViralAnalysisResult> {
   const { transcript } = params;
   if (!transcript.segments || transcript.segments.length === 0) {
     throw new Error('Cannot analyze an empty transcript for viral clips.');
   }
 
   const ai = getGeminiClient();
-  const totalDur = Math.max(1, transcript.duration_sec || transcript.segments[transcript.segments.length - 1].end_sec);
+  const totalDur = Math.max(
+    1,
+    transcript.duration_sec || transcript.segments[transcript.segments.length - 1].end_sec
+  );
   const minClipSec = Math.min(Math.max(2, params.minClipSec ?? 6), Math.max(2, totalDur * 0.8));
   const maxClipSec = Math.min(Math.max(minClipSec + 2, params.maxClipSec ?? 45), totalDur);
   const maxClips = Math.min(Math.max(1, params.maxClips ?? 6), 10);
@@ -522,22 +595,47 @@ export async function analyzeTranscriptForViralClips(params: {
   const formattedTranscript = transcript.segments
     .map((s) => `[${s.start_sec.toFixed(2)}s - ${s.end_sec.toFixed(2)}s] ${s.text}`)
     .join('\n');
+  const fullPlainText = transcript.segments.map((s) => s.text).join(' ');
+
+  const explicitCategory = normalizeVideoCategory(params.videoCategory);
+  const heuristicCategory = detectVideoCategory({
+    transcriptText: fullPlainText,
+    title: params.title,
+    prompt: params.prompt,
+    requestedCategory: params.videoCategory,
+  });
+  const activePromptCategory: VideoCategory | 'auto' = explicitCategory
+    ? explicitCategory
+    : heuristicCategory.category !== 'general'
+      ? heuristicCategory.category
+      : 'auto';
 
   const userGoal =
     params.prompt?.trim() ||
-    'Identify the highest-retention standalone viral short-form clips: bold hooks, surprising insights, emotional stories, and actionable lessons.';
+    'Identify the highest-retention standalone viral short-form clips tailored to the video domain: bold hooks, surprising insights, emotional stories, and actionable lessons.';
+
+  const categoryInstructions = buildCategoryPromptInstructions(activePromptCategory);
 
   const analysisPrompt = [
-    `You are an expert short-form video editor extracting viral clips for YouTube Shorts, TikTok, and Instagram Reels.`,
+    `You are an expert short-form video editor with Category-Specific Viral Intelligence extracting viral clips for YouTube Shorts, TikTok, and Instagram Reels.`,
+    params.title ? `Video title: ${params.title}` : '',
     `Video duration: ${totalDur.toFixed(2)} seconds.`,
     `Target clip length: between ${minClipSec.toFixed(1)}s and ${maxClipSec.toFixed(1)}s (extract up to ${maxClips} distinct, non-overlapping clips ranked by viral strength).`,
     `Editorial focus: ${userGoal}`,
+    explicitCategory
+      ? `User-selected video category: ${explicitCategory}. Apply its rules strictly.`
+      : `Baseline category signal: ${heuristicCategory.category} (${heuristicCategory.reason}). Confirm or refine detected_video_category from the transcript.`,
+    ``,
+    categoryInstructions,
     ``,
     `Transcript with timestamps:`,
     formattedTranscript,
     ``,
-    `Return JSON array items with exact start_sec and end_sec grounded in the transcript timestamps, category ('hook' | 'lesson' | 'entertainment' | 'insight'), sentiment ('Positive' | 'Negative' | 'Neutral'), 1-10 scores (hook_score, lesson_score, entertainment_score), a punchy uppercase caption_hook (<= 48 chars), a 1-sentence editorial reason, and exactly 3 relevant social hashtags starting with #.`,
-  ].join('\n');
+    `Return JSON object { detected_video_category, category_reason, clips: [...] }.`,
+    `Each clip must include: exact start_sec and end_sec grounded in the transcript timestamps, category ('hook' | 'lesson' | 'entertainment' | 'insight'), viral_triggers (1-3 specific matched triggers like 'Financial Revelation', 'Punchline', 'Clutch Play', 'Synced Gameplay + Reaction'), optional gaming_clip_type ('gameplay_highlight' | 'commentary_highlight' | 'synced_gameplay_reaction' when category is gaming), sentiment ('Positive' | 'Negative' | 'Neutral'), 1-10 scores (hook_score, lesson_score, entertainment_score), a punchy uppercase caption_hook (<= 48 chars), a concise editorial reason explaining why it triggers viral engagement in that category, and 3 relevant social hashtags starting with #.`,
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const rawJson = await withGeminiRetry(async () => {
     const response = await ai.models.generateContent({
@@ -545,52 +643,91 @@ export async function analyzeTranscriptForViralClips(params: {
       contents: analysisPrompt,
       config: {
         systemInstruction:
-          'Analyze video transcripts strictly based on the provided spoken segments and timestamps. Never invent timestamps outside the transcript duration.',
+          'Analyze video transcripts strictly based on the provided spoken segments and timestamps. Never invent timestamps outside the transcript duration. Always apply category-specific viral rules and, for gaming content, distinguish gameplay_highlight vs commentary_highlight vs synced_gameplay_reaction.',
         responseMimeType: 'application/json',
         responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING, description: 'Compelling short clip title' },
-              category: {
-                type: Type.STRING,
-                description: 'One of: hook, lesson, entertainment, insight',
-              },
-              sentiment: {
-                type: Type.STRING,
-                description: 'Overall emotional tone: Positive, Negative, or Neutral',
-              },
-              start_sec: { type: Type.NUMBER, description: 'Clip start time in seconds' },
-              end_sec: { type: Type.NUMBER, description: 'Clip end time in seconds' },
-              hook_score: { type: Type.NUMBER, description: 'Scroll-stopping hook strength from 1 to 10' },
-              lesson_score: { type: Type.NUMBER, description: 'Actionable takeaway value from 1 to 10' },
-              entertainment_score: { type: Type.NUMBER, description: 'Storytelling/energy score from 1 to 10' },
-              caption_hook: { type: Type.STRING, description: 'Short bold on-screen hook caption' },
-              reason: { type: Type.STRING, description: 'Why this segment will perform as a viral clip' },
-              tags: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '3 relevant social media hashtags starting with #',
+          type: Type.OBJECT,
+          properties: {
+            detected_video_category: {
+              type: Type.STRING,
+              description:
+                'One of: business, comedy, motivation, politics, sports, relationships, technology, education, gaming, general',
+            },
+            category_reason: {
+              type: Type.STRING,
+              description: 'Short explanation of why this video belongs to the detected category',
+            },
+            clips: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING, description: 'Compelling short clip title' },
+                  category: {
+                    type: Type.STRING,
+                    description: 'One of: hook, lesson, entertainment, insight',
+                  },
+                  viral_triggers: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: '1 to 3 matched category-specific viral triggers',
+                  },
+                  gaming_clip_type: {
+                    type: Type.STRING,
+                    description:
+                      'For gaming videos: gameplay_highlight, commentary_highlight, or synced_gameplay_reaction',
+                  },
+                  sentiment: {
+                    type: Type.STRING,
+                    description: 'Overall emotional tone: Positive, Negative, or Neutral',
+                  },
+                  start_sec: { type: Type.NUMBER, description: 'Clip start time in seconds' },
+                  end_sec: { type: Type.NUMBER, description: 'Clip end time in seconds' },
+                  hook_score: { type: Type.NUMBER, description: 'Scroll-stopping hook strength from 1 to 10' },
+                  lesson_score: { type: Type.NUMBER, description: 'Actionable takeaway value from 1 to 10' },
+                  entertainment_score: { type: Type.NUMBER, description: 'Storytelling/energy score from 1 to 10' },
+                  caption_hook: { type: Type.STRING, description: 'Short bold on-screen hook caption' },
+                  reason: { type: Type.STRING, description: 'Why this segment will perform as a viral clip' },
+                  tags: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: '3 relevant social media hashtags starting with #',
+                  },
+                },
               },
             },
           },
         },
       },
     });
-    return (response.text ?? '[]').trim();
+    return (response.text ?? '{}').trim();
   });
 
-  let parsed: any[] = [];
+  let parsedObj: any = {};
+  let parsedClips: any[] = [];
   try {
-    const data = JSON.parse(rawJson);
-    parsed = Array.isArray(data) ? data : [];
+    parsedObj = JSON.parse(rawJson);
+    if (Array.isArray(parsedObj)) {
+      parsedClips = parsedObj;
+    } else if (parsedObj && Array.isArray(parsedObj.clips)) {
+      parsedClips = parsedObj.clips;
+    }
   } catch {
     throw new Error('Gemini returned malformed JSON during viral clip analysis.');
   }
 
+  const modelCategory = normalizeVideoCategory(parsedObj?.detected_video_category);
+  const resolvedVideoCategory: VideoCategory = explicitCategory || modelCategory || heuristicCategory.category;
+  const resolvedCategoryReason =
+    String(parsedObj?.category_reason || '').trim() || heuristicCategory.reason;
+
   const allWords = transcript.segments.flatMap((s) => s.words || []);
   const validCategories = new Set<ClipCategory>(['hook', 'lesson', 'entertainment', 'insight']);
+  const validGamingTypes = new Set<GamingClipType>([
+    'gameplay_highlight',
+    'commentary_highlight',
+    'synced_gameplay_reaction',
+  ]);
   const clampScore = (v: unknown, fallback = 7.5) => {
     const n = Number(v);
     if (!Number.isFinite(n)) return fallback;
@@ -604,7 +741,7 @@ export async function analyzeTranscriptForViralClips(params: {
     return 'Neutral';
   };
 
-  const normalizedClips: ViralClipCandidate[] = parsed
+  const normalizedClips: ViralClipCandidate[] = parsedClips
     .slice(0, maxClips)
     .map((item, idx) => {
       let start = Math.max(0, Math.min(totalDur - 1, Number(item?.start_sec) || 0));
@@ -621,6 +758,30 @@ export async function analyzeTranscriptForViralClips(params: {
       const rawCat = String(item?.category || 'hook').toLowerCase() as ClipCategory;
       const category: ClipCategory = validCategories.has(rawCat) ? rawCat : 'hook';
 
+      const segWindowText = transcript.segments
+        .filter((s) => s.end_sec >= start && s.start_sec <= end)
+        .map((s) => s.text)
+        .join(' ');
+      const fallbackMeta = inferClipTriggersAndGamingType(
+        `${segWindowText} ${String(item?.reason || '')}`,
+        resolvedVideoCategory
+      );
+
+      const rawTriggers: string[] = Array.isArray(item?.viral_triggers)
+        ? item.viral_triggers.map((t: unknown) => String(t).trim()).filter(Boolean)
+        : [];
+      const viral_triggers = (
+        rawTriggers.length > 0 ? rawTriggers : fallbackMeta.viral_triggers
+      ).slice(0, 4);
+
+      const rawGamingType = String(item?.gaming_clip_type || '').trim().toLowerCase() as GamingClipType;
+      const gaming_clip_type: GamingClipType | undefined =
+        resolvedVideoCategory === 'gaming'
+          ? validGamingTypes.has(rawGamingType)
+            ? rawGamingType
+            : fallbackMeta.gaming_clip_type || 'gameplay_highlight'
+          : undefined;
+
       const rawTags: string[] = Array.isArray(item?.tags) ? item.tags : [];
       const cleanTags = rawTags
         .map((t) => `#${String(t).trim().replace(/^#+/, '').replace(/[^a-zA-Z0-9_]/g, '')}`)
@@ -636,6 +797,9 @@ export async function analyzeTranscriptForViralClips(params: {
         id: `clip_${String(idx + 1).padStart(2, '0')}`,
         title: String(item?.title || `Viral Clip ${idx + 1}`).trim(),
         category,
+        video_category: resolvedVideoCategory,
+        viral_triggers,
+        ...(gaming_clip_type ? { gaming_clip_type } : {}),
         sentiment: normalizeSentiment(item?.sentiment),
         start_sec: Math.round(start * 100) / 100,
         end_sec: Math.round(end * 100) / 100,
@@ -658,5 +822,9 @@ export async function analyzeTranscriptForViralClips(params: {
     throw new Error('Gemini analysis did not return any valid viral clip candidates.');
   }
 
-  return normalizedClips;
+  return {
+    video_category: resolvedVideoCategory,
+    category_reason: resolvedCategoryReason,
+    clips: normalizedClips,
+  };
 }

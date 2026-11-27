@@ -98,9 +98,20 @@ def main() -> None:
             min_clip_sec=float(payload.get("min_clip_sec", 8.0)),
             max_clip_sec=float(payload.get("max_clip_sec", 45.0)),
             max_clips=int(payload.get("max_clips", 6)),
+            title=str(payload.get("title") or ""),
+            video_category=payload.get("video_category"),
         )
         grounded = ground_and_deduplicate_clips(batch.clips, transcript)
-        print(json.dumps([c.model_dump() for c in grounded]))
+        if payload.get("include_meta"):
+            print(
+                json.dumps({
+                    "video_category": batch.detected_video_category,
+                    "category_reason": batch.category_reason,
+                    "clips": [c.model_dump() for c in grounded],
+                })
+            )
+        else:
+            print(json.dumps([c.model_dump() for c in grounded]))
         return
 
     if args.cmd == "captions":

@@ -338,6 +338,9 @@ class ClipCandidate(BaseModel):
     id: str
     title: str
     category: ClipCategory = ClipCategory.INSIGHT
+    video_category: Optional[str] = None
+    viral_triggers: List[str] = Field(default_factory=list)
+    gaming_clip_type: Optional[str] = None
     sentiment: Optional[str] = None
     start_sec: float
     end_sec: float
@@ -377,6 +380,8 @@ class ClipCandidate(BaseModel):
 class HighlightBatch(BaseModel):
     """Strict structured output contract expected from local Ollama / HighlightEngine."""
 
+    detected_video_category: Optional[str] = None
+    category_reason: Optional[str] = None
     clips: List[ClipCandidate] = Field(default_factory=list)
 
 

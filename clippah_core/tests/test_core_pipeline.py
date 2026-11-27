@@ -385,6 +385,147 @@ class CorePipelineTests(unittest.TestCase):
                 self.assertIsNotNone(asset.audio_path)
                 self.assertIsNotNone(tr)
 
+    def test_category_viral_intelligence_auto_detection_and_triggers(self) -> None:
+        from clippah_core.core.viral_intelligence import VideoCategory, detect_video_category
+
+        biz_text = (
+            "We burned $250,000 before fixing our pricing model. "
+            "That costly mistake taught us every startup founder lesson on cashflow and revenue margin."
+        )
+        biz_cat, _conf, _reason = detect_video_category(biz_text, title="Startup Founder Mistakes")
+        self.assertEqual(biz_cat, VideoCategory.BUSINESS)
+
+        pol_text = (
+            "In this senate policy debate, you previously voted for tax hikes, "
+            "which is a glaring contradiction to your public statement."
+        )
+        pol_cat, _pconf, _preason = detect_video_category(pol_text, title="Parliamentary Debate")
+        self.assertEqual(pol_cat, VideoCategory.POLITICS)
+
+        biz_transcript = Transcript(
+            video_hash="biz001",
+            source_path="/tmp/biz.mp4",
+            duration_sec=32.0,
+            segments=[
+                TranscriptSegment(
+                    id=0,
+                    start_sec=0.5,
+                    end_sec=14.0,
+                    text="Our biggest mistake as founders was burning $200,000 on ads before fixing pricing and profit margins.",
+                ),
+                TranscriptSegment(
+                    id=1,
+                    start_sec=15.0,
+                    end_sec=28.0,
+                    text="Unpopular opinion: most startups fail because founders copy enterprise sales playbooks instead of talking to customers.",
+                ),
+            ],
+        )
+        engine = OllamaHighlightEngine(base_url="http://127.0.0.1:1", timeout_sec=0.2)
+        biz_batch = engine.extract_highlights(
+            biz_transcript,
+            user_prompt="founder revenue lessons",
+            title="How We Almost Went Bankrupt",
+            min_clip_sec=6.0,
+            max_clip_sec=16.0,
+            max_clips=3,
+        )
+        self.assertEqual(biz_batch.detected_video_category, "business")
+        self.assertGreaterEqual(len(biz_batch.clips), 1)
+        all_triggers = [t for clip in biz_batch.clips for t in clip.viral_triggers]
+        self.assertTrue(len(all_triggers) >= 1)
+        for clip in biz_batch.clips:
+            self.assertEqual(clip.video_category, "business")
+
+        comedy_transcript = Transcript(
+            video_hash="com001",
+            source_path="/tmp/comedy.mp4",
+            duration_sec=26.0,
+            segments=[
+                TranscriptSegment(
+                    id=0,
+                    start_sec=1.0,
+                    end_sec=12.0,
+                    text="Hahaha wait what just happened? That awkward moment when the comedian forgot the punchline on stage!",
+                ),
+                TranscriptSegment(
+                    id=1,
+                    start_sec=13.0,
+                    end_sec=24.0,
+                    text="Oh yeah right, totally normal to tell a hilarious joke to your boss by accident lol.",
+                ),
+            ],
+        )
+        comedy_batch = engine.extract_highlights(
+            comedy_transcript,
+            user_prompt="funny moments",
+            title="Standup Comedy Podcast",
+            min_clip_sec=6.0,
+            max_clip_sec=15.0,
+            max_clips=2,
+        )
+        self.assertEqual(comedy_batch.detected_video_category, "comedy")
+        self.assertGreaterEqual(len(comedy_batch.clips), 1)
+        self.assertTrue(any(clip.viral_triggers for clip in comedy_batch.clips))
+
+    def test_gaming_gameplay_commentary_and_synchronization(self) -> None:
+        from clippah_core.core.viral_intelligence import GamingClipType
+
+        gaming_transcript = Transcript(
+            video_hash="game001",
+            source_path="/tmp/gaming.mp4",
+            duration_sec=52.0,
+            segments=[
+                # Pure gameplay beat followed immediately by explosive commentary reaction -> should sync!
+                TranscriptSegment(
+                    id=0,
+                    start_sec=1.0,
+                    end_sec=6.5,
+                    text="Final boss phase at 1 hp with a last second parry clutch dodge on the arena boss.",
+                ),
+                TranscriptSegment(
+                    id=1,
+                    start_sec=6.7,
+                    end_sec=12.5,
+                    text="NO WAY!! Oh my god chat are you kidding me?! Let's goooo I am speechless!!",
+                ),
+                # Standalone commentary beat
+                TranscriptSegment(
+                    id=2,
+                    start_sec=20.0,
+                    end_sec=28.5,
+                    text="Bro listen to this hilarious trash talk from my teammate yelling on mic haha.",
+                ),
+                # Standalone gameplay secret / glitch beat
+                TranscriptSegment(
+                    id=3,
+                    start_sec=34.0,
+                    end_sec=44.5,
+                    text="Check this speedrun shortcut glitch that skips the entire quest cutscene through the secret room hitbox.",
+                ),
+            ],
+        )
+        engine = OllamaHighlightEngine(base_url="http://127.0.0.1:1", timeout_sec=0.2)
+        batch = engine.extract_highlights(
+            gaming_transcript,
+            user_prompt="best gaming moments",
+            title="Elden Ring Speedrun & Clutch Boss Fight",
+            min_clip_sec=5.0,
+            max_clip_sec=18.0,
+            max_clips=4,
+        )
+        self.assertEqual(batch.detected_video_category, "gaming")
+        self.assertGreaterEqual(len(batch.clips), 2)
+        clip_types = {c.gaming_clip_type for c in batch.clips if c.gaming_clip_type}
+        self.assertIn(GamingClipType.SYNCED_GAMEPLAY_REACTION.value, clip_types)
+        synced_clips = [
+            c for c in batch.clips if c.gaming_clip_type == GamingClipType.SYNCED_GAMEPLAY_REACTION.value
+        ]
+        self.assertTrue(
+            any(c.start_sec <= 2.0 and c.end_sec >= 11.0 for c in synced_clips),
+            f"Expected synced gameplay+reaction clip spanning boss clutch and reaction, got {synced_clips}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

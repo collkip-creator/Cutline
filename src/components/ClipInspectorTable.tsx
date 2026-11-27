@@ -1,6 +1,12 @@
 import React, { useState } from 'react';
 import { Crosshair, FileText, Frown, Minus, Plus, Send, Smile, Trash2 } from 'lucide-react';
-import type { AspectRatio, ClipCandidate, ClipSentiment, Transcript } from '../types';
+import type {
+  AspectRatio,
+  ClipCandidate,
+  ClipSentiment,
+  GamingClipType,
+  Transcript,
+} from '../types';
 import { apiUrl } from '../lib/api';
 
 interface ClipInspectorTableProps {
@@ -143,6 +149,25 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
                         <option value="entertainment">entertainment</option>
                         <option value="insight">insight</option>
                       </select>
+                      {(clip.video_category === 'gaming' || clip.gaming_clip_type) && (
+                        <div>
+                          <select
+                            aria-label="Gaming clip focus"
+                            value={clip.gaming_clip_type || 'gameplay_highlight'}
+                            onChange={(e) =>
+                              onChangeClip({
+                                ...clip,
+                                gaming_clip_type: e.target.value as GamingClipType,
+                              })
+                            }
+                            className="bg-[#0B0F17] border border-indigo-500/40 focus:border-blue-500 rounded px-1.5 py-0.5 text-[10px] font-sans text-indigo-200 outline-none max-w-[132px]"
+                          >
+                            <option value="gameplay_highlight">Gameplay</option>
+                            <option value="commentary_highlight">Commentary</option>
+                            <option value="synced_gameplay_reaction">Synced Gameplay+Reaction</option>
+                          </select>
+                        </div>
+                      )}
                       {clip.sentiment && (() => {
                         const sentiment: ClipSentiment = clip.sentiment;
                         const badgeStyles: Record<ClipSentiment, string> = {
@@ -287,6 +312,18 @@ export const ClipInspectorTable: React.FC<ClipInspectorTableProps> = ({
                         onChange={(e) => onChangeClip({ ...clip, reason: e.target.value })}
                         className="w-full bg-[#0B0F17] border border-slate-800/80 focus:border-blue-500 rounded px-2 py-1 text-xs text-slate-300 outline-none"
                       />
+                      {Array.isArray(clip.viral_triggers) && clip.viral_triggers.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {clip.viral_triggers.slice(0, 3).map((trigger) => (
+                            <span
+                              key={trigger}
+                              className="inline-block px-1.5 py-0.5 rounded border border-blue-500/30 bg-blue-950/35 text-[10px] text-blue-200 whitespace-nowrap"
+                            >
+                              {trigger}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       <input
                         type="text"
                         value={clip.tags.join(', ')}

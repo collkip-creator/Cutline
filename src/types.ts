@@ -29,6 +29,22 @@ export interface Transcript {
 }
 
 export type ClipCategory = 'lesson' | 'entertainment' | 'insight' | 'hook';
+export type VideoCategory =
+  | 'business'
+  | 'comedy'
+  | 'motivation'
+  | 'politics'
+  | 'sports'
+  | 'relationships'
+  | 'technology'
+  | 'education'
+  | 'gaming'
+  | 'general';
+export type VideoCategoryOption = 'auto' | VideoCategory;
+export type GamingClipType =
+  | 'gameplay_highlight'
+  | 'commentary_highlight'
+  | 'synced_gameplay_reaction';
 export type ClipSentiment = 'Positive' | 'Negative' | 'Neutral';
 export type SubtitlePreset = 'classic' | 'bold_box' | 'yellow_pop' | 'minimal';
 export type SubtitlePosition = 'bottom' | 'middle' | 'top';
@@ -71,6 +87,9 @@ export interface ClipCandidate {
   id: string;
   title: string;
   category?: ClipCategory;
+  video_category?: VideoCategory;
+  viral_triggers?: string[];
+  gaming_clip_type?: GamingClipType;
   sentiment?: ClipSentiment;
   start_sec: number;
   end_sec: number;
@@ -94,6 +113,7 @@ export interface ProjectRecord {
   audio_url?: string | null;
   video_url: string;
   source_url: string | null;
+  video_category?: VideoCategory | null;
   duration_sec: number;
   width: number;
   height: number;
