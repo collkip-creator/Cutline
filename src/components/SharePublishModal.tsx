@@ -22,6 +22,7 @@ import type {
 import {
   apiFetch,
   apiUrl,
+  exportClipWithRecovery,
   readJsonResponse,
 } from '../lib/api';
 import {
@@ -54,6 +55,7 @@ interface SharePublishModalProps {
   burnCaptions: boolean;
   lastExport: ExportResult | null;
   channels: PublishChannelConfig[];
+  onProjectRecovered?: (recovered: ProjectRecord) => void;
   onExportCompleted: (result: ExportResult) => void;
   onQueueCompleted: (queuedCount: number, dispatchedNow: boolean) => Promise<void>;
   onClose: () => void;
@@ -67,6 +69,7 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
   burnCaptions,
   lastExport,
   channels,
+  onProjectRecovered,
   onExportCompleted,
   onQueueCompleted,
   onClose,
@@ -142,22 +145,22 @@ export const SharePublishModal: React.FC<SharePublishModalProps> = ({
     ) {
       return lastExport;
     }
-    const expRes = await apiFetch('/api/clips/export', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_hash: project.video_hash,
-        clip,
-        aspect_ratio: aspectRatio,
-        encode_mode: encodeMode,
-        include_srt: true,
-        burn_captions: burnCaptions,
-      }),
+    let effectiveHash = project.video_hash;
+    const expData = await exportClipWithRecovery({
+      project,
+      clip,
+      aspectRatio,
+      encodeMode,
+      includeSrt: true,
+      burnCaptions,
+      onProjectRecovered: (recovered) => {
+        effectiveHash = recovered.video_hash;
+        onProjectRecovered?.(recovered);
+      },
     });
-    const expData = await readJsonResponse<ExportResult>(expRes);
     onExportCompleted(expData);
     try {
-      await cacheExportInLocalStorage(project.video_hash, clip.title, expData);
+      await cacheExportInLocalStorage(effectiveHash, clip.title, expData);
     } catch {
       // Non-fatal if IndexedDB quota is tight
     }

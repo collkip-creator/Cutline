@@ -1,0 +1,23 @@
+1
+00:00:00,000 --> 00:00:02,139
+Why do cloud AI video editors
+
+2
+00:00:02,183 --> 00:00:04,322
+stall the moment your studio bandwidth
+
+3
+00:00:04,366 --> 00:00:04,686
+drops?
+
+4
+00:00:05,000 --> 00:00:06,738
+Sending gigabytes of raw 4K footage
+
+5
+00:00:06,774 --> 00:00:08,512
+to remote servers wastes hours before
+
+6
+00:00:08,548 --> 00:00:09,690
+a single cut happens.

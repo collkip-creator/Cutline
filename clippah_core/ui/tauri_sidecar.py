@@ -117,7 +117,9 @@ def _read_projects() -> List[Dict[str, Any]]:
 
 
 def _write_projects(items: List[Dict[str, Any]]) -> None:
-    PROJECTS_INDEX.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    tmp_path = PROJECTS_INDEX.with_name(f"{PROJECTS_INDEX.name}.tmp.{os.getpid()}.{int(time.time() * 1000)}")
+    tmp_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    os.replace(tmp_path, PROJECTS_INDEX)
 
 
 def _upsert_project(record: Dict[str, Any]) -> None:
@@ -128,6 +130,147 @@ def _upsert_project(record: Dict[str, Any]) -> None:
     else:
         items.insert(0, record)
     _write_projects(items)
+
+
+def _repair_project_local_path(proj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    local_path = str(proj.get("local_path") or "")
+    if local_path and Path(local_path).is_file():
+        return proj
+    candidates = [
+        str(proj.get("filename") or ""),
+        Path(local_path).name if local_path else "",
+        Path(str(proj.get("video_url") or "").split("?")[0]).name if proj.get("video_url") else "",
+    ]
+    for name in candidates:
+        cleaned = name.strip()
+        if not cleaned or cleaned.startswith("."):
+            continue
+        candidate = VIDEOS_DIR / cleaned
+        if candidate.is_file():
+            repaired = {
+                **proj,
+                "filename": cleaned,
+                "local_path": str(candidate),
+                "video_url": f"/media/videos/{cleaned}",
+            }
+            _upsert_project(repaired)
+            return repaired
+    return None
+
+
+def _resolve_project(
+    video_hash: str,
+    filename: Optional[str] = None,
+    local_path: Optional[str] = None,
+    video_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    clean_hash = (video_hash or "").strip()
+    projects = _read_projects()
+
+    # 1. Exact hash match
+    if clean_hash:
+        exact = next((p for p in projects if p.get("video_hash") == clean_hash), None)
+        if exact:
+            repaired = _repair_project_local_path(exact)
+            if repaired:
+                return repaired
+            if exact.get("filename") == "cutline_architecture_briefing.mp4":
+                return create_sample()["project"]
+            return exact
+
+    # Collect hint filenames
+    hint_names: List[str] = []
+    for raw in (
+        filename,
+        Path(local_path).name if local_path else None,
+        Path(str(video_url).split("?")[0]).name if video_url else None,
+    ):
+        cleaned = (raw or "").strip()
+        if cleaned and not cleaned.startswith(".") and cleaned not in hint_names:
+            hint_names.append(cleaned)
+
+    # 2. Match existing project in projects.json by filename / basename
+    for name in hint_names:
+        by_name = next(
+            (
+                p
+                for p in projects
+                if p.get("filename") == name or Path(str(p.get("local_path") or "")).name == name
+            ),
+            None,
+        )
+        if by_name:
+            repaired = _repair_project_local_path(by_name)
+            if repaired:
+                return repaired
+            if name == "cutline_architecture_briefing.mp4":
+                return create_sample()["project"]
+
+    # 3. Re-index directly from VIDEOS_DIR if matching file exists on disk
+    for name in hint_names:
+        candidate = VIDEOS_DIR / Path(name).name
+        if candidate.is_file():
+            if candidate.name == "cutline_architecture_briefing.mp4":
+                return create_sample()["project"]
+            try:
+                meta = video_processor.probe_media(candidate)
+                computed_hash = compute_file_sha256(candidate)
+                existing = next((p for p in projects if p.get("video_hash") == computed_hash), None)
+                stem = candidate.stem
+                title = (existing or {}).get("title") or re.sub(r"^\d+_", "", stem) or stem
+                record = {
+                    "video_hash": computed_hash,
+                    "title": title,
+                    "filename": candidate.name,
+                    "local_path": str(candidate),
+                    "video_url": f"/media/videos/{candidate.name}",
+                    "source_url": (existing or {}).get("source_url"),
+                    **meta,
+                    "created_at_iso": (existing or {}).get("created_at_iso")
+                    or datetime.now(timezone.utc).isoformat(),
+                    "clips": (existing or {}).get("clips") or [],
+                }
+                _upsert_project(record)
+                return record
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 4. Scan VIDEOS_DIR by SHA-256 hash when hints did not match
+    if clean_hash and VIDEOS_DIR.is_dir():
+        for entry in VIDEOS_DIR.iterdir():
+            if entry.name.startswith(".") or not entry.is_file():
+                continue
+            try:
+                fhash = compute_file_sha256(entry)
+                if fhash == clean_hash:
+                    if entry.name == "cutline_architecture_briefing.mp4":
+                        return create_sample()["project"]
+                    meta = video_processor.probe_media(entry)
+                    stem = entry.stem
+                    record = {
+                        "video_hash": fhash,
+                        "title": re.sub(r"^\d+_", "", stem) or stem,
+                        "filename": entry.name,
+                        "local_path": str(entry),
+                        "video_url": f"/media/videos/{entry.name}",
+                        "source_url": None,
+                        **meta,
+                        "created_at_iso": datetime.now(timezone.utc).isoformat(),
+                        "clips": [],
+                    }
+                    _upsert_project(record)
+                    return record
+            except Exception:  # noqa: BLE001
+                continue
+
+    # 5. Auto-restore sample video if requested or workspace is empty
+    if "cutline_architecture_briefing.mp4" in hint_names or (not projects and not filename):
+        try:
+            return create_sample()["project"]
+        except Exception:  # noqa: BLE001
+            return None
+
+    return None
 
 
 def _build_timed_draft_transcript(
@@ -238,6 +381,9 @@ class ExportRequest(BaseModel):
     include_srt: bool = True
     burn_captions: bool = True
     subtitle_config: Optional[SubtitleConfig] = None
+    filename: Optional[str] = None
+    local_path: Optional[str] = None
+    video_url: Optional[str] = None
 
 
 class QueueRequest(BaseModel):
@@ -404,11 +550,11 @@ def list_projects():
 
 
 @app.get("/api/projects/{video_hash}")
-def get_project(video_hash: str):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+def get_project(video_hash: str, filename: Optional[str] = None):
+    proj = _resolve_project(video_hash, filename=filename)
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
-    tr = cache_store.get(video_hash)
+    tr = cache_store.get(proj["video_hash"])
     return {
         "project": proj,
         "transcript": tr.model_dump() if tr else None,
@@ -516,18 +662,24 @@ def ingest_url(req: UrlRequest):
 
 @app.post("/api/projects/{video_hash}/transcribe")
 def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    proj = _resolve_project(
+        video_hash,
+        filename=(body or {}).get("filename"),
+        local_path=(body or {}).get("local_path"),
+        video_url=(body or {}).get("video_url"),
+    )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
+    effective_hash = proj["video_hash"]
     force = bool((body or {}).get("force", False))
     if not force:
-        cached = cache_store.get(video_hash)
+        cached = cache_store.get(effective_hash)
         if cached:
             return {"transcript": cached.model_dump(), "cache_hit": True}
 
     if not proj.get("has_audio", True):
         tr = _build_timed_draft_transcript(
-            video_hash,
+            effective_hash,
             proj["local_path"],
             float(proj.get("duration_sec") or 10.0),
             [
@@ -543,14 +695,14 @@ def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
         }
 
     try:
-        wav_path = CACHE_DIR / f"{video_hash[:12]}_16k.wav"
+        wav_path = CACHE_DIR / f"{effective_hash[:12]}_16k.wav"
         video_processor.extract_audio(Path(proj["local_path"]), wav_path)
         if getattr(sys, "frozen", False):
             import tempfile
-            out_json = Path(tempfile.gettempdir()) / f"cutline_tr_{video_hash[:12]}.json"
+            out_json = Path(tempfile.gettempdir()) / f"cutline_tr_{effective_hash[:12]}.json"
             kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if os.name == "nt" else {}
             proc = subprocess.run(
-                [sys.executable, "--transcribe-worker", str(wav_path), video_hash, str(out_json)],
+                [sys.executable, "--transcribe-worker", str(wav_path), effective_hash, str(out_json)],
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -562,12 +714,12 @@ def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
             tr = Transcript.model_validate(json.loads(out_json.read_text(encoding="utf-8")))
             out_json.unlink(missing_ok=True)
         else:
-            tr = pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
+            tr = pipeline.transcriber.transcribe(wav_path, video_hash=effective_hash)
         cache_store.put(tr, pipeline.transcriber.model_identifier)
         return {"transcript": tr.model_dump(), "cache_hit": False}
     except Exception as exc:  # noqa: BLE001
         tr = _build_timed_draft_transcript(
-            video_hash,
+            effective_hash,
             proj["local_path"],
             float(proj.get("duration_sec") or 10.0),
             [
@@ -585,15 +737,22 @@ def transcribe_project(video_hash: str, body: Optional[Dict[str, Any]] = None):
 
 @app.put("/api/projects/{video_hash}/transcript")
 def update_transcript(video_hash: str, body: Dict[str, Any]):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    proj = _resolve_project(
+        video_hash,
+        filename=body.get("filename"),
+        local_path=body.get("local_path"),
+        video_url=body.get("video_url"),
+    )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
+    effective_hash = proj["video_hash"]
     if isinstance(body.get("srt"), str):
-        tr = _parse_srt_to_transcript(body["srt"], video_hash, proj["local_path"], float(proj.get("duration_sec") or 10.0))
+        tr = _parse_srt_to_transcript(body["srt"], effective_hash, proj["local_path"], float(proj.get("duration_sec") or 10.0))
         cache_store.put(tr)
         return {"transcript": tr.model_dump()}
     if isinstance(body.get("transcript"), dict):
-        tr = Transcript.model_validate(body["transcript"])
+        tr_payload = {**body["transcript"], "video_hash": effective_hash}
+        tr = Transcript.model_validate(tr_payload)
         cache_store.put(tr)
         return {"transcript": tr.model_dump()}
     raise HTTPException(status_code=400, detail="Provide srt string or transcript object")
@@ -601,10 +760,11 @@ def update_transcript(video_hash: str, body: Dict[str, Any]):
 
 @app.post("/api/projects/{video_hash}/highlights")
 def extract_highlights(video_hash: str, req: HighlightsRequest):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    proj = _resolve_project(video_hash)
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
-    tr = cache_store.get(video_hash)
+    effective_hash = proj["video_hash"]
+    tr = cache_store.get(effective_hash)
     if not tr:
         raise HTTPException(status_code=400, detail="Transcribe video first")
     engine = OllamaHighlightEngine(
@@ -787,14 +947,20 @@ async def transcribe_microphone_audio(request: Request):
 
 @app.post("/api/projects/{video_hash}/ai-viral-clips")
 def ai_viral_clips(video_hash: str, req: Dict[str, Any]):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    proj = _resolve_project(
+        video_hash,
+        filename=req.get("filename"),
+        local_path=req.get("local_path"),
+        video_url=req.get("video_url"),
+    )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
+    effective_hash = proj["video_hash"]
     retranscribe = bool(req.get("retranscribe", False))
-    tr = None if retranscribe else cache_store.get(video_hash)
+    tr = None if retranscribe else cache_store.get(effective_hash)
     cache_hit = tr is not None
     if not tr:
-        tr_res = transcribe_project(video_hash, {"force": retranscribe})
+        tr_res = transcribe_project(effective_hash, {"force": retranscribe})
         tr = Transcript.model_validate(tr_res["transcript"])
         cache_hit = bool(tr_res.get("cache_hit", False))
     hl_req = HighlightsRequest(
@@ -805,7 +971,7 @@ def ai_viral_clips(video_hash: str, req: Dict[str, Any]):
         max_clip_sec=float(req.get("max_clip_sec") or 45.0),
         max_clips=int(req.get("max_clips") or 6),
     )
-    hl_res = extract_highlights(video_hash, hl_req)
+    hl_res = extract_highlights(effective_hash, hl_req)
     return {
         "transcript": tr.model_dump(),
         "clips": hl_res["clips"],
@@ -817,7 +983,12 @@ def ai_viral_clips(video_hash: str, req: Dict[str, Any]):
 
 @app.put("/api/projects/{video_hash}/clips")
 def save_clips(video_hash: str, body: Dict[str, Any]):
-    proj = next((p for p in _read_projects() if p["video_hash"] == video_hash), None)
+    proj = _resolve_project(
+        video_hash,
+        filename=body.get("filename"),
+        local_path=body.get("local_path"),
+        video_url=body.get("video_url"),
+    )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
     proj["clips"] = body.get("clips", [])
@@ -841,11 +1012,20 @@ def preview_captions(req: CaptionsRequest):
 
 @app.post("/api/clips/export")
 def export_clip(req: ExportRequest):
-    proj = next((p for p in _read_projects() if p["video_hash"] == req.video_hash), None)
-    if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
-    tr = cache_store.get(req.video_hash) or Transcript(
-        video_hash=req.video_hash,
+    proj = _resolve_project(
+        req.video_hash,
+        filename=req.filename,
+        local_path=req.local_path,
+        video_url=req.video_url,
+    )
+    if not proj or not proj.get("local_path") or not Path(str(proj["local_path"])).is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found on disk. Reload or re-upload the source video.",
+        )
+    effective_hash = proj["video_hash"]
+    tr = cache_store.get(effective_hash) or Transcript(
+        video_hash=effective_hash,
         source_path=str(proj["local_path"]),
         duration_sec=float(proj.get("duration_sec") or 10.0),
         model_name="manual",
@@ -870,6 +1050,7 @@ def export_clip(req: ExportRequest):
     ass_text = generate_ass(req.clip, tr, aspect_ratio=req.aspect_ratio, subtitle_config=cfg) if burn_captions else None
     result = video_processor.render_clip(Path(proj["local_path"]), spec, srt_content=srt_text, ass_content=ass_text)
     payload = result.model_dump()
+    payload["resolved_video_hash"] = effective_hash
     payload["video_url"] = f"/media/exports/{Path(result.video_path).name}"
     payload["srt_url"] = f"/media/exports/{Path(result.srt_path).name}" if result.srt_path else None
     payload["ass_url"] = f"/media/exports/{Path(result.ass_path).name}" if result.ass_path else None
@@ -883,7 +1064,13 @@ def list_queue():
 
 @app.post("/api/queue")
 def enqueue_job(req: QueueRequest):
-    return queue_store.enqueue(**req.model_dump()).model_dump()
+    data = req.model_dump()
+    vpath = str(data.get("video_path") or "")
+    if vpath and not Path(vpath).is_file():
+        candidate = EXPORTS_DIR / Path(vpath).name
+        if candidate.is_file():
+            data["video_path"] = str(candidate)
+    return queue_store.enqueue(**data).model_dump()
 
 
 @app.get("/api/queue/channels")

@@ -1,3 +1,11 @@
+import type {
+  AspectRatio,
+  ClipCandidate,
+  EncodeMode,
+  ExportResult,
+  ProjectRecord,
+} from '../types';
+
 /**
  * Resolves API and media URLs cleanly across both runtimes:
  * - Web / Express server (default): relative path ('')
@@ -194,4 +202,106 @@ export async function readJsonResponse<T = any>(res: Response): Promise<T> {
     throw new Error(parsed?.error || parsed?.detail || `HTTP ${res.status} error`);
   }
   return parsed as T;
+}
+
+export interface ExportClipParams {
+  project: ProjectRecord;
+  clip: ClipCandidate;
+  aspectRatio: AspectRatio;
+  encodeMode: EncodeMode;
+  includeSrt?: boolean;
+  burnCaptions?: boolean;
+  onProjectRecovered?: (recovered: ProjectRecord) => void;
+}
+
+export async function exportClipWithRecovery({
+  project,
+  clip,
+  aspectRatio,
+  encodeMode,
+  includeSrt = true,
+  burnCaptions = true,
+  onProjectRecovered,
+}: ExportClipParams): Promise<ExportResult> {
+  const effectiveIncludeSrt = clip.subtitles?.enabled === false ? false : includeSrt;
+  const effectiveBurnCaptions = clip.subtitles?.enabled === false ? false : burnCaptions;
+
+  const sendExport = (targetProject: ProjectRecord) =>
+    apiFetch('/api/clips/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        video_hash: targetProject.video_hash,
+        filename: targetProject.filename,
+        local_path: targetProject.local_path,
+        video_url: targetProject.video_url,
+        clip,
+        subtitle_config: clip.subtitles || null,
+        aspect_ratio: aspectRatio,
+        encode_mode: encodeMode,
+        include_srt: effectiveIncludeSrt,
+        burn_captions: effectiveBurnCaptions,
+      }),
+    });
+
+  let activeTarget = project;
+  let res = await sendExport(activeTarget);
+
+  if (res.status === 404) {
+    let recovered: ProjectRecord | null = null;
+    try {
+      const listRes = await apiFetch('/api/projects');
+      if (listRes.ok) {
+        const projects = await readJsonResponse<ProjectRecord[]>(listRes);
+        recovered =
+          projects.find((p) => p.video_hash === project.video_hash) ||
+          projects.find((p) => p.filename === project.filename) ||
+          projects.find((p) => p.title === project.title) ||
+          null;
+      }
+    } catch {
+      // ignore list recovery lookup failure
+    }
+
+    if (
+      !recovered &&
+      (project.filename === 'cutline_architecture_briefing.mp4' ||
+        project.video_url?.includes('cutline_architecture_briefing.mp4'))
+    ) {
+      try {
+        const sampleRes = await apiFetch('/api/projects/sample', { method: 'POST' });
+        if (sampleRes.ok) {
+          const sampleData = await readJsonResponse<{ project: ProjectRecord }>(sampleRes);
+          recovered = sampleData.project;
+        }
+      } catch {
+        // ignore sample re-synthesis failure
+      }
+    }
+
+    if (recovered) {
+      activeTarget = recovered;
+      onProjectRecovered?.(recovered);
+      res = await sendExport(recovered);
+    }
+  }
+
+  const data = await readJsonResponse<ExportResult & { resolved_video_hash?: string }>(res);
+
+  if (data.resolved_video_hash && data.resolved_video_hash !== activeTarget.video_hash) {
+    try {
+      const listRes = await apiFetch('/api/projects');
+      if (listRes.ok) {
+        const projects = await readJsonResponse<ProjectRecord[]>(listRes);
+        const synced = projects.find((p) => p.video_hash === data.resolved_video_hash);
+        if (synced) {
+          onProjectRecovered?.(synced);
+        }
+      }
+    } catch {
+      // ignore non-fatal sync
+    }
+  }
+
+  return data;
 }

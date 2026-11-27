@@ -104,7 +104,9 @@ function readProjects(): ProjectRecord[] {
 }
 
 function writeProjects(projects: ProjectRecord[]): void {
-  fs.writeFileSync(PROJECTS_INDEX, JSON.stringify(projects, null, 2), 'utf-8');
+  const tmpPath = `${PROJECTS_INDEX}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(projects, null, 2), 'utf-8');
+  fs.renameSync(tmpPath, PROJECTS_INDEX);
 }
 
 function upsertProject(project: ProjectRecord): ProjectRecord[] {
@@ -117,6 +119,164 @@ function upsertProject(project: ProjectRecord): ProjectRecord[] {
   }
   writeProjects(all);
   return all;
+}
+
+interface ProjectLookupHints {
+  filename?: string;
+  local_path?: string;
+  video_url?: string;
+}
+
+async function resolveProject(
+  hash: string,
+  hints?: ProjectLookupHints
+): Promise<ProjectRecord | null> {
+  const cleanHash = String(hash || '').trim();
+  const projects = readProjects();
+
+  const repairLocalPath = (proj: ProjectRecord): ProjectRecord | null => {
+    if (proj.local_path && fs.existsSync(proj.local_path)) {
+      return proj;
+    }
+    const candidates = [
+      proj.filename,
+      proj.local_path ? path.basename(proj.local_path) : '',
+      proj.video_url ? path.basename(proj.video_url) : '',
+    ].filter(Boolean);
+    for (const name of candidates) {
+      const candidatePath = path.join(VIDEOS_DIR, name);
+      if (fs.existsSync(candidatePath)) {
+        const repaired: ProjectRecord = {
+          ...proj,
+          filename: name,
+          local_path: candidatePath,
+          video_url: `/media/videos/${name}`,
+        };
+        upsertProject(repaired);
+        return repaired;
+      }
+    }
+    return null;
+  };
+
+  // 1. Exact hash match
+  if (cleanHash) {
+    const exact = projects.find((p) => p.video_hash === cleanHash);
+    if (exact) {
+      const repaired = repairLocalPath(exact);
+      if (repaired) return repaired;
+      if (exact.filename === 'cutline_architecture_briefing.mp4') {
+        return generateSampleVideoFile();
+      }
+      return exact;
+    }
+  }
+
+  // Gather candidate filenames from request hints
+  const hintNames = Array.from(
+    new Set(
+      [
+        hints?.filename,
+        hints?.local_path ? path.basename(hints.local_path) : '',
+        hints?.video_url ? path.basename(hints.video_url.split('?')[0]) : '',
+      ]
+        .map((v) => String(v || '').trim())
+        .filter((v) => Boolean(v) && !v.startsWith('.'))
+    )
+  );
+
+  // 2. Match existing project in projects.json by filename / basename
+  for (const name of hintNames) {
+    const byName = projects.find(
+      (p) => p.filename === name || path.basename(p.local_path || '') === name
+    );
+    if (byName) {
+      const repaired = repairLocalPath(byName);
+      if (repaired) return repaired;
+      if (name === 'cutline_architecture_briefing.mp4') {
+        return generateSampleVideoFile();
+      }
+    }
+  }
+
+  // 3. Re-index directly from VIDEOS_DIR if the media file is on disk
+  for (const name of hintNames) {
+    const candidatePath = path.join(VIDEOS_DIR, path.basename(name));
+    if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
+      if (name === 'cutline_architecture_briefing.mp4') {
+        return generateSampleVideoFile();
+      }
+      try {
+        const meta = await probeVideo(candidatePath);
+        const computedHash = await computeSha256(candidatePath);
+        const existing = projects.find((p) => p.video_hash === computedHash);
+        const title =
+          existing?.title || path.parse(name).name.replace(/^\d+_/, '') || path.parse(name).name;
+        const record: ProjectRecord = {
+          video_hash: computedHash,
+          title,
+          filename: path.basename(candidatePath),
+          local_path: candidatePath,
+          video_url: `/media/videos/${path.basename(candidatePath)}`,
+          source_url: existing?.source_url || null,
+          ...meta,
+          created_at_iso: existing?.created_at_iso || new Date().toISOString(),
+          clips: existing?.clips || [],
+        };
+        upsertProject(record);
+        return record;
+      } catch {
+        // continue to other candidates
+      }
+    }
+  }
+
+  // 4. Scan VIDEOS_DIR by SHA-256 hash when no hint matched
+  if (cleanHash && fs.existsSync(VIDEOS_DIR)) {
+    const files = fs.readdirSync(VIDEOS_DIR).filter((f) => !f.startsWith('.'));
+    for (const fname of files) {
+      const fullPath = path.join(VIDEOS_DIR, fname);
+      try {
+        if (!fs.statSync(fullPath).isFile()) continue;
+        const fileHash = await computeSha256(fullPath);
+        if (fileHash === cleanHash) {
+          if (fname === 'cutline_architecture_briefing.mp4') {
+            return generateSampleVideoFile();
+          }
+          const meta = await probeVideo(fullPath);
+          const record: ProjectRecord = {
+            video_hash: fileHash,
+            title: path.parse(fname).name.replace(/^\d+_/, '') || path.parse(fname).name,
+            filename: fname,
+            local_path: fullPath,
+            video_url: `/media/videos/${fname}`,
+            source_url: null,
+            ...meta,
+            created_at_iso: new Date().toISOString(),
+            clips: [],
+          };
+          upsertProject(record);
+          return record;
+        }
+      } catch {
+        // ignore unreadable/non-media files
+      }
+    }
+  }
+
+  // 5. Auto-restore built-in sample project if requested or workspace is empty
+  if (
+    hintNames.includes('cutline_architecture_briefing.mp4') ||
+    (projects.length === 0 && !hints?.filename)
+  ) {
+    try {
+      return await generateSampleVideoFile();
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 function getTranscriptPath(videoHash: string): string {
@@ -547,14 +707,16 @@ async function startServer() {
     res.json(projects);
   });
 
-  app.get('/api/projects/:hash', (req: Request, res: Response) => {
+  app.get('/api/projects/:hash', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: typeof req.query.filename === 'string' ? req.query.filename : undefined,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    const transcript = readCachedTranscript(hash);
+    const transcript = readCachedTranscript(project.video_hash);
     res.json({ project, transcript, cache_hit: Boolean(transcript) });
   });
 
@@ -654,14 +816,19 @@ async function startServer() {
   app.post('/api/projects/:hash/transcribe', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
     const force = Boolean(req.body?.force);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: req.body?.filename,
+      local_path: req.body?.local_path,
+      video_url: req.body?.video_url,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    const effectiveHash = project.video_hash;
 
     if (!force) {
-      const cached = readCachedTranscript(hash);
+      const cached = readCachedTranscript(effectiveHash);
       if (cached) {
         res.json({ transcript: cached, cache_hit: true });
         return;
@@ -670,7 +837,7 @@ async function startServer() {
 
     if (!project.has_audio) {
       const silentTranscript = buildSegmentedTranscriptFromLines(
-        hash,
+        effectiveHash,
         project.local_path,
         project.duration_sec,
         [
@@ -686,9 +853,9 @@ async function startServer() {
 
     if (req.body?.provider === 'gemini') {
       try {
-        const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+        const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
         const aiTranscript = await transcribeVideoChunksWithGemini({
-          videoHash: hash,
+          videoHash: effectiveHash,
           sourcePath: project.local_path,
           totalDurationSec: project.duration_sec,
           chunks,
@@ -713,14 +880,14 @@ async function startServer() {
     try {
       await execFileAsync('python3', ['-c', 'import faster_whisper']);
       // In full desktop environments with faster-whisper, invoke FasterWhisperTranscriber
-      const wavPath = path.join(DATA_DIR, 'cache', `${hash.slice(0, 12)}_16k.wav`);
+      const wavPath = path.join(DATA_DIR, 'cache', `${effectiveHash.slice(0, 12)}_16k.wav`);
       await execFileAsync('ffmpeg', ['-y', '-i', project.local_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', wavPath]);
       const pyScript = `
 import json
 from pathlib import Path
 from clippah_core.adapters.desktop_whisper import FasterWhisperTranscriber
 t = FasterWhisperTranscriber(model_size="small", compute_type="int8")
-res = t.transcribe(Path(${JSON.stringify(wavPath)}), ${JSON.stringify(hash)})
+res = t.transcribe(Path(${JSON.stringify(wavPath)}), ${JSON.stringify(effectiveHash)})
 print(res.model_dump_json())
 `;
       const { stdout } = await execFileAsync('python3', ['-c', pyScript], { cwd: ROOT_DIR });
@@ -731,9 +898,9 @@ print(res.model_dump_json())
     } catch {
       if (process.env.GEMINI_API_KEY?.trim()) {
         try {
-          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
           const aiTranscript = await transcribeVideoChunksWithGemini({
-            videoHash: hash,
+            videoHash: effectiveHash,
             sourcePath: project.local_path,
             totalDurationSec: project.duration_sec,
             chunks,
@@ -756,7 +923,7 @@ print(res.model_dump_json())
         "Selected moments snap to word boundaries and export via FFmpeg in 16:9 or 9:16 vertical.",
       ];
       const transcript = buildSegmentedTranscriptFromLines(
-        hash,
+        effectiveHash,
         project.local_path,
         project.duration_sec,
         fallbackLines,
@@ -767,23 +934,29 @@ print(res.model_dump_json())
     }
   });
 
-  app.put('/api/projects/:hash/transcript', (req: Request, res: Response) => {
+  app.put('/api/projects/:hash/transcript', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: req.body?.filename,
+      local_path: req.body?.local_path,
+      video_url: req.body?.video_url,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    const effectiveHash = project.video_hash;
     const srtText = typeof req.body?.srt === 'string' ? req.body.srt : null;
     if (srtText) {
-      const parsed = parseSrtToTranscript(srtText, hash, project.local_path, project.duration_sec);
+      const parsed = parseSrtToTranscript(srtText, effectiveHash, project.local_path, project.duration_sec);
       writeCachedTranscript(parsed);
       res.json({ transcript: parsed });
       return;
     }
     if (req.body?.transcript) {
-      writeCachedTranscript(req.body.transcript);
-      res.json({ transcript: req.body.transcript });
+      const normalized = { ...req.body.transcript, video_hash: effectiveHash };
+      writeCachedTranscript(normalized);
+      res.json({ transcript: normalized });
       return;
     }
     res.status(400).json({ error: 'Provide either srt string or transcript object' });
@@ -923,11 +1096,16 @@ print(res.model_dump_json())
 
   app.post('/api/projects/:hash/ai-viral-clips', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: req.body?.filename,
+      local_path: req.body?.local_path,
+      video_url: req.body?.video_url,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    const effectiveHash = project.video_hash;
 
     const retranscribe = Boolean(req.body?.retranscribe);
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
@@ -936,7 +1114,7 @@ print(res.model_dump_json())
     const maxClips = Number(req.body?.max_clips || 6);
 
     try {
-      let transcript = readCachedTranscript(hash) as any;
+      let transcript = readCachedTranscript(effectiveHash) as any;
       const isDraftTranscript =
         !transcript ||
         transcript.model_name === 'local-timed-draft' ||
@@ -954,9 +1132,9 @@ print(res.model_dump_json())
           }
           note = 'No audio track detected; analyzed the cached transcript instead.';
         } else {
-          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, hash);
+          const chunks = await extractVideoAudioChunks(project.local_path, project.duration_sec, effectiveHash);
           const aiTranscript = await transcribeVideoChunksWithGemini({
-            videoHash: hash,
+            videoHash: effectiveHash,
             sourcePath: project.local_path,
             totalDurationSec: project.duration_sec,
             chunks,
@@ -1004,12 +1182,16 @@ print(res.model_dump_json())
 
   app.post('/api/projects/:hash/highlights', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: req.body?.filename,
+      local_path: req.body?.local_path,
+      video_url: req.body?.video_url,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    const transcript = readCachedTranscript(hash);
+    const transcript = readCachedTranscript(project.video_hash);
     if (!transcript) {
       res.status(400).json({ error: 'Transcribe video before extracting highlights' });
       return;
@@ -1035,9 +1217,13 @@ print(res.model_dump_json())
     }
   });
 
-  app.put('/api/projects/:hash/clips', (req: Request, res: Response) => {
+  app.put('/api/projects/:hash/clips', async (req: Request, res: Response) => {
     const hash = String(req.params.hash);
-    const project = readProjects().find((p) => p.video_hash === hash);
+    const project = await resolveProject(hash, {
+      filename: req.body?.filename,
+      local_path: req.body?.local_path,
+      video_url: req.body?.video_url,
+    });
     if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
@@ -1076,13 +1262,20 @@ print(res.model_dump_json())
   app.post('/api/clips/export', async (req: Request, res: Response) => {
     try {
       const hash = String(req.body?.video_hash || '');
-      const project = readProjects().find((p) => p.video_hash === hash);
-      if (!project) {
-        res.status(404).json({ error: 'Project not found' });
+      const project = await resolveProject(hash, {
+        filename: req.body?.filename,
+        local_path: req.body?.local_path,
+        video_url: req.body?.video_url,
+      });
+      if (!project || !project.local_path || !fs.existsSync(project.local_path)) {
+        res.status(404).json({
+          error: 'Project not found on disk. Reload or re-upload the source video.',
+        });
         return;
       }
-      const transcript = readCachedTranscript(hash) || {
-        video_hash: hash,
+      const effectiveHash = project.video_hash;
+      const transcript = readCachedTranscript(effectiveHash) || {
+        video_hash: effectiveHash,
         source_path: project.local_path,
         language: 'en',
         duration_sec: project.duration_sec || 10,
@@ -1105,6 +1298,7 @@ print(res.model_dump_json())
       const result = JSON.parse(stdout);
       res.json({
         ...result,
+        resolved_video_hash: effectiveHash,
         video_url: `/media/exports/${path.basename(result.video_path)}`,
         srt_url: result.srt_path ? `/media/exports/${path.basename(result.srt_path)}` : null,
         ass_url: result.ass_path ? `/media/exports/${path.basename(result.ass_path)}` : null,
@@ -1126,9 +1320,16 @@ print(res.model_dump_json())
 
   app.post('/api/queue', async (req: Request, res: Response) => {
     try {
+      const body = { ...(req.body || {}) };
+      if (typeof body.video_path === 'string' && body.video_path && !fs.existsSync(body.video_path)) {
+        const candidate = path.join(EXPORTS_DIR, path.basename(body.video_path));
+        if (fs.existsSync(candidate)) {
+          body.video_path = candidate;
+        }
+      }
       const stdout = await runPythonCli(
         ['queue', '--db', QUEUE_DB, '--action', 'enqueue'],
-        req.body
+        body
       );
       res.json(JSON.parse(stdout));
     } catch (err: any) {

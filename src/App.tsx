@@ -32,6 +32,7 @@ import {
   apiFetch,
   apiUrl,
   checkSidecarHealth,
+  exportClipWithRecovery,
   getTauriSidecarDiagnostics,
   isTauriRuntime,
   readJsonResponse,
@@ -334,6 +335,14 @@ export default function App() {
         await selectProject(list[0].video_hash);
       } else if (selectFirst && list.length === 0) {
         await handleLoadSample();
+      } else if (!selectFirst && list.length > 0) {
+        setActiveProject((prev) => {
+          if (!prev) return prev;
+          const exact = list.find((p) => p.video_hash === prev.video_hash);
+          if (exact) return prev;
+          const byName = list.find((p) => p.filename === prev.filename);
+          return byName || prev;
+        });
       }
     } catch {
       // Ignore transient cold-start poll errors
@@ -857,24 +866,18 @@ export default function App() {
     setIsExporting(true);
     setNotice(null);
     try {
-      const effectiveIncludeSrt =
-        activeClip.subtitles?.enabled === false ? false : includeSrt;
-      const effectiveBurnCaptions =
-        activeClip.subtitles?.enabled === false ? false : burnCaptions;
-      const res = await apiFetch('/api/clips/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_hash: activeProject.video_hash,
-          clip: activeClip,
-          subtitle_config: activeClip.subtitles || null,
-          aspect_ratio: aspectRatio,
-          encode_mode: encodeMode,
-          include_srt: effectiveIncludeSrt,
-          burn_captions: effectiveBurnCaptions,
-        }),
+      const data = await exportClipWithRecovery({
+        project: activeProject,
+        clip: activeClip,
+        aspectRatio,
+        encodeMode,
+        includeSrt,
+        burnCaptions,
+        onProjectRecovered: (recovered) => {
+          setActiveProject(recovered);
+          void loadProjects(false);
+        },
       });
-      const data = await readJsonResponse<ExportResult>(res);
       setLastExport(data);
       setNotice({
         kind: 'info',
@@ -1689,6 +1692,10 @@ export default function App() {
           burnCaptions={burnCaptions}
           lastExport={lastExport}
           channels={queueChannels}
+          onProjectRecovered={(recovered) => {
+            setActiveProject(recovered);
+            void loadProjects(false);
+          }}
           onExportCompleted={(expData) => setLastExport(expData)}
           onQueueCompleted={async (count, dispatchedNow) => {
             await loadQueue();
