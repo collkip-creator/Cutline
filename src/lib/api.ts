@@ -305,3 +305,65 @@ export async function exportClipWithRecovery({
 
   return data;
 }
+
+export interface IngestProgressEvent {
+  type: 'progress' | 'result' | 'error';
+  stage?: string;
+  message?: string;
+  mp3_ready?: boolean;
+  segment_count?: number;
+  error?: string;
+}
+
+export async function readIngestStreamResponse<T = any>(
+  res: Response,
+  onProgress?: (event: IngestProgressEvent) => void
+): Promise<T> {
+  const ctype = (res.headers.get('content-type') || '').toLowerCase();
+  if (!res.ok && !ctype.includes('application/x-ndjson')) {
+    return readJsonResponse<T>(res);
+  }
+  if (!ctype.includes('application/x-ndjson') || !res.body) {
+    return readJsonResponse<T>(res);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalResult: T | null = null;
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const evt = JSON.parse(trimmed) as IngestProgressEvent & T;
+    if (evt.type === 'progress') {
+      onProgress?.(evt);
+    } else if (evt.type === 'error') {
+      throw new Error(evt.error || 'Media ingest pipeline failed.');
+    } else if (evt.type === 'result') {
+      finalResult = evt as T;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl = buffer.indexOf('\n');
+    while (nl >= 0) {
+      const line = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      processLine(line);
+      nl = buffer.indexOf('\n');
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    processLine(buffer);
+  }
+
+  if (finalResult === null) {
+    throw new Error('Stream closed before ingest pipeline completed.');
+  }
+  return finalResult;
+}

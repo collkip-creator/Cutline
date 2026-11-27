@@ -347,6 +347,44 @@ class CorePipelineTests(unittest.TestCase):
             self.assertIn(b'filename="short.mp4"', body)
             self.assertIn(b"ftypmp42data", body)
 
+    def test_fast_ytdlp_flags_and_parallel_mp3_ingest(self) -> None:
+        from clippah_core.adapters.desktop_ffmpeg import FFmpegVideoProcessor
+        from clippah_core.adapters.desktop_ytdlp import (
+            DesktopMediaDownloader,
+            build_ytdlp_fast_flags,
+            build_ytdlp_format_selector,
+        )
+
+        self.assertIn("height<=720", build_ytdlp_format_selector("fast"))
+        self.assertIn("height<=1080", build_ytdlp_format_selector("hd"))
+        flags = build_ytdlp_fast_flags()
+        self.assertIn("--concurrent-fragments", flags)
+        self.assertIn("8", flags)
+
+        sample_video = Path("data/videos/cutline_architecture_briefing.mp4")
+        if sample_video.is_file():
+            vp = FFmpegVideoProcessor()
+            dl = DesktopMediaDownloader(vp)
+            seen_mp3s: list[Path] = []
+
+            def _fake_transcribe(mp3: Path) -> Transcript:
+                seen_mp3s.append(mp3)
+                return _sample_transcript()
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                asset, mp3_path, tr = dl.ingest_with_parallel_audio(
+                    str(sample_video),
+                    tmp_path / "videos",
+                    tmp_path / "audio",
+                    transcribe_mp3_fn=_fake_transcribe,
+                )
+                self.assertIsNotNone(mp3_path)
+                self.assertTrue(mp3_path.is_file())  # type: ignore[union-attr]
+                self.assertEqual(len(seen_mp3s), 1)
+                self.assertIsNotNone(asset.audio_path)
+                self.assertIsNotNone(tr)
+
 
 if __name__ == "__main__":
     unittest.main()

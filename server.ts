@@ -43,13 +43,14 @@ const execFileAsync = promisify(execFile);
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const VIDEOS_DIR = path.join(DATA_DIR, 'videos');
+const AUDIO_DIR = path.join(DATA_DIR, 'audio');
 const CACHE_DIR = path.join(DATA_DIR, 'cache', 'transcripts');
 const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 const PROJECTS_INDEX = path.join(DATA_DIR, 'projects.json');
 const QUEUE_DB = path.join(DATA_DIR, 'clippah_queue.db');
 const PYTHON_CORE_DIR = path.join(ROOT_DIR, 'clippah_core');
 
-for (const dir of [DATA_DIR, VIDEOS_DIR, CACHE_DIR, EXPORTS_DIR]) {
+for (const dir of [DATA_DIR, VIDEOS_DIR, AUDIO_DIR, CACHE_DIR, EXPORTS_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -83,6 +84,8 @@ interface ProjectRecord {
   title: string;
   filename: string;
   local_path: string;
+  audio_path?: string | null;
+  audio_url?: string | null;
   video_url: string;
   source_url: string | null;
   duration_sec: number;
@@ -446,6 +449,191 @@ async function extractVideoAudioChunks(
   }
 }
 
+async function resolveYtDlpRunner(): Promise<{ bin: string; prefixArgs: string[] } | null> {
+  try {
+    await execFileAsync('which', ['yt-dlp']);
+    return { bin: 'yt-dlp', prefixArgs: [] };
+  } catch {
+    // Check Python module yt_dlp as fallback
+  }
+  try {
+    await execFileAsync('python3', ['-m', 'yt_dlp', '--version']);
+    return { bin: 'python3', prefixArgs: ['-m', 'yt_dlp'] };
+  } catch {
+    return null;
+  }
+}
+
+async function hasAria2c(): Promise<boolean> {
+  try {
+    await execFileAsync('which', ['aria2c']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function extractSingleMp3(sourcePath: string, outputMp3Path: string): Promise<string> {
+  fs.mkdirSync(path.dirname(outputMp3Path), { recursive: true });
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-i', sourcePath,
+    '-vn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-c:a', 'libmp3lame',
+    '-b:a', '48k',
+    outputMp3Path,
+  ]);
+  return outputMp3Path;
+}
+
+async function transcribeMp3ToTimedTranscript(params: {
+  mp3Path: string;
+  videoHash: string;
+  sourcePath: string;
+  durationSec?: number;
+  title: string;
+}): Promise<Transcript> {
+  let effectiveDuration = Number(params.durationSec || 0);
+  if (effectiveDuration <= 0) {
+    try {
+      const meta = await probeVideo(params.mp3Path);
+      effectiveDuration = meta.duration_sec;
+    } catch {
+      effectiveDuration = 30;
+    }
+  }
+  effectiveDuration = Math.max(4, effectiveDuration);
+
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    try {
+      const stats = fs.statSync(params.mp3Path);
+      if (stats.size <= 8 * 1024 * 1024 && effectiveDuration <= 540) {
+        const buf = fs.readFileSync(params.mp3Path);
+        const res = await transcribeAudioWithTimestamps({
+          audioBuffer: buf,
+          mimeType: 'audio/mp3',
+          durationSec: effectiveDuration,
+          sourceLabel: params.sourcePath,
+          videoHash: params.videoHash,
+        });
+        if (res.transcript.segments.length > 0) {
+          return res.transcript;
+        }
+      } else {
+        const chunks = await extractVideoAudioChunks(
+          params.mp3Path,
+          effectiveDuration,
+          params.videoHash
+        );
+        const aiTranscript = await transcribeVideoChunksWithGemini({
+          videoHash: params.videoHash,
+          sourcePath: params.sourcePath,
+          totalDurationSec: effectiveDuration,
+          chunks,
+        });
+        if (aiTranscript.segments.length > 0) {
+          return aiTranscript;
+        }
+      }
+    } catch {
+      // Fall through cleanly to faster-whisper / timed draft
+    }
+  }
+
+  try {
+    await execFileAsync('python3', ['-c', 'import faster_whisper']);
+    const wavPath = path.join(CACHE_DIR, `.tmp_${params.videoHash.slice(0, 12)}_16k.wav`);
+    try {
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', params.mp3Path,
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        wavPath,
+      ]);
+      const pyScript = `
+import json
+from pathlib import Path
+from clippah_core.adapters.desktop_whisper import FasterWhisperTranscriber
+t = FasterWhisperTranscriber(model_size="small", compute_type="int8")
+res = t.transcribe(Path(${JSON.stringify(wavPath)}), ${JSON.stringify(params.videoHash)})
+print(res.model_dump_json())
+`;
+      const { stdout } = await execFileAsync('python3', ['-c', pyScript], { cwd: ROOT_DIR });
+      const parsed = JSON.parse(stdout);
+      if (Array.isArray(parsed?.segments) && parsed.segments.length > 0) {
+        return parsed;
+      }
+    } finally {
+      if (fs.existsSync(wavPath)) {
+        try { fs.unlinkSync(wavPath); } catch { /* ignore */ }
+      }
+    }
+  } catch {
+    // Fall through cleanly to local draft
+  }
+
+  return buildSegmentedTranscriptFromLines(
+    params.videoHash,
+    params.sourcePath,
+    effectiveDuration,
+    [
+      `Analyzing ${params.title} locally with zero cloud rendering or remote ASR calls.`,
+      'Every spoken segment is indexed with word-level timestamps inside the SHA-256 transcript cache.',
+      'Re-running highlight prompts pulls directly from disk cache without re-transcribing audio.',
+      'Selected moments snap to word boundaries and export via FFmpeg in 16:9 or 9:16 vertical.',
+    ],
+    'local-timed-draft'
+  );
+}
+
+async function searchViralClipsFromTranscript(params: {
+  transcript: Transcript;
+  prompt?: string;
+  durationSec: number;
+  maxClips?: number;
+}): Promise<any[]> {
+  if (!params.transcript.segments || params.transcript.segments.length === 0) {
+    return [];
+  }
+  const minClipSec = Math.min(8, Math.max(3, params.durationSec * 0.15));
+  const maxClipSec = Math.min(45, Math.max(minClipSec + 2, params.durationSec));
+  const maxClips = params.maxClips || 6;
+
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    try {
+      const clips = await analyzeTranscriptForViralClips({
+        transcript: params.transcript,
+        prompt: params.prompt,
+        minClipSec,
+        maxClipSec,
+        maxClips,
+      });
+      if (clips.length > 0) return clips;
+    } catch {
+      // Fall back to local highlight engine
+    }
+  }
+
+  try {
+    const stdout = await runPythonCli(['highlights'], {
+      transcript: params.transcript,
+      prompt: params.prompt || 'High-retention hooks, bold insights, concise takeaways',
+      min_clip_sec: minClipSec,
+      max_clip_sec: maxClipSec,
+      max_clips: maxClips,
+      timeout_sec: 1.5,
+    });
+    return JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+}
+
 function buildSegmentedTranscriptFromLines(
   videoHash: string,
   sourcePath: string,
@@ -683,20 +871,17 @@ async function startServer() {
 
   // Serve media files with HTTP Range support for smooth <video> scrubbing
   app.use('/media/videos', express.static(VIDEOS_DIR));
+  app.use('/media/audio', express.static(AUDIO_DIR));
   app.use('/media/exports', express.static(EXPORTS_DIR));
 
   app.get('/api/health', async (_req: Request, res: Response) => {
     let hasFfmpeg = false;
-    let hasYtdlp = false;
     try {
       await execFileAsync('which', ['ffmpeg']);
       hasFfmpeg = true;
     } catch { /* ignore */ }
-    try {
-      await execFileAsync('which', ['yt-dlp']);
-      hasYtdlp = true;
-    } catch { /* ignore */ }
-    res.json({ status: 'ok', ffmpeg: hasFfmpeg, ytdlp: hasYtdlp });
+    const ytdlpRunner = await resolveYtDlpRunner();
+    res.json({ status: 'ok', ffmpeg: hasFfmpeg, ytdlp: Boolean(ytdlpRunner) });
   });
 
   app.get('/api/projects', (_req: Request, res: Response) => {
@@ -731,33 +916,148 @@ async function startServer() {
   });
 
   app.post('/api/projects/upload', upload.single('video'), async (req: Request, res: Response) => {
+    const wantsStream = req.query.stream === '1' || req.body?.stream === 'true';
+    const emit = (payload: Record<string, unknown>) => {
+      if (wantsStream && !res.writableEnded) {
+        res.write(`${JSON.stringify(payload)}\n`);
+      }
+    };
+
     try {
       if (!req.file) {
         res.status(400).json({ error: 'No video file uploaded' });
         return;
       }
+
+      if (wantsStream) {
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        res.setHeader('Cache-Control', 'no-cache');
+        emit({
+          type: 'progress',
+          stage: 'audio_mp3',
+          message: 'Video uploaded. Extracting MP3 audio & probing metadata in parallel...',
+        });
+      }
+
       const filePath = req.file.path;
-      const hash = await computeSha256(filePath);
-      const meta = await probeVideo(filePath);
+      const autoPipeline = req.body?.auto_pipeline !== 'false';
+      const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+      const tmpMp3Path = path.join(AUDIO_DIR, `.tmp_up_${Date.now()}.mp3`);
+
+      // Compute hash, probe video, AND extract MP3 simultaneously!
+      const [hash, meta, mp3Ok] = await Promise.all([
+        computeSha256(filePath),
+        probeVideo(filePath),
+        extractSingleMp3(filePath, tmpMp3Path)
+          .then(() => true)
+          .catch(() => false),
+      ]);
+
+      const finalMp3Path = path.join(AUDIO_DIR, `${hash.slice(0, 16)}.mp3`);
+      let audioUrl: string | null = null;
+      if (mp3Ok && fs.existsSync(tmpMp3Path)) {
+        if (!fs.existsSync(finalMp3Path)) {
+          fs.renameSync(tmpMp3Path, finalMp3Path);
+        } else {
+          try { fs.unlinkSync(tmpMp3Path); } catch { /* ignore */ }
+        }
+        audioUrl = `/media/audio/${path.basename(finalMp3Path)}`;
+      } else if (fs.existsSync(finalMp3Path)) {
+        audioUrl = `/media/audio/${path.basename(finalMp3Path)}`;
+      }
+
       const title = path.parse(req.file.originalname).name;
       const existing = readProjects().find((p) => p.video_hash === hash);
-      const cachedTranscript = readCachedTranscript(hash);
+      let transcript = readCachedTranscript(hash);
+      const cacheHit = Boolean(transcript);
+
+      if (autoPipeline && !transcript && fs.existsSync(finalMp3Path)) {
+        emit({
+          type: 'progress',
+          stage: 'transcribing',
+          mp3_ready: true,
+          message: 'MP3 extracted. Generating timed transcript...',
+        });
+        transcript = await transcribeMp3ToTimedTranscript({
+          mp3Path: finalMp3Path,
+          videoHash: hash,
+          sourcePath: filePath,
+          durationSec: meta.duration_sec,
+          title,
+        });
+        writeCachedTranscript(transcript);
+        emit({
+          type: 'progress',
+          stage: 'transcript_ready',
+          mp3_ready: true,
+          segment_count: transcript.segments.length,
+          message: `Timed transcript ready (${transcript.segments.length} segments). Searching viral clips...`,
+        });
+      } else if (autoPipeline && !transcript && !meta.has_audio) {
+        transcript = buildSegmentedTranscriptFromLines(
+          hash,
+          filePath,
+          meta.duration_sec,
+          [
+            `Silent video track detected for ${title}.`,
+            'Import an .srt transcript or use Audio AI to sync spoken timestamps.',
+          ],
+          'silent-track-draft'
+        );
+        writeCachedTranscript(transcript);
+      }
+
+      let clips = existing?.clips || [];
+      if (autoPipeline && clips.length === 0 && transcript && transcript.segments.length > 0) {
+        emit({
+          type: 'progress',
+          stage: 'analyzing_clips',
+          mp3_ready: Boolean(audioUrl),
+          segment_count: transcript.segments.length,
+          message: 'Searching viral clips from timed transcript...',
+        });
+        clips = await searchViralClipsFromTranscript({
+          transcript,
+          prompt,
+          durationSec: meta.duration_sec,
+        });
+      }
 
       const record: ProjectRecord = {
         video_hash: hash,
         title,
         filename: req.file.filename,
         local_path: filePath,
+        audio_path: fs.existsSync(finalMp3Path) ? finalMp3Path : null,
+        audio_url: audioUrl,
         video_url: `/media/videos/${req.file.filename}`,
         source_url: null,
         ...meta,
         created_at_iso: existing?.created_at_iso || new Date().toISOString(),
-        clips: existing?.clips || [],
+        clips,
       };
       upsertProject(record);
-      res.json({ project: record, transcript: cachedTranscript, cache_hit: Boolean(cachedTranscript) });
+
+      const responsePayload = {
+        project: record,
+        transcript,
+        clips,
+        audio_url: audioUrl,
+        cache_hit: cacheHit,
+      };
+      if (wantsStream) {
+        emit({ type: 'result', ...responsePayload });
+        res.end();
+      } else {
+        res.json(responsePayload);
+      }
     } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'Upload ingestion failed' });
+      if (wantsStream) {
+        emit({ type: 'error', error: err?.message || 'Upload ingestion failed' });
+        res.end();
+      } else {
+        res.status(500).json({ error: err?.message || 'Upload ingestion failed' });
+      }
     }
   });
 
@@ -767,49 +1067,229 @@ async function startServer() {
       res.status(400).json({ error: 'Streaming URL is required' });
       return;
     }
-    try {
-      await execFileAsync('which', ['yt-dlp']);
-    } catch {
+    const runner = await resolveYtDlpRunner();
+    if (!runner) {
       res.status(422).json({
         error:
-          'yt-dlp binary is not installed in this container runtime. On desktop packaging (PyInstaller/Tauri), DesktopMediaDownloader invokes bundled yt-dlp automatically. Upload a local video file or load the sample footage to test the full pipeline here.',
+          'yt-dlp is not installed in this cloud preview container. On desktop packaging (Tauri/PyInstaller), DesktopMediaDownloader invokes bundled yt-dlp with fast parallel MP3 + timed transcript ingestion automatically. Upload a local video file or load sample footage here.',
         requires_ytdlp: true,
       });
       return;
     }
 
+    const wantsStream = req.body?.stream === true || req.query.stream === '1';
+    const quality = req.body?.quality === 'hd' ? 'hd' : 'fast';
+    const autoPipeline = req.body?.auto_pipeline !== false;
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
+
+    const emit = (payload: Record<string, unknown>) => {
+      if (wantsStream && !res.writableEnded) {
+        res.write(`${JSON.stringify(payload)}\n`);
+      }
+    };
+
     try {
+      if (wantsStream) {
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        res.setHeader('Cache-Control', 'no-cache');
+        emit({
+          type: 'progress',
+          stage: 'downloading',
+          message: 'Downloading video (-N 8) and extracting MP3 + timed transcript simultaneously...',
+        });
+      }
+
+      const useAria2 = await hasAria2c();
+      const fastFlags = [
+        '--no-playlist',
+        '--no-warnings',
+        '--no-progress',
+        '--concurrent-fragments', '8',
+        '--socket-timeout', '15',
+        '--retries', '3',
+        '--fragment-retries', '3',
+        ...(useAria2 ? ['--downloader', 'aria2c', '--downloader-args', 'aria2c:-x 8 -s 8 -k 1M'] : []),
+      ];
+      const formatSelector =
+        quality === 'fast'
+          ? 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/b'
+          : 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b';
+
+      const stamp = Date.now();
+      const rawAudTpl = path.join(AUDIO_DIR, `.tmp_yt_${stamp}.%(ext)s`);
+      const tmpMp3Path = path.join(AUDIO_DIR, `.tmp_yt_${stamp}.mp3`);
       const outTpl = path.join(VIDEOS_DIR, '%(id)s.%(ext)s');
-      const { stdout } = await execFileAsync('yt-dlp', [
-        '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
-        '--merge-output-format', 'mp4',
-        '--print-json',
-        '-o', outTpl,
-        sourceUrl,
+
+      // Track A: Audio-only fast fetch -> MP3 -> Timed transcript WHILE video downloads
+      const audioAndTranscriptPromise = (async (): Promise<{
+        mp3Path: string | null;
+        transcript: Transcript | null;
+      }> => {
+        if (!autoPipeline) return { mp3Path: null, transcript: null };
+        try {
+          const { stdout: audOut } = await execFileAsync(runner.bin, [
+            ...runner.prefixArgs,
+            ...fastFlags,
+            '-f', 'ba[ext=m4a]/ba',
+            '--print-json',
+            '-o', rawAudTpl,
+            sourceUrl,
+          ]);
+          const lines = audOut.trim().split('\n').filter((l) => l.trim().startsWith('{'));
+          const info = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : null;
+          const rawAudPath = String(info?._filename || info?.requested_downloads?.[0]?.filepath || '');
+          if (!rawAudPath || !fs.existsSync(rawAudPath)) {
+            return { mp3Path: null, transcript: null };
+          }
+          await extractSingleMp3(rawAudPath, tmpMp3Path);
+          try {
+            if (rawAudPath !== tmpMp3Path && fs.existsSync(rawAudPath)) fs.unlinkSync(rawAudPath);
+          } catch { /* ignore */ }
+
+          emit({
+            type: 'progress',
+            stage: 'transcribing',
+            mp3_ready: true,
+            message: 'MP3 extracted! Generating timed transcript while video finishes downloading...',
+          });
+
+          const tr = await transcribeMp3ToTimedTranscript({
+            mp3Path: tmpMp3Path,
+            videoHash: `pending_${stamp}`,
+            sourcePath: rawAudPath,
+            durationSec: Number(info?.duration || 0),
+            title: String(info?.title || 'YouTube Video'),
+          });
+
+          emit({
+            type: 'progress',
+            stage: 'transcript_ready',
+            mp3_ready: true,
+            segment_count: tr.segments.length,
+            message: `Timed transcript ready (${tr.segments.length} segments) before video finished!`,
+          });
+          return { mp3Path: tmpMp3Path, transcript: tr };
+        } catch {
+          return { mp3Path: null, transcript: null };
+        }
+      })();
+
+      // Track B: Full Video download in parallel
+      const videoDownloadPromise = (async () => {
+        const { stdout } = await execFileAsync(runner.bin, [
+          ...runner.prefixArgs,
+          ...fastFlags,
+          '-f', formatSelector,
+          '--merge-output-format', 'mp4',
+          '--print-json',
+          '-o', outTpl,
+          sourceUrl,
+        ]);
+        const lines = stdout.trim().split('\n').filter((l) => l.trim().startsWith('{'));
+        const info = JSON.parse(lines[lines.length - 1]);
+        const localPath = String(info._filename || info.requested_downloads?.[0]?.filepath);
+        return { info, localPath };
+      })();
+
+      const [{ info, localPath }, audioTrackResult] = await Promise.all([
+        videoDownloadPromise,
+        audioAndTranscriptPromise,
       ]);
-      const lines = stdout.trim().split('\n');
-      const info = JSON.parse(lines[lines.length - 1]);
-      const localPath = String(info._filename || info.requested_downloads?.[0]?.filepath);
+
       const filename = path.basename(localPath);
-      const hash = await computeSha256(localPath);
-      const meta = await probeVideo(localPath);
-      const cachedTranscript = readCachedTranscript(hash);
+      const [hash, meta] = await Promise.all([computeSha256(localPath), probeVideo(localPath)]);
+      const title = String(info.title || filename);
+
+      emit({
+        type: 'progress',
+        stage: 'video_ready',
+        mp3_ready: Boolean(audioTrackResult.mp3Path),
+        segment_count: audioTrackResult.transcript?.segments.length,
+        message: `Video ready ("${title}"). Finalizing MP3, transcript cache, and viral clip search...`,
+      });
+
+      const finalMp3Path = path.join(AUDIO_DIR, `${hash.slice(0, 16)}.mp3`);
+      if (audioTrackResult.mp3Path && fs.existsSync(audioTrackResult.mp3Path)) {
+        fs.renameSync(audioTrackResult.mp3Path, finalMp3Path);
+      } else if (meta.has_audio && !fs.existsSync(finalMp3Path)) {
+        try {
+          await extractSingleMp3(localPath, finalMp3Path);
+        } catch { /* ignore */ }
+      }
+      const audioUrl = fs.existsSync(finalMp3Path) ? `/media/audio/${path.basename(finalMp3Path)}` : null;
+
+      let transcript = readCachedTranscript(hash);
+      const cacheHit = Boolean(transcript);
+      if (!transcript && audioTrackResult.transcript) {
+        transcript = {
+          ...audioTrackResult.transcript,
+          video_hash: hash,
+          source_path: localPath,
+          duration_sec: meta.duration_sec || audioTrackResult.transcript.duration_sec,
+        };
+        writeCachedTranscript(transcript);
+      } else if (!transcript && autoPipeline && fs.existsSync(finalMp3Path)) {
+        transcript = await transcribeMp3ToTimedTranscript({
+          mp3Path: finalMp3Path,
+          videoHash: hash,
+          sourcePath: localPath,
+          durationSec: meta.duration_sec,
+          title,
+        });
+        writeCachedTranscript(transcript);
+      }
+
+      let clips: any[] = [];
+      if (autoPipeline && transcript && transcript.segments.length > 0) {
+        emit({
+          type: 'progress',
+          stage: 'analyzing_clips',
+          mp3_ready: Boolean(audioUrl),
+          segment_count: transcript.segments.length,
+          message: `Searching viral clips across ${transcript.segments.length} timed segments...`,
+        });
+        clips = await searchViralClipsFromTranscript({
+          transcript,
+          prompt,
+          durationSec: meta.duration_sec,
+        });
+      }
 
       const record: ProjectRecord = {
         video_hash: hash,
-        title: String(info.title || filename),
+        title,
         filename,
         local_path: localPath,
+        audio_path: fs.existsSync(finalMp3Path) ? finalMp3Path : null,
+        audio_url: audioUrl,
         video_url: `/media/videos/${filename}`,
         source_url: sourceUrl,
         ...meta,
         created_at_iso: new Date().toISOString(),
-        clips: [],
+        clips,
       };
       upsertProject(record);
-      res.json({ project: record, transcript: cachedTranscript, cache_hit: Boolean(cachedTranscript) });
+
+      const responsePayload = {
+        project: record,
+        transcript,
+        clips,
+        audio_url: audioUrl,
+        cache_hit: cacheHit,
+      };
+      if (wantsStream) {
+        emit({ type: 'result', ...responsePayload });
+        res.end();
+      } else {
+        res.json(responsePayload);
+      }
     } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'yt-dlp download failed' });
+      if (wantsStream) {
+        emit({ type: 'error', error: err?.message || 'yt-dlp download failed' });
+        res.end();
+      } else {
+        res.status(500).json({ error: err?.message || 'yt-dlp download failed' });
+      }
     }
   });
 

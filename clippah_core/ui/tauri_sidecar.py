@@ -22,16 +22,16 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..adapters.desktop_ffmpeg import FFmpegVideoProcessor, resolve_media_binary
 from ..adapters.desktop_ollama import OllamaHighlightEngine
 from ..adapters.desktop_whisper import FasterWhisperTranscriber
-from ..adapters.desktop_ytdlp import DesktopMediaDownloader
+from ..adapters.desktop_ytdlp import DesktopMediaDownloader, extract_mp3_audio
 from ..adapters.social_adapters import (
     build_publishers_from_store,
     test_webhook_endpoint,
@@ -56,11 +56,12 @@ from ..core.schemas import (
 
 DATA_ROOT = Path.home() / ".cutline_studio"
 VIDEOS_DIR = DATA_ROOT / "videos"
+AUDIO_DIR = DATA_ROOT / "audio"
 EXPORTS_DIR = DATA_ROOT / "exports"
 CACHE_DIR = DATA_ROOT / "transcript_cache"
 PROJECTS_INDEX = DATA_ROOT / "projects.json"
 
-for d in (DATA_ROOT, VIDEOS_DIR, EXPORTS_DIR, CACHE_DIR):
+for d in (DATA_ROOT, VIDEOS_DIR, AUDIO_DIR, EXPORTS_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 video_processor = FFmpegVideoProcessor()
@@ -104,6 +105,7 @@ async def _json_exception_handler(request: Request, exc: Exception):
 
 
 app.mount("/media/videos", StaticFiles(directory=str(VIDEOS_DIR)), name="videos")
+app.mount("/media/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
 app.mount("/media/exports", StaticFiles(directory=str(EXPORTS_DIR)), name="exports")
 
 
@@ -350,6 +352,10 @@ def _parse_srt_to_transcript(srt_text: str, video_hash: str, source_path: str, d
 
 class UrlRequest(BaseModel):
     url: str
+    quality: str = "fast"
+    auto_pipeline: bool = True
+    prompt: str = "High-retention hooks, bold insights, concise takeaways"
+    stream: bool = False
 
 
 class HighlightsRequest(BaseModel):
@@ -612,8 +618,216 @@ def create_sample():
     return {"project": record, "transcript": tr.model_dump(), "cache_hit": True}
 
 
+def _build_word_timestamps(text: str, start_sec: float, end_sec: float) -> List[WordTimestamp]:
+    toks = text.split()
+    if not toks:
+        return []
+    span = max(0.2, end_sec - start_sec)
+    wstep = span / len(toks)
+    return [
+        WordTimestamp(
+            word=t,
+            start_sec=round(start_sec + wi * wstep, 3),
+            end_sec=round(min(end_sec, start_sec + (wi + 0.9) * wstep), 3),
+            confidence=0.95,
+        )
+        for wi, t in enumerate(toks)
+    ]
+
+
+def _transcribe_mp3_to_timed_transcript(
+    mp3_path: Path,
+    video_hash: str,
+    source_path: str,
+    duration_sec: float,
+    title: str = "Video",
+) -> Transcript:
+    safe_dur = max(1.0, float(duration_sec or 0.0))
+    if safe_dur <= 1.0:
+        try:
+            probed = video_processor.probe_media(mp3_path)
+            safe_dur = max(1.0, float(probed.get("duration_sec") or 10.0))
+        except Exception:  # noqa: BLE001
+            safe_dur = 10.0
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        import base64
+        import math
+        import tempfile
+        import urllib.request
+
+        try:
+            ffmpeg_bin = resolve_media_binary("ffmpeg")
+            chunk_len = 600.0
+            file_bytes = mp3_path.stat().st_size
+            chunk_count = 1 if (safe_dur <= 540.0 and file_bytes <= 8 * 1024 * 1024) else max(1, math.ceil(safe_dur / chunk_len))
+            all_segments: List[TranscriptSegment] = []
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for idx in range(chunk_count):
+                    chunk_start = idx * chunk_len
+                    chunk_dur = min(chunk_len, max(1.0, safe_dur - chunk_start))
+                    if chunk_count == 1:
+                        chunk_bytes = mp3_path.read_bytes()
+                    else:
+                        chunk_file = Path(tmpdir) / f"chunk_{idx}.mp3"
+                        kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if os.name == "nt" else {}
+                        subprocess.run(
+                            [
+                                ffmpeg_bin,
+                                "-y",
+                                "-ss",
+                                str(chunk_start),
+                                "-t",
+                                str(chunk_dur),
+                                "-i",
+                                str(mp3_path),
+                                "-vn",
+                                "-ac",
+                                "1",
+                                "-ar",
+                                "16000",
+                                "-c:a",
+                                "libmp3lame",
+                                "-b:a",
+                                "48k",
+                                str(chunk_file),
+                            ],
+                            capture_output=True,
+                            check=True,
+                            **kwargs,
+                        )
+                        chunk_bytes = chunk_file.read_bytes()
+
+                    prompt_text = (
+                        "Transcribe all spoken words in this audio accurately. "
+                        "Format each sentence or natural spoken phrase on a new line prefixed with its exact start timestamp "
+                        "from the start of this audio clip in [MM:SS] format (for example: [00:00] First sentence here.). "
+                        "If there is no speech, respond with an empty string."
+                    )
+                    payload = json.dumps({
+                        "contents": [{
+                            "parts": [
+                                {"inlineData": {"mimeType": "audio/mp3", "data": base64.b64encode(chunk_bytes).decode("ascii")}},
+                                {"text": prompt_text},
+                            ]
+                        }]
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-transcribe:generateContent",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": gemini_key,
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=90) as resp:
+                        body = json.loads(resp.read().decode("utf-8"))
+                    parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    raw_text = "".join(p.get("text", "") for p in parts).strip()
+                    if raw_text:
+                        chunk_segs = _parse_timestamped_text_to_segments(raw_text, chunk_dur)
+                        for s in chunk_segs:
+                            abs_s = round(chunk_start + s.start_sec, 3)
+                            abs_e = round(min(safe_dur, chunk_start + s.end_sec), 3)
+                            if abs_e <= abs_s:
+                                abs_e = round(abs_s + 0.4, 3)
+                            all_segments.append(
+                                TranscriptSegment(
+                                    id=len(all_segments),
+                                    start_sec=abs_s,
+                                    end_sec=abs_e,
+                                    text=s.text,
+                                    words=_build_word_timestamps(s.text, abs_s, abs_e),
+                                )
+                            )
+            if all_segments:
+                return Transcript(
+                    video_hash=video_hash,
+                    source_path=source_path,
+                    duration_sec=safe_dur,
+                    model_name="gemini-3.5-transcribe",
+                    segments=all_segments,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fallback to local faster-whisper or timed draft
+    try:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = Path(tmpdir) / "asr_16k.wav"
+            video_processor.extract_audio(mp3_path, wav_path)
+            if getattr(sys, "frozen", False):
+                out_json = Path(tmpdir) / "tr.json"
+                kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if os.name == "nt" else {}
+                proc = subprocess.run(
+                    [sys.executable, "--transcribe-worker", str(wav_path), video_hash, str(out_json)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                    **kwargs,
+                )
+                if proc.returncode == 0 and out_json.exists():
+                    return Transcript.model_validate(json.loads(out_json.read_text(encoding="utf-8")))
+            else:
+                return pipeline.transcriber.transcribe(wav_path, video_hash=video_hash)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _build_timed_draft_transcript(
+        video_hash,
+        source_path,
+        safe_dur,
+        [
+            f"Draft timeline created for {title} while local ASR was unavailable.",
+            "Import an .srt transcript or use Audio AI to sync exact spoken timestamps.",
+        ],
+    )
+
+
+def _auto_search_viral_clips(
+    transcript: Transcript,
+    prompt: str,
+    duration_sec: float,
+    max_clips: int = 6,
+) -> List[Dict[str, Any]]:
+    if not transcript.segments:
+        return []
+    min_clip = min(8.0, max(3.0, duration_sec * 0.15))
+    max_clip = min(45.0, max(min_clip + 2.0, duration_sec))
+    engine = OllamaHighlightEngine(timeout_sec=4.0, allow_heuristic_fallback=True)
+    pipeline.highlight_engine = engine
+    try:
+        clips = pipeline.find_clips(
+            transcript,
+            prompt,
+            min_clip_sec=min_clip,
+            max_clip_sec=max_clip,
+            max_clips=max_clips,
+        )
+    except Exception:  # noqa: BLE001
+        raw = engine._heuristic_extract(
+            transcript,
+            prompt,
+            min_clip_sec=min_clip,
+            max_clip_sec=max_clip,
+            max_clips=max_clips,
+        )
+        clips = ground_and_deduplicate_clips(raw.clips, transcript)
+    return [c.model_dump() for c in clips]
+
+
 @app.post("/api/projects/upload")
-async def upload_video(video: UploadFile = File(...)):
+async def upload_video(
+    video: UploadFile = File(...),
+    auto_pipeline: bool = Form(True),
+    prompt: str = Form("High-retention hooks, bold insights, concise takeaways"),
+):
     safe_name = f"{int(datetime.now().timestamp())}_{Path(video.filename or 'clip.mp4').name}"
     dest = VIDEOS_DIR / safe_name
     with dest.open("wb") as fh:
@@ -621,43 +835,196 @@ async def upload_video(video: UploadFile = File(...)):
     meta = video_processor.probe_media(dest)
     vhash = compute_file_sha256(dest)
     tr = cache_store.get(vhash)
+    mp3_path = AUDIO_DIR / f"{vhash[:16]}.mp3"
+    audio_url: Optional[str] = None
+    if bool(meta.get("has_audio", True)):
+        if not mp3_path.is_file():
+            try:
+                extract_mp3_audio(dest, mp3_path, ffmpeg_bin=resolve_media_binary("ffmpeg"))
+            except Exception:  # noqa: BLE001
+                pass
+        if mp3_path.is_file():
+            audio_url = f"/media/audio/{mp3_path.name}"
+
+    clips_list: List[Dict[str, Any]] = []
+    if auto_pipeline and tr is None and mp3_path.is_file():
+        tr = _transcribe_mp3_to_timed_transcript(
+            mp3_path,
+            vhash,
+            str(dest),
+            float(meta.get("duration_sec") or 10.0),
+            title=dest.stem,
+        )
+        cache_store.put(tr)
+    if auto_pipeline and tr is not None and tr.segments:
+        clips_list = _auto_search_viral_clips(
+            tr,
+            prompt,
+            float(meta.get("duration_sec") or 10.0),
+        )
+
     record = {
         "video_hash": vhash,
         "title": dest.stem,
         "filename": safe_name,
         "local_path": str(dest),
+        "audio_path": str(mp3_path) if mp3_path.is_file() else None,
+        "audio_url": audio_url,
         "video_url": f"/media/videos/{safe_name}",
         "source_url": None,
         **meta,
         "created_at_iso": datetime.now(timezone.utc).isoformat(),
-        "clips": [],
+        "clips": clips_list,
     }
     _upsert_project(record)
-    return {"project": record, "transcript": tr.model_dump() if tr else None, "cache_hit": tr is not None}
+    return {
+        "project": record,
+        "transcript": tr.model_dump() if tr else None,
+        "clips": clips_list,
+        "audio_url": audio_url,
+        "cache_hit": tr is not None,
+    }
 
 
 @app.post("/api/projects/url")
 def ingest_url(req: UrlRequest):
-    asset = pipeline.downloader.ingest(req.url, VIDEOS_DIR)
-    tr = cache_store.get(asset.video_hash)
-    fname = Path(asset.local_path).name
-    record = {
-        "video_hash": asset.video_hash,
-        "title": asset.title,
-        "filename": fname,
-        "local_path": asset.local_path,
-        "video_url": f"/media/videos/{fname}",
-        "source_url": asset.source_url,
-        "duration_sec": asset.duration_sec,
-        "width": asset.width,
-        "height": asset.height,
-        "fps": asset.fps,
-        "has_audio": asset.has_audio,
-        "created_at_iso": datetime.now(timezone.utc).isoformat(),
-        "clips": [],
-    }
-    _upsert_project(record)
-    return {"project": record, "transcript": tr.model_dump() if tr else None, "cache_hit": tr is not None}
+    import queue
+    import threading
+
+    def _run_pipeline(emit: Any) -> Dict[str, Any]:
+        emit("starting", "Launching fast multi-connection download & parallel MP3 transcription...", {})
+        holder: Dict[str, Any] = {"mp3_path": None, "tr": None}
+
+        def _transcribe_worker(mp3_file: Path):
+            tr_obj = _transcribe_mp3_to_timed_transcript(
+                mp3_file,
+                f"pending_{int(time.time())}",
+                str(mp3_file),
+                0.0,
+                title="YouTube Video",
+            )
+            holder["mp3_path"] = mp3_file
+            holder["tr"] = tr_obj
+            emit(
+                "transcript_ready",
+                f"MP3 extracted & timed transcript ready ({len(tr_obj.segments)} segments).",
+                {"segment_count": len(tr_obj.segments)},
+            )
+            return tr_obj
+
+        def _on_stage(stage: str, message: str):
+            if stage in ("downloading", "audio_ready", "audio_mp3", "transcribing"):
+                emit(stage, message, {})
+
+        asset, final_mp3, tr_obj = pipeline.downloader.ingest_with_parallel_audio(
+            req.url,
+            VIDEOS_DIR,
+            AUDIO_DIR,
+            quality=req.quality or "fast",
+            transcribe_mp3_fn=_transcribe_worker if req.auto_pipeline else None,
+            on_stage=_on_stage,
+        )
+
+        emit(
+            "video_ready",
+            f'Video downloaded ("{asset.title}"); finalizing transcript & searching viral clips...',
+            {"mp3_ready": bool(final_mp3 and final_mp3.is_file())},
+        )
+
+        # Prefer already-cached transcript under SHA-256 hash if present
+        cached_tr = cache_store.get(asset.video_hash)
+        effective_tr: Optional[Transcript] = cached_tr
+        cache_hit = cached_tr is not None
+
+        if effective_tr is None and isinstance(tr_obj, Transcript):
+            effective_tr = Transcript(
+                video_hash=asset.video_hash,
+                source_path=asset.local_path,
+                language=tr_obj.language,
+                duration_sec=asset.duration_sec or tr_obj.duration_sec,
+                model_name=tr_obj.model_name,
+                created_at_iso=tr_obj.created_at_iso,
+                segments=tr_obj.segments,
+            )
+            cache_store.put(effective_tr)
+        elif effective_tr is None and req.auto_pipeline and final_mp3 and final_mp3.is_file():
+            effective_tr = _transcribe_mp3_to_timed_transcript(
+                final_mp3,
+                asset.video_hash,
+                asset.local_path,
+                asset.duration_sec,
+                title=asset.title,
+            )
+            cache_store.put(effective_tr)
+
+        clips_list: List[Dict[str, Any]] = []
+        if req.auto_pipeline and effective_tr and effective_tr.segments:
+            emit(
+                "analyzing_clips",
+                f"Searching viral clips across {len(effective_tr.segments)} timed transcript segments...",
+                {},
+            )
+            clips_list = _auto_search_viral_clips(
+                effective_tr,
+                req.prompt,
+                asset.duration_sec,
+            )
+
+        fname = Path(asset.local_path).name
+        audio_url = f"/media/audio/{final_mp3.name}" if final_mp3 and final_mp3.is_file() else None
+        record = {
+            "video_hash": asset.video_hash,
+            "title": asset.title,
+            "filename": fname,
+            "local_path": asset.local_path,
+            "audio_path": str(final_mp3) if final_mp3 and final_mp3.is_file() else None,
+            "audio_url": audio_url,
+            "video_url": f"/media/videos/{fname}",
+            "source_url": asset.source_url,
+            "duration_sec": asset.duration_sec,
+            "width": asset.width,
+            "height": asset.height,
+            "fps": asset.fps,
+            "has_audio": asset.has_audio,
+            "created_at_iso": datetime.now(timezone.utc).isoformat(),
+            "clips": clips_list,
+        }
+        _upsert_project(record)
+        return {
+            "project": record,
+            "transcript": effective_tr.model_dump() if effective_tr else None,
+            "clips": clips_list,
+            "audio_url": audio_url,
+            "cache_hit": cache_hit,
+        }
+
+    if not req.stream:
+        return _run_pipeline(lambda _s, _m, _e: None)
+
+    q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def _emit(stage: str, message: str, extra: Dict[str, Any]):
+        q.put(json.dumps({"type": "progress", "stage": stage, "message": message, **extra}) + "\n")
+
+    def _bg():
+        try:
+            result = _run_pipeline(_emit)
+            q.put(json.dumps({"type": "result", **result}) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            q.put(json.dumps({"type": "error", "error": str(exc)}) + "\n")
+        finally:
+            q.put(None)
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+    def _gen():
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            yield item
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson")
 
 
 @app.post("/api/projects/{video_hash}/transcribe")

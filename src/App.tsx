@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   CalendarClock,
+  CheckCircle2,
   Cpu,
   FileText,
   FolderGit2,
@@ -8,6 +9,7 @@ import {
   Loader2,
   Menu,
   Mic,
+  Music,
   Scissors,
   Search,
   Sparkles,
@@ -35,8 +37,10 @@ import {
   exportClipWithRecovery,
   getTauriSidecarDiagnostics,
   isTauriRuntime,
+  readIngestStreamResponse,
   readJsonResponse,
   restartTauriSidecar,
+  type IngestProgressEvent,
   type SidecarDiagnostics,
 } from './lib/api';
 import { downloadUrlViaBlob } from './lib/localExports';
@@ -285,6 +289,9 @@ export default function App() {
 
   // Ingestion & prompt controls
   const [streamUrl, setStreamUrl] = useState('');
+  const [urlQuality, setUrlQuality] = useState<'fast' | 'hd'>('fast');
+  const [autoPipeline, setAutoPipeline] = useState(true);
+  const [ingestProgress, setIngestProgress] = useState<IngestProgressEvent | null>(null);
   const [prompt, setPrompt] = useState(
     'Strongest standalone moments across actionable lessons, entertaining banter/stories, and high-retention hooks'
   );
@@ -466,36 +473,86 @@ export default function App() {
     }
   };
 
+  const applyIngestResult = async (data: any, label: string) => {
+    setSidecarStatus('ready');
+    setActiveProject(data.project);
+    const resolvedTranscript: Transcript | null = data.transcript || null;
+    setTranscript(resolvedTranscript);
+    setCacheHit(Boolean(data.cache_hit || resolvedTranscript));
+
+    const rawClips: ClipCandidate[] = data.clips || data.project?.clips || [];
+    const enrichedClips = rawClips.map((clip) => {
+      const existingTags = Array.isArray(clip.tags) ? clip.tags : [];
+      const tags =
+        existingTags.length >= 3
+          ? existingTags
+          : [
+              ...existingTags,
+              ...generateTranscriptHashtags(clip, resolvedTranscript, 3 - existingTags.length),
+            ];
+      const sentiment = clip.sentiment || analyzeTranscriptSentiment(clip, resolvedTranscript);
+      return { ...clip, sentiment, tags };
+    });
+
+    setClips(enrichedClips);
+    setActiveClipId(enrichedClips[0]?.id || null);
+    setLastExport(null);
+
+    if (enrichedClips.length > 0 && data.project?.video_hash) {
+      await persistClips(data.project.video_hash, enrichedClips).catch(() => {});
+    }
+    await loadProjects(false);
+
+    if (autoPipeline && resolvedTranscript) {
+      const segs = resolvedTranscript.segments?.length || 0;
+      const mp3Text = data.audio_url || data.project?.audio_url ? 'MP3 + ' : '';
+      setNotice({
+        kind: 'info',
+        text: `Imported "${label}": ${mp3Text}${segs} timed transcript segments and ${enrichedClips.length} viral clips ready.`,
+      });
+    } else if (!resolvedTranscript) {
+      await handleTranscribe(data.project.video_hash, false);
+    } else {
+      setNotice({ kind: 'info', text: `Loaded "${label}" with cached transcript.` });
+    }
+  };
+
   const handleFileUpload = async (file: File) => {
     const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
     setIsUploading(true);
+    setIngestProgress({
+      type: 'progress',
+      stage: 'uploading',
+      message: `Uploading "${file.name}" (${sizeMb} MB) & extracting MP3 + timed transcript...`,
+    });
     setNotice({
       kind: 'info',
-      text: `Loading "${file.name}" (${sizeMb} MB) into local workspace...`,
+      text: autoPipeline
+        ? `Uploading "${file.name}" (${sizeMb} MB), extracting MP3, generating timed transcript & searching viral clips...`
+        : `Loading "${file.name}" (${sizeMb} MB) into local workspace...`,
     });
     try {
       const form = new FormData();
       form.append('video', file);
-      const res = await apiFetch('/api/projects/upload', { method: 'POST', body: form });
-      const data = await readJsonResponse<any>(res);
-      setSidecarStatus('ready');
-      setActiveProject(data.project);
-      setTranscript(data.transcript);
-      setCacheHit(Boolean(data.cache_hit));
-      setClips(data.project.clips || []);
-      setActiveClipId(data.project.clips?.[0]?.id || null);
-      setLastExport(null);
-      await loadProjects(false);
-      if (!data.transcript) {
-        await handleTranscribe(data.project.video_hash, false);
-      } else {
-        setNotice({ kind: 'info', text: `Loaded "${file.name}" with cached transcript.` });
-      }
+      form.append('auto_pipeline', autoPipeline ? 'true' : 'false');
+      form.append('prompt', prompt);
+      const endpoint = isTauriRuntime
+        ? '/api/projects/upload'
+        : '/api/projects/upload?stream=1';
+      const res = await apiFetch(endpoint, { method: 'POST', body: form });
+      const data = await readIngestStreamResponse<any>(res, (evt) => {
+        setIngestProgress(evt);
+        if (evt.message) {
+          setNotice({ kind: 'info', text: evt.message });
+        }
+      });
+      await applyIngestResult(data, file.name);
     } catch (err: any) {
       if (isTauriRuntime) setSidecarDiag(await getTauriSidecarDiagnostics());
       setNotice({ kind: 'error', text: err.message });
     } finally {
       setIsUploading(false);
+      setIngestProgress(null);
     }
   };
 
@@ -503,31 +560,45 @@ export default function App() {
     e.preventDefault();
     if (!streamUrl.trim()) return;
     setIsFetchingUrl(true);
+    setIngestProgress({
+      type: 'progress',
+      stage: 'downloading',
+      message: autoPipeline
+        ? `Fetching stream (${urlQuality === 'fast' ? '720p Fast' : '1080p HD'}, -N 8) while extracting MP3 & timed transcript...`
+        : 'Fetching stream via fast multi-connection yt-dlp...',
+    });
     setNotice({
       kind: 'info',
-      text: 'Fetching stream via yt-dlp (this can take 10–60s depending on stream size)...',
+      text: autoPipeline
+        ? 'Downloading video (-N 8) and extracting MP3 + timed transcript in parallel...'
+        : 'Fetching stream via fast multi-connection yt-dlp...',
     });
     try {
       const res = await apiFetch('/api/projects/url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: streamUrl.trim() }),
+        body: JSON.stringify({
+          url: streamUrl.trim(),
+          quality: urlQuality,
+          auto_pipeline: autoPipeline,
+          prompt,
+          stream: true,
+        }),
       });
-      const data = await readJsonResponse<any>(res);
-      setSidecarStatus('ready');
-      setActiveProject(data.project);
-      setTranscript(data.transcript);
-      setCacheHit(Boolean(data.cache_hit));
-      setClips(data.project.clips || []);
-      setActiveClipId(data.project.clips?.[0]?.id || null);
+      const data = await readIngestStreamResponse<any>(res, (evt) => {
+        setIngestProgress(evt);
+        if (evt.message) {
+          setNotice({ kind: 'info', text: evt.message });
+        }
+      });
       setStreamUrl('');
-      setNotice({ kind: 'info', text: `Imported "${data.project.title}" from URL.` });
-      await loadProjects(false);
+      await applyIngestResult(data, data.project?.title || 'YouTube Video');
     } catch (err: any) {
       if (isTauriRuntime) setSidecarDiag(await getTauriSidecarDiagnostics());
       setNotice({ kind: 'error', text: err.message });
     } finally {
       setIsFetchingUrl(false);
+      setIngestProgress(null);
     }
   };
 
@@ -1365,25 +1436,92 @@ export default function App() {
                     </button>
                   </div>
 
-                  <form onSubmit={handleUrlIngest} className="lg:col-span-7 flex items-center gap-2">
-                    <div className="relative flex-1 min-w-0">
+                  <form onSubmit={handleUrlIngest} className="lg:col-span-7 flex flex-wrap sm:flex-nowrap items-center gap-2">
+                    <div className="relative flex-1 min-w-[180px]">
                       <Link2 className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
                       <input
                         type="url"
                         value={streamUrl}
                         onChange={(e) => setStreamUrl(e.target.value)}
-                        placeholder="Streaming URL for yt-dlp ingestion (https://...)"
+                        placeholder="YouTube / streaming URL (-N 8 fast parallel ingest)..."
                         className="w-full bg-[#0B0F17] border border-slate-800 focus:border-blue-500 rounded pl-8 pr-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 outline-none"
                       />
                     </div>
+                    <select
+                      aria-label="YouTube fetch speed quality"
+                      value={urlQuality}
+                      onChange={(e) => setUrlQuality(e.target.value === 'hd' ? 'hd' : 'fast')}
+                      className="bg-[#0B0F17] border border-slate-800 rounded px-2.5 py-2 text-xs text-slate-200 outline-none shrink-0"
+                    >
+                      <option value="fast">720p Fast</option>
+                      <option value="hd">1080p HD</option>
+                    </select>
                     <button
                       type="submit"
                       disabled={isFetchingUrl || !streamUrl.trim()}
-                      className="px-3.5 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
                     >
+                      {isFetchingUrl && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                       {isFetchingUrl ? 'Fetching...' : 'Fetch URL'}
                     </button>
                   </form>
+                </div>
+
+                {/* Parallel Auto-Pipeline Control + Live Stages */}
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                  <label className="inline-flex items-center gap-2 cursor-pointer select-none text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={autoPipeline}
+                      onChange={(e) => setAutoPipeline(e.target.checked)}
+                      className="accent-blue-500 rounded"
+                    />
+                    <span>
+                      Parallel Auto-Pipeline: extract MP3 + generate timed transcript during fetch, then find viral clips immediately
+                    </span>
+                  </label>
+                  {(isFetchingUrl || isUploading) && ingestProgress && (
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                      <span className="inline-flex items-center gap-1 text-blue-300">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {ingestProgress.stage === 'downloading' || ingestProgress.stage === 'uploading'
+                          ? '1. Video'
+                          : '1. Video'}
+                      </span>
+                      <span
+                        className={`inline-flex items-center gap-1 ${
+                          ingestProgress.mp3_ready ? 'text-emerald-300' : 'text-slate-400'
+                        }`}
+                      >
+                        {ingestProgress.mp3_ready && <CheckCircle2 className="w-3 h-3" />}
+                        2. MP3
+                      </span>
+                      <span
+                        className={`inline-flex items-center gap-1 ${
+                          ingestProgress.segment_count !== undefined
+                            ? 'text-emerald-300'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        {ingestProgress.segment_count !== undefined && (
+                          <CheckCircle2 className="w-3 h-3" />
+                        )}
+                        3. Timed Transcript
+                        {ingestProgress.segment_count !== undefined
+                          ? ` (${ingestProgress.segment_count})`
+                          : ''}
+                      </span>
+                      <span
+                        className={`inline-flex items-center gap-1 ${
+                          ingestProgress.stage === 'analyzing_clips'
+                            ? 'text-blue-300'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        4. Viral Clips
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Highlight Extraction & Transcript Cache Row */}
@@ -1453,10 +1591,22 @@ export default function App() {
                         </>
                       )}
                     </button>
-                    <span className="text-[11px] font-mono tabular-nums text-slate-400 ml-auto">
-                      {cacheHit ? 'Transcript cached · 0ms ASR' : 'Uncached'} · SHA256{' '}
-                      {activeProject.video_hash.slice(0, 8)}
-                    </span>
+                    <div className="flex items-center gap-2.5 ml-auto text-[11px] font-mono tabular-nums text-slate-400">
+                      {activeProject.audio_url && (
+                        <a
+                          href={apiUrl(activeProject.audio_url)}
+                          download={`${activeProject.title || 'audio'}.mp3`}
+                          className="inline-flex items-center gap-1 text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
+                        >
+                          <Music className="w-3 h-3" />
+                          MP3
+                        </a>
+                      )}
+                      <span>
+                        {cacheHit ? 'Transcript cached · 0ms ASR' : 'Uncached'} · SHA256{' '}
+                        {activeProject.video_hash.slice(0, 8)}
+                      </span>
+                    </div>
                   </div>
                 )}
 

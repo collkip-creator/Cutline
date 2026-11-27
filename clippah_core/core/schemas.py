@@ -295,6 +295,7 @@ class MediaAsset(BaseModel):
     video_hash: str
     title: str
     local_path: str
+    audio_path: Optional[str] = None
     source_url: Optional[str] = None
     duration_sec: float
     width: int = 1280

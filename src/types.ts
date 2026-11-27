@@ -90,6 +90,8 @@ export interface ProjectRecord {
   title: string;
   filename: string;
   local_path: string;
+  audio_path?: string | null;
+  audio_url?: string | null;
   video_url: string;
   source_url: string | null;
   duration_sec: number;
